@@ -83,3 +83,17 @@ docker run --rm -it -v $PWD:/work -w /work plm-cluster:latest
 - Each run writes `results/manifests/run_manifest.json` with parameters, tool paths, versions, git hash, and input checksums.
 - External commands are logged in `results/logs/`.
 - Keep config YAML checked into your project for exact reruns.
+
+## Why `esm-extract` may be missing after installing `fair-esm`
+
+Some `fair-esm` builds expose Python APIs but do not always install an `esm-extract` console binary into `bin/` (packaging/version dependent).
+
+This repository now installs a compatibility wrapper command named `esm-extract` via `plm_cluster` itself.
+
+Verify:
+
+```bash
+which esm-extract
+esm-extract -h
+```
+

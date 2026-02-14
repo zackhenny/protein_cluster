@@ -67,13 +67,23 @@ conda activate plm_cluster
 pip install .
 # If build isolation cannot fetch setuptools/wheel in your network:
 # pip install . --no-build-isolation
-pip install -e .
 
 plm_cluster run-all \
   --proteins_fasta example_data/toy_proteins.faa \
   --weights_path /path/to/esm2_t33_650M_UR50D.pt \
   --config docs/config.template.yaml \
   --results_root results
+```
+
+
+### `esm-extract` note
+
+If `fair-esm` is installed but `esm-extract` is missing from `bin/`, that is a packaging/version behavior.
+This repo provides a compatible `esm-extract` wrapper entrypoint when you install `plm_cluster`.
+
+```bash
+which esm-extract
+esm-extract -h
 ```
 
 ## Output layout
