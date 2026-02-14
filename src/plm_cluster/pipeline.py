@@ -334,6 +334,8 @@ def merge_graph(
     config: dict,
     hmm_relaxed_tsv: str | None = None,
 ) -> None:
+    Path(out_strict_tsv).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_functional_tsv).parent.mkdir(parents=True, exist_ok=True)
     core = pd.read_csv(hmm_core_tsv, sep="\t") if Path(hmm_core_tsv).exists() else pd.DataFrame()
     emb = pd.read_csv(emb_tsv, sep="\t") if Path(emb_tsv).exists() else pd.DataFrame()
     relaxed = pd.read_csv(hmm_relaxed_tsv, sep="\t") if hmm_relaxed_tsv and Path(hmm_relaxed_tsv).exists() else pd.DataFrame()
@@ -477,9 +479,9 @@ def map_proteins_to_families(
         else:
             arch.append({"protein_id": pid, "architecture": "", "n_segments": 0, "total_covered_aa": 0, "coverage_fraction": 0.0, "is_fusion": 0})
 
-    pd.DataFrame(hits).to_csv(out / "protein_vs_profile_hits.tsv", sep="\t", index=False)
-    pd.DataFrame(segs).to_csv(out / "protein_family_segments.tsv", sep="\t", index=False)
-    pd.DataFrame(arch).to_csv(out / "protein_architectures.tsv", sep="\t", index=False)
+    pd.DataFrame(hits, columns=["protein_id","profile_id","subfamily_id","family_id","start_aa","end_aa","prob","evalue","profile_cov","protein_cov","aln_len","tool","hit_rank","run_id"]).to_csv(out / "protein_vs_profile_hits.tsv", sep="\t", index=False)
+    pd.DataFrame(segs, columns=["protein_id","family_id","family_mode","segment_start_aa","segment_end_aa","best_subfamily_id","support_score","support_tool","profile_cov","segment_len"]).to_csv(out / "protein_family_segments.tsv", sep="\t", index=False)
+    pd.DataFrame(arch, columns=["protein_id","architecture","n_segments","total_covered_aa","coverage_fraction","is_fusion"]).to_csv(out / "protein_architectures.tsv", sep="\t", index=False)
 
 
 def _write_dense_if_small(sparse: pd.DataFrame, row_col: tuple[str, str], out_path: Path, threshold: int) -> None:
@@ -491,7 +493,10 @@ def _write_dense_if_small(sparse: pd.DataFrame, row_col: tuple[str, str], out_pa
 def write_matrices(subfamily_map: str, protein_family_segments: str, outdir: str, config: dict) -> None:
     out = _ensure_dir(outdir)
     smap = pd.read_csv(subfamily_map, sep="\t")
-    seg = pd.read_csv(protein_family_segments, sep="\t")
+    if Path(protein_family_segments).exists() and Path(protein_family_segments).stat().st_size > 0:
+        seg = pd.read_csv(protein_family_segments, sep="\t")
+    else:
+        seg = pd.DataFrame(columns=["protein_id","family_id","family_mode"])
 
     sf = smap[["subfamily_id", "protein_id"]].drop_duplicates().sort_values(["subfamily_id", "protein_id"])
     sf["value"] = 1

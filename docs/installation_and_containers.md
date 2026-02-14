@@ -23,10 +23,25 @@ This document covers local installation, conda setup, and container builds.
 
 ```bash
 conda env create -f envs/plm_cluster.yaml
-conda activate plm_cluster
-pip install .
-# If your environment blocks build-isolation downloads:
-# pip install . --no-build-isolation
+# recommended on HPC (always installs into named env):
+bash scripts/install_in_conda_env.sh plm_cluster .
+
+# manual equivalent:
+# conda activate plm_cluster
+# python -m pip install --no-build-isolation --no-user .
+```
+
+
+### Why this avoids home-directory installs
+
+- `conda run -n <env> python -m pip ...` binds `pip` to the target env interpreter.
+- `--no-user` disables user-site installs.
+- `PYTHONNOUSERSITE=1` prevents reading user site packages.
+
+If you need to verify the target location:
+
+```bash
+conda run -n plm_cluster python -c "import sys; print(sys.executable); print(sys.prefix)"
 ```
 
 Check CLI:
@@ -97,3 +112,7 @@ which esm-extract
 esm-extract -h
 ```
 
+
+## Installed test data
+
+The package now includes a bundled toy FASTA at `plm_cluster/data/toy_proteins.faa`, so isolated environments running `pytest` can access test data without relying on repository-relative paths.

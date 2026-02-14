@@ -63,10 +63,11 @@ Python stack:
 
 ```bash
 conda env create -f envs/plm_cluster.yaml
-conda activate plm_cluster
-pip install .
-# If build isolation cannot fetch setuptools/wheel in your network:
-# pip install . --no-build-isolation
+# HPC-safe install path (forces pip into the conda env):
+bash scripts/install_in_conda_env.sh plm_cluster .
+# Or manual equivalent:
+# conda activate plm_cluster
+# python -m pip install --no-build-isolation --no-user .
 
 plm_cluster run-all \
   --proteins_fasta example_data/toy_proteins.faa \
@@ -84,6 +85,21 @@ This repo provides a compatible `esm-extract` wrapper entrypoint when you instal
 ```bash
 which esm-extract
 esm-extract -h
+```
+
+
+### Ensuring pip installs into the conda env (HPC)
+
+On some HPC systems, calling bare `pip` can target user/home site-packages.
+Use one of these patterns:
+
+```bash
+# safest
+bash scripts/install_in_conda_env.sh plm_cluster .
+
+# equivalent after activation
+conda activate plm_cluster
+python -m pip install --no-build-isolation --no-user .
 ```
 
 ## Output layout
@@ -113,6 +129,8 @@ results/
 - Single container: `container/Dockerfile`
 
 ## Testing
+
+- Packaged test/example FASTA is installed at `plm_cluster/data/toy_proteins.faa` to support isolated test environments.
 
 ```bash
 pytest -q

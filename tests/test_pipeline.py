@@ -10,8 +10,8 @@ def test_merge_graph_writes_strict_and_functional(tmp_path: Path):
     hmm_core = tmp_path / "hmm_core.tsv"
     hmm_relaxed = tmp_path / "hmm_relaxed.tsv"
     emb = tmp_path / "emb.tsv"
-    out_s = tmp_path / "merged_s.tsv"
-    out_f = tmp_path / "merged_f.tsv"
+    out_s = tmp_path / "nested/06_family_clustering/merged_s.tsv"
+    out_f = tmp_path / "nested/06_family_clustering/merged_f.tsv"
 
     pd.DataFrame([
         {"q_subfamily_id": "s1", "t_subfamily_id": "s2", "edge_weight": 0.9},

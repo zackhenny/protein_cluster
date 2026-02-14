@@ -23,6 +23,13 @@ dependencies:
       - fair-esm
       - pytest
 
-# Install this repo after env creation:
+# Install this repo after env creation (HPC-safe, forces pip into env):
+#   bash scripts/install_in_conda_env.sh plm_cluster .
+# Or manually:
 #   conda activate plm_cluster
-#   pip install .
+#   python -m pip install --no-build-isolation --no-user .
+
+variables:
+  PYTHONNOUSERSITE: "1"
+  PIP_USER: "0"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
