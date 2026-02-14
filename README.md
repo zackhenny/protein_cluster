@@ -1,14 +1,33 @@
 # plm-cluster
 
-Fusion-safe, annotation-independent protein clustering pipeline using MMseqs2 + HH-suite + ESM-2 + Leiden.
+`plm_cluster` is a reproducible, annotation-independent, fusion-safe protein clustering pipeline for large-scale datasets.
 
-## Key design updates
-- **No Pfam/InterPro required**.
-- **Mode A (strict core-domain families):** cluster from `hmm_hmm_edges_core.tsv` only.
-- **Mode B (functional neighborhoods):** cluster from relaxed HMM edges + embedding edges.
-- **Fusion-safe mapping:** proteins are assigned by segments and can belong to multiple families.
+It combines:
+- MMseqs2 subfamily clustering
+- HH-suite profile construction and HMM-HMM edges
+- ESM-2 embeddings on subfamily representatives
+- Graph clustering (Leiden)
+- Segment-based protein-family mapping for fusion-aware membership
 
-## CLI subcommands
+## Documentation map
+
+- Algorithm background and design: `docs/algorithm_background.md`
+- Installation and container builds: `docs/installation_and_containers.md`
+- CLI workflow and run options: `docs/cli_workflow_and_options.md`
+- Config template: `docs/config.template.yaml`
+- Output schemas: `docs/output_schemas.md`
+
+## Core concepts
+
+- **Subfamily**: MMseqs2 cluster of proteins
+- **Strict family (Mode A)**: core-domain identity based on stringent HMM-HMM evidence
+- **Functional family (Mode B)**: broader neighborhood from relaxed HMM + embedding evidence
+- **Architecture**: ordered family segment composition of a full-length protein
+
+This separation prevents fusion proteins from falsely merging core-domain families.
+
+## CLI commands
+
 - `mmseqs-cluster`
 - `build-profiles`
 - `embed`
@@ -24,30 +43,29 @@ Backward-compatible aliases:
 - `cluster` -> `cluster-families`
 - `map-proteins` -> `map-proteins-to-families`
 
-## Required executables
-Runtime checks enforce:
+## Requirements
+
+External tools checked at runtime:
 - `mmseqs`
 - `hhmake`
-- `hhalign` (or configure path)
+- `hhalign` (or equivalent HH-suite setup)
+
 Optional:
-- `mcl` (if method selected)
+- `mcl` (if selected)
 
-Tool versions are logged and included in `results/manifests/run_manifest.json`.
+Python stack:
+- PyTorch + fair-esm
+- numpy/scipy/pandas
+- scikit-learn (FAISS optional)
+- python-igraph + leidenalg
 
-## Offline embeddings
-Embedding never downloads weights silently.
-You **must** provide:
-- `--weights_path /path/to/preloaded_esm2_weights.pt`
+## Quick start
 
-## 200k-protein scaling guidance
-- Cluster all proteins with MMseqs2.
-- Build embeddings only for **subfamily representatives**.
-- Use `knn` output as candidate pairs for `hmm-hmm-edges` (avoid naive all-vs-all):
-  - `hmm_hmm.topN: 100-300` depending on budget.
-- Keep strict/functional clustering separate.
-
-## End-to-end run
 ```bash
+conda env create -f envs/plm_cluster.yaml
+conda activate plm_cluster
+pip install -e .
+
 plm_cluster run-all \
   --proteins_fasta example_data/toy_proteins.faa \
   --weights_path /path/to/esm2_t33_650M_UR50D.pt \
@@ -55,7 +73,8 @@ plm_cluster run-all \
   --results_root results
 ```
 
-## Outputs
+## Output layout
+
 ```
 results/
   01_mmseqs/
@@ -69,26 +88,21 @@ results/
   logs/
 ```
 
-Important files:
-- `06_family_clustering/subfamily_to_family_strict.tsv`
-- `06_family_clustering/subfamily_to_family_functional.tsv`
-- `07_membership_matrices/family_strict_x_protein_sparse.tsv`
-- `07_membership_matrices/family_functional_x_protein_sparse.tsv`
+## Compatibility note
 
-Migration note:
-- `subfamily_to_family.tsv` is retained as alias to strict families for compatibility.
+`06_family_clustering/subfamily_to_family.tsv` is preserved as a strict-family alias for older consumers.
 
-## SLURM
-Use scripts in `scripts/slurm/` for CPU (MMseqs2/HH-suite/graph) and GPU/CPU embedding.
+## HPC and containers
 
-## Environments and containers
-- Conda: `envs/plm_cluster.yaml`
-- Apptainer CPU graph/profile: `container/graph_profile.def`
-- Apptainer embedder GPU: `container/embedder.def`
-- Single-container alternative: `container/Dockerfile`
+- SLURM examples: `scripts/slurm/`
+- CPU graph/profile Apptainer: `container/container_cpu_graph.def` (alias of `graph_profile.def`)
+- GPU embedder Apptainer: `container/container_embedder.def` (alias of `embedder.def`)
+- Single container: `container/Dockerfile`
 
-## Tests
+## Testing
+
 ```bash
 pytest -q
 ```
-Includes unit tests and a mocked-tool smoke pipeline test that verifies required stage outputs.
+
+Includes unit tests and a mocked-tool smoke workflow test.
