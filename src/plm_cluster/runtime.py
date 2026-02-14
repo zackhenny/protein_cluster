@@ -13,9 +13,6 @@ from typing import Any
 import importlib.metadata as importlib_metadata
 
 
-REQUIRED_TOOLS = ["mmseqs", "hhmake"]
-
-
 def setup_logging(log_dir: str | Path, name: str) -> logging.Logger:
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(name)
@@ -31,26 +28,24 @@ def setup_logging(log_dir: str | Path, name: str) -> logging.Logger:
     return logger
 
 
-def command_exists(tool: str) -> bool:
-    return shutil.which(tool) is not None
-
-
 def require_executables(tools: list[str], config_paths: dict[str, str] | None = None) -> dict[str, str]:
     resolved: dict[str, str] = {}
     config_paths = config_paths or {}
-    for t in tools:
-        if t in config_paths and config_paths[t]:
-            p = Path(config_paths[t])
+    for tool in tools:
+        conf_key = f"{tool}_path"
+        configured = config_paths.get(conf_key, "") if conf_key in config_paths else config_paths.get(tool, "")
+        if configured:
+            p = Path(configured)
             if not p.exists():
-                raise RuntimeError(f"Configured executable for {t} not found: {p}")
-            resolved[t] = str(p)
+                raise RuntimeError(f"Configured executable for {tool} not found: {p}")
+            resolved[tool] = str(p)
         else:
-            w = shutil.which(t)
-            if not w:
+            p = shutil.which(tool)
+            if not p:
                 raise RuntimeError(
-                    f"Required executable '{t}' not found in PATH. Install it or provide config.tools.{t}_path"
+                    f"Required executable '{tool}' not found in PATH. Install it or set tools.{tool}_path in config."
                 )
-            resolved[t] = w
+            resolved[tool] = p
     return resolved
 
 
@@ -66,21 +61,44 @@ def run_cmd(cmd: list[str], logger: logging.Logger, cwd: str | None = None) -> s
     return out.stdout
 
 
-def executable_version(tool_path: str, version_arg: str = "--version") -> str:
-    try:
-        out = subprocess.run([tool_path, version_arg], capture_output=True, text=True)
-        txt = (out.stdout or out.stderr).strip().splitlines()
-        return txt[0] if txt else "unknown"
-    except Exception:
-        return "unknown"
+def executable_version(tool_path: str) -> str:
+    for arg in ("--version", "-h"):
+        try:
+            out = subprocess.run([tool_path, arg], capture_output=True, text=True)
+            txt = (out.stdout or out.stderr).strip().splitlines()
+            if txt:
+                return txt[0]
+        except Exception:
+            continue
+    return "unknown"
 
 
 def file_sha256(path: str | Path) -> str:
     h = hashlib.sha256()
-    with Path(path).open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def git_commit() -> str | None:
+    try:
+        out = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def collect_lib_versions() -> dict[str, str]:
+    libs = {}
+    for pkg in ["numpy", "pandas", "torch", "fair-esm", "igraph", "leidenalg", "scikit-learn"]:
+        try:
+            libs[pkg] = importlib_metadata.version(pkg)
+        except importlib_metadata.PackageNotFoundError:
+            libs[pkg] = "not_installed"
+    return libs
 
 
 def write_manifest(
@@ -89,20 +107,15 @@ def write_manifest(
     tool_paths: dict[str, str],
     inputs: list[str],
 ) -> None:
-    libs = {}
-    for pkg in ["numpy", "pandas", "torch", "fair-esm", "leidenalg", "igraph"]:
-        try:
-            libs[pkg] = importlib_metadata.version(pkg)
-        except importlib_metadata.PackageNotFoundError:
-            libs[pkg] = "not_installed"
     payload = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "cwd": os.getcwd(),
+        "git_commit": git_commit(),
         "params": params,
         "tool_paths": tool_paths,
         "tool_versions": {k: executable_version(v) for k, v in tool_paths.items()},
-        "python_lib_versions": libs,
-        "inputs": [{"path": p, "sha256": file_sha256(p) if Path(p).exists() else None} for p in inputs],
+        "python_lib_versions": collect_lib_versions(),
+        "inputs": [{"path": p, "sha256": file_sha256(p) if p and Path(p).exists() else None} for p in inputs],
     }
     Path(manifest_path).parent.mkdir(parents=True, exist_ok=True)
     Path(manifest_path).write_text(json.dumps(payload, indent=2))

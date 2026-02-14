@@ -3,4 +3,8 @@
 #SBATCH -c 8
 #SBATCH --mem=32G
 #SBATCH -t 04:00:00
-plm_cluster cluster-families --merged_edges $1/06_family_clustering/merged_edges.tsv --subfamily_map $1/01_mmseqs/subfamily_map.tsv --config $2 --results_root $1
+plm_cluster cluster-families \
+  --merged_edges_strict $1/06_family_clustering/merged_edges_strict.tsv \
+  --merged_edges_functional $1/06_family_clustering/merged_edges_functional.tsv \
+  --subfamily_map $1/01_mmseqs/subfamily_map.tsv \
+  --config $2 --results_root $1

@@ -11,15 +11,15 @@ dependencies:
   - mafft
   - mcl
   - numpy
+  - scipy
   - pandas
   - pyyaml
-  - scipy
   - scikit-learn
   - python-igraph
   - leidenalg
   - pytorch
-  - cudatoolkit  # optional GPU runtime
+  - faiss-cpu
   - pip:
       - fair-esm
-      - -e .
       - pytest
+      - -e .
