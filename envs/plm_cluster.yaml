@@ -22,4 +22,7 @@ dependencies:
   - pip:
       - fair-esm
       - pytest
-      - -e .
+
+# Install this repo after env creation:
+#   conda activate plm_cluster
+#   pip install .

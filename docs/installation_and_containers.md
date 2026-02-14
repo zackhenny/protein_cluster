@@ -24,7 +24,9 @@ This document covers local installation, conda setup, and container builds.
 ```bash
 conda env create -f envs/plm_cluster.yaml
 conda activate plm_cluster
-pip install -e .
+pip install .
+# If your environment blocks build-isolation downloads:
+# pip install . --no-build-isolation
 ```
 
 Check CLI:

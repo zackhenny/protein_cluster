@@ -64,6 +64,9 @@ Python stack:
 ```bash
 conda env create -f envs/plm_cluster.yaml
 conda activate plm_cluster
+pip install .
+# If build isolation cannot fetch setuptools/wheel in your network:
+# pip install . --no-build-isolation
 pip install -e .
 
 plm_cluster run-all \
