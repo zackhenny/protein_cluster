@@ -1,0 +1,25 @@
+name: plm_cluster
+channels:
+  - conda-forge
+  - bioconda
+  - pytorch
+dependencies:
+  - python=3.11
+  - pip
+  - mmseqs2
+  - hhsuite
+  - mafft
+  - mcl
+  - numpy
+  - pandas
+  - pyyaml
+  - scipy
+  - scikit-learn
+  - python-igraph
+  - leidenalg
+  - pytorch
+  - cudatoolkit  # optional GPU runtime
+  - pip:
+      - fair-esm
+      - -e .
+      - pytest
