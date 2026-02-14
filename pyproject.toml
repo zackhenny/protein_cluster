@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plm-cluster"
+version = "0.1.0"
+description = "Annotation-independent, fusion-safe protein clustering pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "plm_cluster"}]
+dependencies = [
+  "PyYAML>=6.0",
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "scikit-learn>=1.2",
+  "python-igraph>=0.11",
+  "leidenalg>=0.10",
+  "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+embed = ["torch>=2.1", "fair-esm>=2.0"]
+faiss = ["faiss-cpu>=1.7"]
+test = ["pytest>=7.4"]
+
+[project.scripts]
+plm_cluster = "plm_cluster.cli:main"
+esm-extract = "plm_cluster.esm_extract_cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
