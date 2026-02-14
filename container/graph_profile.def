@@ -1,0 +1,12 @@
+Bootstrap: docker
+From: mambaorg/micromamba:1.5.8
+
+%post
+    micromamba create -y -n plm_cluster -c conda-forge -c bioconda python=3.11 mmseqs2 hhsuite mafft mcl numpy pandas scipy scikit-learn python-igraph leidenalg pyyaml pip
+    /opt/conda/envs/plm_cluster/bin/pip install fair-esm
+
+%environment
+    export PATH=/opt/conda/envs/plm_cluster/bin:$PATH
+
+%runscript
+    exec plm_cluster "$@"
