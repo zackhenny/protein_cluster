@@ -24,7 +24,7 @@ This document covers local installation, conda setup, and container builds.
 ```bash
 conda env create -f envs/plm_cluster.yaml
 # recommended on HPC (always installs into named env):
-bash scripts/install_in_conda_env.sh plm_cluster .
+bash scripts/install_in_conda_env.sh plm_cluster . test,embed
 
 # manual equivalent:
 # conda activate plm_cluster
@@ -116,3 +116,6 @@ esm-extract -h
 ## Installed test data
 
 The package now includes a bundled toy FASTA at `plm_cluster/data/toy_proteins.faa`, so isolated environments running `pytest` can access test data without relying on repository-relative paths.
+
+
+Pytest note: some HPC images miss `iniconfig` and `pygments`; the installer script now installs both into the conda env before running tests.

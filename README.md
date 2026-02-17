@@ -64,7 +64,7 @@ Python stack:
 ```bash
 conda env create -f envs/plm_cluster.yaml
 # HPC-safe install path (forces pip into the conda env):
-bash scripts/install_in_conda_env.sh plm_cluster .
+bash scripts/install_in_conda_env.sh plm_cluster . test,embed
 # Or manual equivalent:
 # conda activate plm_cluster
 # python -m pip install --no-build-isolation --no-user .
@@ -95,7 +95,7 @@ Use one of these patterns:
 
 ```bash
 # safest
-bash scripts/install_in_conda_env.sh plm_cluster .
+bash scripts/install_in_conda_env.sh plm_cluster . test,embed
 
 # equivalent after activation
 conda activate plm_cluster
@@ -137,3 +137,6 @@ pytest -q
 ```
 
 Includes unit tests and a mocked-tool smoke workflow test.
+
+
+Pytest note: some HPC images miss `iniconfig` and `pygments`; the installer script now installs both into the conda env before running tests.

@@ -19,12 +19,14 @@ dependencies:
   - leidenalg
   - pytorch
   - faiss-cpu
+  - iniconfig
+  - pygments
   - pip:
       - fair-esm
       - pytest
 
 # Install this repo after env creation (HPC-safe, forces pip into env):
-#   bash scripts/install_in_conda_env.sh plm_cluster .
+#   bash scripts/install_in_conda_env.sh plm_cluster . test,embed
 # Or manually:
 #   conda activate plm_cluster
 #   python -m pip install --no-build-isolation --no-user .
