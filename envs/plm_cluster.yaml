@@ -1,0 +1,37 @@
+name: plm_cluster
+channels:
+  - conda-forge
+  - bioconda
+  - pytorch
+dependencies:
+  - python=3.11
+  - pip
+  - mmseqs2
+  - hhsuite
+  - mafft
+  - mcl
+  - numpy
+  - scipy
+  - pandas
+  - pyyaml
+  - scikit-learn
+  - python-igraph
+  - leidenalg
+  - pytorch
+  - faiss-cpu
+  - iniconfig
+  - pygments
+  - pip:
+      - fair-esm
+      - pytest
+
+# Install this repo after env creation (HPC-safe, forces pip into env):
+#   bash scripts/install_in_conda_env.sh plm_cluster . test,embed
+# Or manually:
+#   conda activate plm_cluster
+#   python -m pip install --no-build-isolation --no-user .
+
+variables:
+  PYTHONNOUSERSITE: "1"
+  PIP_USER: "0"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
