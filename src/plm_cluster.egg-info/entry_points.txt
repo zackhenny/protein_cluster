@@ -1,3 +1,0 @@
-[console_scripts]
-esm-extract = plm_cluster.esm_extract_cli:main
-plm_cluster = plm_cluster.cli:main
