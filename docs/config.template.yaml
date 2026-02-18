@@ -1,0 +1,66 @@
+seed: 42
+tools:
+  mmseqs_path: ""
+  hhmake_path: ""
+  hhsearch_path: ""
+  hhalign_path: ""
+  mafft_path: ""
+  mcl_path: ""
+
+mmseqs:
+  mode: linclust
+  min_seq_id: 0.6
+  coverage: 0.8
+  cov_mode: 1
+  evalue: 1e-3
+  sensitivity: 7.5  # used for non-linclust modes
+  threads: 16
+  tmpdir: tmp/mmseqs
+
+profiles:
+  max_members_per_subfamily: 256
+
+hmm_hmm:
+  topN: 200
+  mincov_core: 0.70
+  min_prob_core: 90
+  max_evalue_core: 1e-5
+  min_aln_len_core: 120
+  mincov_relaxed: 0.60
+  min_prob_relaxed: 80
+  max_evalue_relaxed: 1e-3
+  min_aln_len_relaxed: 80
+
+embed:
+  esm_model_name: esm2_t33_650M_UR50D
+  pooling: mean
+  long_seq_policy: truncate
+  max_len: 2048
+  batch_size: 4
+
+knn:
+  k: 100
+  min_cosine: 0.35
+  min_len_ratio: 0.5
+  max_len_ratio: 2.0
+
+graph:
+  edge_weight_policy: downweight_embeddings  # strict|union|gated|downweight_embeddings
+  w_hmm: 1.0
+  w_emb: 0.35
+  weak_hmm_threshold: 0.2
+  leiden_resolution_strict: 0.7
+  leiden_resolution_functional: 1.0
+  seed: 42
+
+mapping:
+  search_mode: family_reps
+  profile_cov_min: 0.70
+  min_prob: 90
+  max_evalue: 1e-5
+  min_segment_len: 120
+  max_overlap_aa: 30
+
+outputs:
+  write_dense_threshold: 2000000
+  write_matrix_market: true
