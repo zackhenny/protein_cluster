@@ -149,35 +149,55 @@ def main() -> None:
         write_matrices(args.subfamily_map, args.protein_family_segments, args.outdir, cfg)
     elif cmd == "run-all":
         root = Path(args.results_root)
-        mmseqs_cluster(args.proteins_fasta, root / "01_mmseqs", cfg, logger)
-        build_profiles(args.proteins_fasta, root / "01_mmseqs/subfamily_map.tsv", root / "02_profiles", cfg, logger)
-        embed(root / "01_mmseqs/subfamily_reps.faa", root / "04_embeddings", cfg, args.weights_path, logger)
-        knn(root / "04_embeddings/embeddings.npy", root / "04_embeddings/ids.txt", root / "04_embeddings/lengths.tsv", root / "04_embeddings/embedding_knn_edges.tsv", cfg)
-        hmm_hmm_edges(root / "02_profiles/subfamily_profile_index.tsv", root / "03_hmm_hmm_edges", cfg, logger, root / "04_embeddings/embedding_knn_edges.tsv")
+        logger.info("Starting run-all pipeline")
+        
+        logger.info("Step 1/8: MMseqs clustering")
+        mmseqs_cluster(args.proteins_fasta, str(root / "01_mmseqs"), cfg, logger)
+        
+        logger.info("Step 2/8: Building profiles")
+        build_profiles(args.proteins_fasta, str(root / "01_mmseqs/subfamily_map.tsv"), str(root / "02_profiles"), cfg, logger)
+        
+        logger.info("Step 3/8: Embedding subfamily representatives")
+        embed(str(root / "01_mmseqs/subfamily_reps.faa"), str(root / "04_embeddings"), cfg, args.weights_path, logger)
+        
+        logger.info("Step 4/8: Computing KNN edges")
+        knn(str(root / "04_embeddings/embeddings.npy"), str(root / "04_embeddings/ids.txt"), str(root / "04_embeddings/lengths.tsv"), str(root / "04_embeddings/embedding_knn_edges.tsv"), cfg)
+        
+        logger.info("Step 5/8: Computing HMM-HMM edges")
+        hmm_hmm_edges(str(root / "02_profiles/subfamily_profile_index.tsv"), str(root / "03_hmm_hmm_edges"), cfg, logger, str(root / "04_embeddings/embedding_knn_edges.tsv"))
+        
+        logger.info("Step 6/8: Merging graphs")
         merge_graph(
-            root / "03_hmm_hmm_edges/hmm_hmm_edges_core.tsv",
-            root / "04_embeddings/embedding_knn_edges.tsv",
-            root / "06_family_clustering/merged_edges_strict.tsv",
-            root / "06_family_clustering/merged_edges_functional.tsv",
+            str(root / "03_hmm_hmm_edges/hmm_hmm_edges_core.tsv"),
+            str(root / "04_embeddings/embedding_knn_edges.tsv"),
+            str(root / "06_family_clustering/merged_edges_strict.tsv"),
+            str(root / "06_family_clustering/merged_edges_functional.tsv"),
             cfg,
-            root / "03_hmm_hmm_edges/hmm_hmm_edges_relaxed.tsv",
+            str(root / "03_hmm_hmm_edges/hmm_hmm_edges_relaxed.tsv"),
         )
+        
+        logger.info("Step 7/8: Clustering families")
         cluster_families(
-            root / "06_family_clustering/merged_edges_strict.tsv",
-            root / "06_family_clustering/merged_edges_functional.tsv",
-            root / "01_mmseqs/subfamily_map.tsv",
-            root / "06_family_clustering",
+            str(root / "06_family_clustering/merged_edges_strict.tsv"),
+            str(root / "06_family_clustering/merged_edges_functional.tsv"),
+            str(root / "01_mmseqs/subfamily_map.tsv"),
+            str(root / "06_family_clustering"),
             cfg,
+            "leiden",
         )
+        
+        logger.info("Step 8/8: Mapping proteins to families and writing matrices")
         map_proteins_to_families(
             args.proteins_fasta,
-            root / "06_family_clustering/subfamily_to_family_strict.tsv",
-            root / "06_family_clustering/subfamily_to_family_functional.tsv",
-            root / "01_mmseqs/subfamily_map.tsv",
-            root / "05_domain_hits",
+            str(root / "06_family_clustering/subfamily_to_family_strict.tsv"),
+            str(root / "06_family_clustering/subfamily_to_family_functional.tsv"),
+            str(root / "01_mmseqs/subfamily_map.tsv"),
+            str(root / "05_domain_hits"),
             cfg,
         )
-        write_matrices(root / "01_mmseqs/subfamily_map.tsv", root / "05_domain_hits/protein_family_segments.tsv", root / "07_membership_matrices", cfg)
+        write_matrices(str(root / "01_mmseqs/subfamily_map.tsv"), str(root / "05_domain_hits/protein_family_segments.tsv"), str(root / "07_membership_matrices"), cfg)
+        
+        logger.info("Pipeline completed successfully")
 
     write_manifest(
         Path(args.results_root) / "manifests" / "run_manifest.json",

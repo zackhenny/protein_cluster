@@ -243,6 +243,7 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
 
     max_len = int(config["embed"]["max_len"])
     policy = config["embed"]["long_seq_policy"]
+    batch_size = int(config["embed"]["batch_size"])
     seqs = []
     lengths = []
     for r in recs:
@@ -252,15 +253,30 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
             seq = seq[:max_len]
         seqs.append((r.id, seq))
 
-    labels, strs, toks = batch_converter(seqs)
-    with torch.no_grad():
-        outp = model(toks, repr_layers=[model.num_layers], return_contacts=False)
-    reps = outp["representations"][model.num_layers]
-
+    # Process in batches to avoid OOM
     embs = []
-    for i, seq in enumerate(strs):
-        L = len(seq)
-        embs.append(reps[i, 1 : L + 1].mean(0).cpu().numpy())
+    total_batches = (len(seqs) + batch_size - 1) // batch_size
+    logger.info(f"Processing {len(seqs)} sequences in {total_batches} batches of size {batch_size}")
+    
+    for i in range(0, len(seqs), batch_size):
+        batch = seqs[i:i + batch_size]
+        batch_num = i // batch_size + 1
+        logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} sequences)")
+        
+        labels, strs, toks = batch_converter(batch)
+        with torch.no_grad():
+            outp = model(toks, repr_layers=[model.num_layers], return_contacts=False)
+        reps = outp["representations"][model.num_layers]
+
+        # Extract embeddings from this batch
+        for j, seq in enumerate(strs):
+            L = len(seq)
+            embs.append(reps[j, 1 : L + 1].mean(0).cpu().numpy())
+        
+        # Clear GPU memory after each batch
+        del toks, outp, reps
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     mat = np.vstack(embs).astype(np.float32)
     np.save(out / "embeddings.npy", mat)
