@@ -13,7 +13,7 @@ mmseqs:
   coverage: 0.8
   cov_mode: 1
   evalue: 1e-3
-  sensitivity: 7.5
+  sensitivity: 7.5  # used for non-linclust modes
   threads: 16
   tmpdir: tmp/mmseqs
 

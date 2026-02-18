@@ -59,28 +59,27 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger) -> di
     tsv = out / "clusters.tsv"
     rep_db = out / "repDB"
     run_cmd([tools["mmseqs"], "createdb", proteins_fasta, str(db)], logger)
-    run_cmd(
-        [
-            tools["mmseqs"],
-            mm["mode"],
-            str(db),
-            str(clu),
-            str(tmpdir),
-            "--min-seq-id",
-            str(mm["min_seq_id"]),
-            "-c",
-            str(mm["coverage"]),
-            "--cov-mode",
-            str(mm["cov_mode"]),
-            "-e",
-            str(mm["evalue"]),
-            "-s",
-            str(mm["sensitivity"]),
-            "--threads",
-            str(mm["threads"]),
-        ],
-        logger,
-    )
+    mmseqs_cmd = [
+        tools["mmseqs"],
+        mm["mode"],
+        str(db),
+        str(clu),
+        str(tmpdir),
+        "--min-seq-id",
+        str(mm["min_seq_id"]),
+        "-c",
+        str(mm["coverage"]),
+        "--cov-mode",
+        str(mm["cov_mode"]),
+        "-e",
+        str(mm["evalue"]),
+        "--threads",
+        str(mm["threads"]),
+    ]
+    # Some MMseqs2 builds do not accept -s for linclust; keep it for search/cluster style modes only.
+    if str(mm["mode"]).lower() != "linclust":
+        mmseqs_cmd.extend(["-s", str(mm["sensitivity"])])
+    run_cmd(mmseqs_cmd, logger)
     run_cmd([tools["mmseqs"], "createtsv", str(db), str(db), str(clu), str(tsv)], logger)
     run_cmd([tools["mmseqs"], "result2repseq", str(db), str(clu), str(rep_db)], logger)
     run_cmd([tools["mmseqs"], "result2flat", str(db), str(db), str(rep_db), str(out / "subfamily_reps_raw.faa")], logger)
@@ -108,6 +107,10 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger) -> di
 def build_profiles(proteins_fasta: str, subfamily_map: str, outdir: str, config: dict, logger) -> dict[str, str]:
     out = _ensure_dir(outdir)
     tools = require_executables(["mafft", "hhmake"], config["tools"])
+    if not Path(subfamily_map).exists():
+        raise RuntimeError(
+            f"subfamily_map not found: {subfamily_map}. Run mmseqs-cluster first and confirm step 01 outputs."
+        )
     smap = pd.read_csv(subfamily_map, sep="\t")
     seqs = {r.id: r.seq for r in read_fasta(proteins_fasta)}
     cap = int(config["profiles"]["max_members_per_subfamily"])

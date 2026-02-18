@@ -102,6 +102,9 @@ conda activate plm_cluster
 python -m pip install --no-build-isolation --no-user .
 ```
 
+
+- MMseqs note: `sensitivity` is applied for non-`linclust` modes; some MMseqs builds reject `-s` for `linclust`.
+
 ## Output layout
 
 ```
