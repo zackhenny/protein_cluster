@@ -38,6 +38,11 @@ def test_smoke_pipeline_with_mocked_tools(tmp_path: Path, monkeypatch):
         elif cmd[0] == "hhalign":
             out = Path(cmd[cmd.index("-o") + 1])
             out.write_text("Probab=98.0 E-value=1e-20 Score=200 Aligned_cols=8 Identities=75%\n")
+        elif cmd[0] == "mmseqs" and cmd[1] == "easy-search":
+            out_file = cmd[4]
+            Path(out_file).write_text("p1\tsubfam_000000\t100.0\t8\t0\t0\t1\t8\t1\t8\t1e-20\t200\t8\t8\n"
+                                      "p2\tsubfam_000000\t100.0\t8\t0\t0\t1\t8\t1\t8\t1e-20\t200\t8\t8\n"
+                                      "p3\tsubfam_000001\t100.0\t8\t0\t0\t1\t8\t1\t8\t1e-20\t200\t8\t8\n")
         return ""
 
     monkeypatch.setattr("plm_cluster.pipeline.require_executables", fake_require)

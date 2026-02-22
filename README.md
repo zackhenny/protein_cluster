@@ -4,10 +4,10 @@
 
 It combines:
 - MMseqs2 subfamily clustering
-- HH-suite profile construction and HMM-HMM edges
+- Multiprocessing-enabled HH-suite profile construction and HMM-HMM edges
 - ESM-2 embeddings on subfamily representatives
 - Graph clustering (Leiden)
-- Segment-based protein-family mapping for fusion-aware membership
+- Segment-based protein-family mapping using mmseqs easy-search for fusion-aware membership
 
 ## Documentation map
 
@@ -24,7 +24,9 @@ It combines:
 - **Functional family (Mode B)**: broader neighborhood from relaxed HMM + embedding evidence
 - **Architecture**: ordered family segment composition of a full-length protein
 
-This separation prevents fusion proteins from falsely merging core-domain families.
+This separation prevents fusion proteins from falsely merging core-domain families. Distinct domains are correctly separated by aligning full-length sequences against subfamily representatives with `mmseqs search` and employing greedy overlap filtering.
+
+Additionally, profile construction (`build-profiles`) and edge alignments (`hmm-hmm-edges`) take advantage of multithreading to scale effectively to very large datasets.
 
 ## CLI commands
 

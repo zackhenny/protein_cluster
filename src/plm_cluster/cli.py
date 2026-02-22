@@ -144,6 +144,7 @@ def main() -> None:
             args.subfamily_map,
             args.outdir,
             cfg,
+            logger,
         )
     elif cmd == "write-matrices":
         write_matrices(args.subfamily_map, args.protein_family_segments, args.outdir, cfg)
@@ -194,6 +195,7 @@ def main() -> None:
             str(root / "01_mmseqs/subfamily_map.tsv"),
             str(root / "05_domain_hits"),
             cfg,
+            logger,
         )
         write_matrices(str(root / "01_mmseqs/subfamily_map.tsv"), str(root / "05_domain_hits/protein_family_segments.tsv"), str(root / "07_membership_matrices"), cfg)
         

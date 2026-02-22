@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import re
 from collections import defaultdict
@@ -115,9 +116,7 @@ def build_profiles(proteins_fasta: str, subfamily_map: str, outdir: str, config:
     seqs = {r.id: r.seq for r in read_fasta(proteins_fasta)}
     cap = int(config["profiles"]["max_members_per_subfamily"])
 
-    rows: list[dict] = []
-    for subfam, grp in smap.groupby("subfamily_id", sort=True):
-        members = sorted(grp["protein_id"].tolist())[:cap]
+    def _process_subfam(subfam, members):
         fa = out / f"{subfam}.faa"
         a3m = out / f"{subfam}.a3m"
         hhm = out / f"{subfam}.hhm"
@@ -125,16 +124,25 @@ def build_profiles(proteins_fasta: str, subfamily_map: str, outdir: str, config:
         msa = run_cmd([tools["mafft"], "--auto", str(fa)], logger)
         a3m.write_text(msa)
         run_cmd([tools["hhmake"], "-i", str(a3m), "-o", str(hhm)], logger)
-        rows.append(
-            {
-                "subfamily_id": subfam,
-                "hhm_path": str(hhm),
-                "msa_path": str(a3m),
-                "n_members_used": len(members),
-                "build_tool": "mafft+hhmake",
-                "build_params_json": json.dumps({"mafft": "--auto", "max_members": cap}),
-            }
-        )
+        return {
+            "subfamily_id": subfam,
+            "hhm_path": str(hhm),
+            "msa_path": str(a3m),
+            "n_members_used": len(members),
+            "build_tool": "mafft+hhmake",
+            "build_params_json": json.dumps({"mafft": "--auto", "max_members": cap}),
+        }
+
+    threads = int(config.get("mmseqs", {}).get("threads", 8))
+    rows: list[dict] = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = []
+        for subfam, grp in smap.groupby("subfamily_id", sort=True):
+            members = sorted(grp["protein_id"].tolist())[:cap]
+            futures.append(executor.submit(_process_subfam, subfam, members))
+        for future in concurrent.futures.as_completed(futures):
+            rows.append(future.result())
 
     pd.DataFrame(rows).sort_values("subfamily_id").to_csv(out / "subfamily_profile_index.tsv", sep="\t", index=False)
     return tools
@@ -166,9 +174,9 @@ def hmm_hmm_edges(
             for t in subfams[i + 1 : i + 1 + topn]:
                 cands.append((q, t))
 
-    raw_rows: list[dict] = []
     run_id = "hmm_hmm_v2"
-    for q, t in sorted(set(tuple(sorted(x)) for x in cands)):
+    
+    def _process_hh_edge(q, t):
         out_hhr = out / f"{q}__{t}.hhr"
         run_cmd([tools["hhalign"], "-i", hhm[q], "-t", hhm[t], "-o", str(out_hhr)], logger)
         m = _parse_hhr_metrics(out_hhr)
@@ -177,21 +185,28 @@ def hmm_hmm_edges(
         aln_len = int(m["aln_len"])
         qcov = min(1.0, aln_len / qlen)
         tcov = min(1.0, aln_len / tlen)
-        raw_rows.append(
-            {
-                "q_subfamily_id": q,
-                "t_subfamily_id": t,
-                "prob": float(m["prob"]),
-                "evalue": float(m["evalue"]),
-                "bits": "NA",
-                "qcov": qcov,
-                "tcov": tcov,
-                "aln_len": aln_len,
-                "pident": float(m["pident"]) if not np.isnan(m["pident"]) else "NA",
-                "tool": "hhalign",
-                "run_id": run_id,
-            }
-        )
+        return {
+            "q_subfamily_id": q,
+            "t_subfamily_id": t,
+            "prob": float(m["prob"]),
+            "evalue": float(m["evalue"]),
+            "bits": "NA",
+            "qcov": qcov,
+            "tcov": tcov,
+            "aln_len": aln_len,
+            "pident": float(m["pident"]) if not np.isnan(m["pident"]) else "NA",
+            "tool": "hhalign",
+            "run_id": run_id,
+        }
+
+    threads = int(config.get("mmseqs", {}).get("threads", 8))
+    raw_rows: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = []
+        for q, t in sorted(set(tuple(sorted(x)) for x in cands)):
+            futures.append(executor.submit(_process_hh_edge, q, t))
+        for future in concurrent.futures.as_completed(futures):
+            raw_rows.append(future.result())
 
     raw = pd.DataFrame(raw_rows).sort_values(["q_subfamily_id", "t_subfamily_id"])
     raw.to_csv(out / "hmm_hmm_edges_raw.tsv", sep="\t", index=False)
@@ -473,33 +488,142 @@ def map_proteins_to_families(
     subfamily_map: str,
     outdir: str,
     config: dict,
+    logger=None,
 ) -> None:
+    if logger is None:
+        import logging
+        logger = logging.getLogger(__name__)
     out = _ensure_dir(outdir)
-    recs = sorted(read_fasta(proteins_fasta), key=lambda r: r.id)
-    smap = pd.read_csv(subfamily_map, sep="\t")
+    
+    tools = require_executables(["mmseqs"], config["tools"])
+    sub_reps = Path(outdir).parent / "01_mmseqs" / "subfamily_reps.faa"
+    if not sub_reps.exists():
+        raise RuntimeError(f"subfamily_reps.faa not found at {sub_reps}")
+        
+    db_out = out / "mmseqs_search"
+    db_out.mkdir(parents=True, exist_ok=True)
+    res_tsv = db_out / "search_results.tsv"
+    tmpdir = _ensure_dir(config.get("mmseqs", {}).get("tmpdir", "tmp/mmseqs"))
+    threads = str(config.get("mmseqs", {}).get("threads", 8))
+    
+    mmseqs_cmd = [
+        tools["mmseqs"], "easy-search",
+        proteins_fasta,
+        str(sub_reps),
+        str(res_tsv),
+        str(tmpdir),
+        "--threads", threads,
+        "-e", str(config["mapping"]["max_evalue"]),
+        "--format-output", "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen",
+    ]
+    run_cmd(mmseqs_cmd, logger)
+    
     s2f = pd.read_csv(subfamily_to_family_strict, sep="\t").set_index("subfamily_id")["family_id"].to_dict()
     f2f = pd.read_csv(subfamily_to_family_functional, sep="\t").set_index("subfamily_id")["family_id"].to_dict()
-    p2s = smap.groupby("protein_id")["subfamily_id"].first().to_dict()
+    
+    # Read search results
+    cols = ["query","target","pident","alnlen","mismatch","gapopen","qstart","qend","tstart","tend","evalue","bits","qlen","tlen"]
+    if res_tsv.stat().st_size > 0:
+        df = pd.read_csv(res_tsv, sep="\t", names=cols)
+    else:
+        df = pd.DataFrame(columns=cols)
 
+    # Filter hits
+    min_cov = float(config["mapping"]["profile_cov_min"])
+    if len(df) > 0:
+        df["profile_cov"] = df["alnlen"] / df["tlen"]
+        df["protein_cov"] = df["alnlen"] / df["qlen"]
+        df = df[df["profile_cov"] >= min_cov]
+        df = df.sort_values(["query", "evalue", "bits"], ascending=[True, True, False])
+
+    max_overlap = int(config["mapping"]["max_overlap_aa"])
+    
     hits = []
     segs = []
+    
+    def _overlap(s1, e1, s2, e2):
+        return max(0, min(e1, e2) - max(s1, s2))
+
+    if len(df) > 0:
+        for pid, grp in df.groupby("query", sort=False):
+            accepted_intervals = []
+            rank = 1
+            for _, row in grp.iterrows():
+                qs, qe = int(row["qstart"]), int(row["qend"])
+                
+                # Check overlap
+                too_much_overlap = False
+                for (acc_s, acc_e) in accepted_intervals:
+                    if _overlap(qs, qe, acc_s, acc_e) > max_overlap:
+                        too_much_overlap = True
+                        break
+                
+                if not too_much_overlap:
+                    accepted_intervals.append((qs, qe))
+                    subfam = row["target"]
+                    fam_s = s2f.get(subfam, "")
+                    fam_f = f2f.get(subfam, "")
+                    
+                    hits.append({
+                        "protein_id": pid,
+                        "profile_id": subfam,
+                        "subfamily_id": subfam,
+                        "family_id": fam_s if fam_s else "",
+                        "start_aa": qs,
+                        "end_aa": qe,
+                        "prob": row["pident"],
+                        "evalue": row["evalue"],
+                        "profile_cov": row["profile_cov"],
+                        "protein_cov": row["protein_cov"],
+                        "aln_len": row["alnlen"],
+                        "tool": "mmseqs",
+                        "hit_rank": rank,
+                        "run_id": "map_v3"
+                    })
+                    
+                    L = qe - qs + 1
+                    if fam_s:
+                        segs.append({"protein_id": pid, "family_id": fam_s, "family_mode": "strict", "segment_start_aa": qs, "segment_end_aa": qe, "best_subfamily_id": subfam, "support_score": row["evalue"], "support_tool": "mmseqs", "profile_cov": row["profile_cov"], "segment_len": L})
+                    if fam_f:
+                        segs.append({"protein_id": pid, "family_id": fam_f, "family_mode": "functional", "segment_start_aa": qs, "segment_end_aa": qe, "best_subfamily_id": subfam, "support_score": row["evalue"], "support_tool": "mmseqs", "profile_cov": row["profile_cov"], "segment_len": L})
+                        
+                    rank += 1
+
+    # Now calculate architectures for all proteins (even those with no hits)
+    recs = {r.id: len(r.seq) for r in read_fasta(proteins_fasta)}
     arch = []
-    for rec in recs:
-        pid, L = rec.id, len(rec.seq)
-        sub = p2s.get(pid, "")
-        fam_s = s2f.get(sub, "")
-        fam_f = f2f.get(sub, "")
-        if fam_s:
-            hits.append({"protein_id": pid, "profile_id": sub, "subfamily_id": sub, "family_id": fam_s, "start_aa": 1, "end_aa": L, "prob": 99.0, "evalue": 1e-20, "profile_cov": 1.0, "protein_cov": 1.0, "aln_len": L, "tool": "containment", "hit_rank": 1, "run_id": "map_v2"})
-            segs.append({"protein_id": pid, "family_id": fam_s, "family_mode": "strict", "segment_start_aa": 1, "segment_end_aa": L, "best_subfamily_id": sub, "support_score": 99.0, "support_tool": "containment", "profile_cov": 1.0, "segment_len": L})
-            if fam_f:
-                segs.append({"protein_id": pid, "family_id": fam_f, "family_mode": "functional", "segment_start_aa": 1, "segment_end_aa": L, "best_subfamily_id": sub, "support_score": 99.0, "support_tool": "containment", "profile_cov": 1.0, "segment_len": L})
-            arch.append({"protein_id": pid, "architecture": fam_s, "n_segments": 1, "total_covered_aa": L, "coverage_fraction": 1.0, "is_fusion": 0})
+    
+    seg_df = pd.DataFrame(segs, columns=["protein_id","family_id","family_mode","segment_start_aa","segment_end_aa","best_subfamily_id","support_score","support_tool","profile_cov","segment_len"])
+    
+    for pid, L in recs.items():
+        if len(seg_df) > 0:
+            p_segs = seg_df[(seg_df["protein_id"] == pid) & (seg_df["family_mode"] == "strict")].sort_values("segment_start_aa")
         else:
-            arch.append({"protein_id": pid, "architecture": "", "n_segments": 0, "total_covered_aa": 0, "coverage_fraction": 0.0, "is_fusion": 0})
+            p_segs = []
+            
+        if len(p_segs) > 0:
+            arch_str = "|".join(p_segs["family_id"].tolist())
+            cov_aa = sum(p_segs["segment_len"].tolist())
+            arch.append({
+                "protein_id": pid,
+                "architecture": arch_str,
+                "n_segments": len(p_segs),
+                "total_covered_aa": cov_aa,
+                "coverage_fraction": min(1.0, cov_aa / L),
+                "is_fusion": 1 if len(p_segs) > 1 else 0
+            })
+        else:
+            arch.append({
+                "protein_id": pid,
+                "architecture": "",
+                "n_segments": 0,
+                "total_covered_aa": 0,
+                "coverage_fraction": 0.0,
+                "is_fusion": 0
+            })
 
     pd.DataFrame(hits, columns=["protein_id","profile_id","subfamily_id","family_id","start_aa","end_aa","prob","evalue","profile_cov","protein_cov","aln_len","tool","hit_rank","run_id"]).to_csv(out / "protein_vs_profile_hits.tsv", sep="\t", index=False)
-    pd.DataFrame(segs, columns=["protein_id","family_id","family_mode","segment_start_aa","segment_end_aa","best_subfamily_id","support_score","support_tool","profile_cov","segment_len"]).to_csv(out / "protein_family_segments.tsv", sep="\t", index=False)
+    seg_df.to_csv(out / "protein_family_segments.tsv", sep="\t", index=False)
     pd.DataFrame(arch, columns=["protein_id","architecture","n_segments","total_covered_aa","coverage_fraction","is_fusion"]).to_csv(out / "protein_architectures.tsv", sep="\t", index=False)
 
 
