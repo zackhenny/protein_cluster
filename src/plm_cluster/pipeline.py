@@ -50,6 +50,11 @@ def _parse_hhr_metrics(path: str | Path) -> dict[str, float]:
 
 
 def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger) -> dict[str, str]:
+    """Step 1: Cluster proteins into subfamilies using MMseqs2.
+
+    Produces subfamily_map.tsv, subfamily_reps.faa, and subfamily_stats.tsv.
+    Returns a dict of resolved tool paths for manifest tracking.
+    """
     out = _ensure_dir(outdir)
     mm = config["mmseqs"]
     tools = require_executables(["mmseqs"], config["tools"])
@@ -106,6 +111,12 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger) -> di
 
 
 def build_profiles(proteins_fasta: str, subfamily_map: str, outdir: str, config: dict, logger) -> dict[str, str]:
+    """Step 2: Build MSAs (MAFFT) and profile HMMs (hhmake) for each subfamily.
+
+    Profiles are used downstream for HMM-HMM edge detection. Large subfamilies
+    are capped at ``profiles.max_members_per_subfamily`` members.
+    Returns resolved tool paths.
+    """
     out = _ensure_dir(outdir)
     tools = require_executables(["mafft", "hhmake"], config["tools"])
     if not Path(subfamily_map).exists():
@@ -136,13 +147,22 @@ def build_profiles(proteins_fasta: str, subfamily_map: str, outdir: str, config:
     threads = int(config.get("mmseqs", {}).get("threads", 8))
     rows: list[dict] = []
     
+    failed: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = []
+        future_to_subfam: dict[concurrent.futures.Future, str] = {}
         for subfam, grp in smap.groupby("subfamily_id", sort=True):
             members = sorted(grp["protein_id"].tolist())[:cap]
-            futures.append(executor.submit(_process_subfam, subfam, members))
-        for future in concurrent.futures.as_completed(futures):
-            rows.append(future.result())
+            fut = executor.submit(_process_subfam, subfam, members)
+            future_to_subfam[fut] = subfam
+        for future in concurrent.futures.as_completed(future_to_subfam):
+            subfam = future_to_subfam[future]
+            try:
+                rows.append(future.result())
+            except Exception as exc:
+                logger.error("Profile build FAILED for %s: %s", subfam, exc)
+                failed.append(subfam)
+    if failed:
+        logger.warning("%d subfamily profile(s) failed: %s", len(failed), ", ".join(failed[:20]))
 
     pd.DataFrame(rows).sort_values("subfamily_id").to_csv(out / "subfamily_profile_index.tsv", sep="\t", index=False)
     return tools
@@ -155,6 +175,12 @@ def hmm_hmm_edges(
     logger,
     candidate_edges_tsv: str | None = None,
 ) -> dict[str, str]:
+    """Step 3: Compute HMM-HMM profile-profile edges via hhalign.
+
+    If *candidate_edges_tsv* is provided (from KNN), only those pairs are
+    aligned. Otherwise, falls back to all-vs-all (slow for large datasets).
+    Produces core (strict) and relaxed edge tables.
+    """
     out = _ensure_dir(outdir)
     tools = require_executables(["hhalign"], config["tools"])
     idx = pd.read_csv(profile_index, sep="\t").sort_values("subfamily_id")
@@ -170,8 +196,14 @@ def hmm_hmm_edges(
                 cands.append((q, t))
     else:
         subfams = idx["subfamily_id"].tolist()
+        n_pairs = len(subfams) * (len(subfams) - 1) // 2
+        logger.warning(
+            "No candidate edges provided — using ALL-vs-ALL (%d pairs for %d subfamilies). "
+            "This is slow for large datasets; consider running embed+knn first.",
+            n_pairs, len(subfams),
+        )
         for i, q in enumerate(subfams):
-            for t in subfams[i + 1 : i + 1 + topn]:
+            for t in subfams[i + 1 :]:
                 cands.append((q, t))
 
     run_id = "hmm_hmm_v2"
@@ -201,12 +233,23 @@ def hmm_hmm_edges(
 
     threads = int(config.get("mmseqs", {}).get("threads", 8))
     raw_rows: list[dict] = []
+    failed_edges: list[str] = []
+    unique_cands = sorted(set(tuple(sorted(x)) for x in cands))
+    logger.info("Running hhalign on %d candidate edge pairs", len(unique_cands))
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = []
-        for q, t in sorted(set(tuple(sorted(x)) for x in cands)):
-            futures.append(executor.submit(_process_hh_edge, q, t))
-        for future in concurrent.futures.as_completed(futures):
-            raw_rows.append(future.result())
+        future_to_pair: dict[concurrent.futures.Future, tuple[str, str]] = {}
+        for q, t in unique_cands:
+            fut = executor.submit(_process_hh_edge, q, t)
+            future_to_pair[fut] = (q, t)
+        for future in concurrent.futures.as_completed(future_to_pair):
+            pair = future_to_pair[future]
+            try:
+                raw_rows.append(future.result())
+            except Exception as exc:
+                logger.error("hhalign FAILED for %s vs %s: %s", pair[0], pair[1], exc)
+                failed_edges.append(f"{pair[0]}__{pair[1]}")
+    if failed_edges:
+        logger.warning("%d hhalign edge(s) failed: %s", len(failed_edges), ", ".join(failed_edges[:20]))
 
     raw = pd.DataFrame(raw_rows).sort_values(["q_subfamily_id", "t_subfamily_id"])
     raw.to_csv(out / "hmm_hmm_edges_raw.tsv", sep="\t", index=False)
@@ -239,6 +282,12 @@ def hmm_hmm_edges(
 
 
 def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, logger) -> None:
+    """Step 4: Generate ESM-2 mean-pooled embeddings for subfamily representatives.
+
+    Runs on CPU or GPU depending on ``embed.device`` in config.
+    Sequences longer than ``embed.max_len`` are handled per ``embed.long_seq_policy``.
+    Saves embeddings.npy, ids.txt, lengths.tsv, and metadata.json.
+    """
     try:
         import esm
         import torch
@@ -255,6 +304,12 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
     model, alphabet = esm.pretrained.load_model_and_alphabet_local(weights_path)
     model.eval()
     batch_converter = alphabet.get_batch_converter()
+
+    # Device selection: "cpu", "cuda", or "cuda:0" etc.
+    device_str = str(config["embed"].get("device", "cpu"))
+    device = torch.device(device_str)
+    model = model.to(device)
+    logger.info("Embedding device: %s", device)
 
     max_len = int(config["embed"]["max_len"])
     policy = config["embed"]["long_seq_policy"]
@@ -279,6 +334,7 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
         logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} sequences)")
         
         labels, strs, toks = batch_converter(batch)
+        toks = toks.to(device)
         with torch.no_grad():
             outp = model(toks, repr_layers=[model.num_layers], return_contacts=False)
         reps = outp["representations"][model.num_layers]
@@ -290,7 +346,7 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
         
         # Clear GPU memory after each batch
         del toks, outp, reps
-        if torch.cuda.is_available():
+        if device.type == "cuda":
             torch.cuda.empty_cache()
 
     mat = np.vstack(embs).astype(np.float32)
@@ -316,6 +372,11 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
 
 
 def knn(embeddings_npy: str, ids_txt: str, lengths_tsv: str, out_tsv: str, config: dict) -> None:
+    """Step 5: Find K-nearest neighbors in embedding space.
+
+    Uses FAISS if available, otherwise falls back to sklearn NearestNeighbors.
+    Edges are filtered by cosine similarity and length ratio thresholds.
+    """
     X = np.load(embeddings_npy)
     ids = [x.strip() for x in Path(ids_txt).read_text().splitlines() if x.strip()]
     lens = pd.read_csv(lengths_tsv, sep="\t").set_index("subfamily_id")["rep_length_aa"].to_dict()
@@ -368,6 +429,11 @@ def merge_graph(
     config: dict,
     hmm_relaxed_tsv: str | None = None,
 ) -> None:
+    """Step 6: Merge HMM and embedding edges into strict and functional graphs.
+
+    The strict graph uses only core HMM edges. The functional graph merges
+    relaxed HMM and embedding edges according to ``graph.edge_weight_policy``.
+    """
     Path(out_strict_tsv).parent.mkdir(parents=True, exist_ok=True)
     Path(out_functional_tsv).parent.mkdir(parents=True, exist_ok=True)
     core = pd.read_csv(hmm_core_tsv, sep="\t") if Path(hmm_core_tsv).exists() else pd.DataFrame()
@@ -530,10 +596,20 @@ def map_proteins_to_families(
 
     # Filter hits
     min_cov = float(config["mapping"]["profile_cov_min"])
+    min_pident = float(config["mapping"].get("min_prob", 0.0))
+    min_seg_len = int(config["mapping"].get("min_segment_len", 0))
     if len(df) > 0:
         df["profile_cov"] = df["alnlen"] / df["tlen"]
         df["protein_cov"] = df["alnlen"] / df["qlen"]
+        pre_count = len(df)
         df = df[df["profile_cov"] >= min_cov]
+        if min_pident > 0:
+            df = df[df["pident"] >= min_pident]
+        if min_seg_len > 0:
+            df = df[df["alnlen"] >= min_seg_len]
+        if logger:
+            logger.info("Mapping filter: %d -> %d hits (min_cov=%.2f, min_pident=%.1f, min_seg_len=%d)",
+                        pre_count, len(df), min_cov, min_pident, min_seg_len)
         df = df.sort_values(["query", "evalue", "bits"], ascending=[True, True, False])
 
     max_overlap = int(config["mapping"]["max_overlap_aa"])

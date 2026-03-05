@@ -1,147 +1,156 @@
 # plm-cluster
 
-`plm_cluster` is a reproducible, annotation-independent, fusion-safe protein clustering pipeline for large-scale datasets.
+**Annotation-independent, fusion-safe protein clustering pipeline.**
 
-It combines:
-- MMseqs2 subfamily clustering
-- Multiprocessing-enabled HH-suite profile construction and HMM-HMM edges
-- ESM-2 embeddings on subfamily representatives
-- Graph clustering (Leiden)
-- Segment-based protein-family mapping using mmseqs easy-search for fusion-aware membership
+`plm_cluster` groups proteins into evolutionary families without relying on
+existing functional annotations.  It separates *core-domain identity* from
+*domain architecture* so that fusion proteins do not falsely merge unrelated
+families.
 
-## Documentation map
+```
+Input proteins  ──►  MMseqs2 subfamilies  ──►  HMM profiles  ──►  HMM-HMM edges
+                                                     │
+                               ESM-2 embeddings  ──►  KNN candidates  ──►  Graph merge
+                                                                              │
+                                                              Leiden clustering ──►  Family assignments
+                                                                                         │
+                                                                    Fusion-safe mapping ──►  Matrices & QC
+```
 
-- Algorithm background and design: `docs/algorithm_background.md`
-- Installation and container builds: `docs/installation_and_containers.md`
-- CLI workflow and run options: `docs/cli_workflow_and_options.md`
-- Config template: `docs/config.template.yaml`
-- Output schemas: `docs/output_schemas.md`
+## Pipeline overview
 
-## Core concepts
-
-- **Subfamily**: MMseqs2 cluster of proteins
-- **Strict family (Mode A)**: core-domain identity based on stringent HMM-HMM evidence
-- **Functional family (Mode B)**: broader neighborhood from relaxed HMM + embedding evidence
-- **Architecture**: ordered family segment composition of a full-length protein
-
-This separation prevents fusion proteins from falsely merging core-domain families. Distinct domains are correctly separated by aligning full-length sequences against subfamily representatives with `mmseqs search` and employing greedy overlap filtering.
-
-Additionally, profile construction (`build-profiles`) and edge alignments (`hmm-hmm-edges`) take advantage of multithreading to scale effectively to very large datasets.
-
-## CLI commands
-
-- `mmseqs-cluster`
-- `build-profiles`
-- `embed`
-- `knn`
-- `hmm-hmm-edges`
-- `merge-graph`
-- `cluster-families`
-- `map-proteins-to-families`
-- `write-matrices`
-- `run-all`
-
-Backward-compatible aliases:
-- `cluster` -> `cluster-families`
-- `map-proteins` -> `map-proteins-to-families`
-
-## Requirements
-
-External tools checked at runtime:
-- `mmseqs`
-- `hhmake`
-- `hhalign` (or equivalent HH-suite setup)
-
-Optional:
-- `mcl` (if selected)
-
-Python stack:
-- PyTorch + fair-esm
-- numpy/scipy/pandas
-- scikit-learn (FAISS optional)
-- python-igraph + leidenalg
+| Step | Tool | What it does |
+|------|------|-------------|
+| 1 | MMseqs2 | Cluster proteins into subfamilies by sequence identity |
+| 2 | MAFFT + HH-suite | Build MSAs and profile HMMs per subfamily |
+| 3 | ESM-2 (PyTorch) | Generate mean-pooled embeddings for subfamily reps |
+| 4 | FAISS / sklearn | Find K-nearest embedding neighbors as candidate pairs |
+| 5 | hhalign | Profile-profile alignments on candidate pairs → edge sets |
+| 6 | Leiden | Cluster strict and functional family graphs |
+| 7 | MMseqs2 | Map full-length proteins to families (fusion-aware segments) |
+| 8 | pandas / scipy | Write sparse/dense membership matrices |
+| 9 | matplotlib | Generate QC diagnostic plots |
 
 ## Quick start
 
 ```bash
+# 1. Create environment
 conda env create -f envs/plm_cluster.yaml
-# HPC-safe install path (forces pip into the conda env):
 bash scripts/install_in_conda_env.sh plm_cluster . test,embed
-# Or manual equivalent:
-# conda activate plm_cluster
-# python -m pip install --no-build-isolation --no-user .
 
+# 2. Run the full pipeline
 plm_cluster run-all \
-  --proteins_fasta example_data/toy_proteins.faa \
+  --proteins_fasta proteins.faa \
   --weights_path /path/to/esm2_t33_650M_UR50D.pt \
   --config docs/config.template.yaml \
   --results_root results
 ```
 
+> **CPU or GPU?**  Set `embed.device` in your config to `"cpu"` or `"cuda"`.
+> CPU is the default and works everywhere; GPU accelerates embedding on large
+> datasets.
 
-### `esm-extract` note
+## Key concepts
 
-If `fair-esm` is installed but `esm-extract` is missing from `bin/`, that is a packaging/version behavior.
-This repo provides a compatible `esm-extract` wrapper entrypoint when you install `plm_cluster`.
+- **Subfamily** — MMseqs2 cluster of proteins sharing high sequence identity.
+- **Strict family (Mode A)** — subfamilies linked by high-confidence, high-coverage
+  HMM-HMM alignments.  Use for conservative evolutionary homology groups.
+- **Functional family (Mode B)** — broader neighborhoods from relaxed HMM edges
+  plus embedding similarity.  Use for exploratory function transfer.
+- **Architecture** — the ordered list of family segments per protein.  A protein
+  with segments from two different families is a *fusion protein*.
 
-```bash
-which esm-extract
-esm-extract -h
+## Configuration
+
+Copy `docs/config.template.yaml` and edit to taste.  Every parameter has inline
+comments explaining its purpose, allowed range, and impact.
+
+Key tuning knobs:
+
+| Parameter | Effect |
+|-----------|--------|
+| `mmseqs.min_seq_id` | Subfamily granularity |
+| `hmm_hmm.min_prob_core` | Strict family sensitivity |
+| `graph.leiden_resolution_*` | Family size (lower → larger families) |
+| `embed.device` | CPU or GPU for embeddings |
+| `mapping.min_prob` / `min_segment_len` | Filter noisy/short hits |
+
+See [`docs/config.template.yaml`](docs/config.template.yaml) for the full list.
+
+## CLI commands
+
+```
+plm_cluster mmseqs-cluster       # Step 1
+plm_cluster build-profiles       # Step 2
+plm_cluster embed                # Step 3
+plm_cluster knn                  # Step 4
+plm_cluster hmm-hmm-edges        # Step 5
+plm_cluster merge-graph          # Step 6
+plm_cluster cluster-families     # Step 7
+plm_cluster map-proteins-to-families  # Step 8
+plm_cluster write-matrices       # Step 9
+plm_cluster qc-plots             # Generate QC figures
+plm_cluster run-all              # Run everything end-to-end
 ```
 
+Backward-compatible aliases: `cluster` → `cluster-families`,
+`map-proteins` → `map-proteins-to-families`.
 
-### Ensuring pip installs into the conda env (HPC)
+## Requirements
 
-On some HPC systems, calling bare `pip` can target user/home site-packages.
-Use one of these patterns:
+**External tools** (must be on `$PATH` or set in config):
+- `mmseqs` (MMseqs2)
+- `hhmake`, `hhalign` (HH-suite)
+- `mafft`
 
-```bash
-# safest
-bash scripts/install_in_conda_env.sh plm_cluster . test,embed
-
-# equivalent after activation
-conda activate plm_cluster
-python -m pip install --no-build-isolation --no-user .
-```
-
-
-- MMseqs note: `sensitivity` is applied for non-`linclust` modes; some MMseqs builds reject `-s` for `linclust`.
+**Python** (≥ 3.10):
+- PyTorch + fair-esm (for embeddings)
+- numpy, scipy, pandas, scikit-learn
+- python-igraph + leidenalg (for Leiden clustering)
+- matplotlib (for QC plots, optional)
+- FAISS (optional, falls back to sklearn)
 
 ## Output layout
 
 ```
 results/
-  01_mmseqs/
-  02_profiles/
-  03_hmm_hmm_edges/
-  04_embeddings/
-  05_domain_hits/
-  06_family_clustering/
-  07_membership_matrices/
-  manifests/
-  logs/
+  01_mmseqs/           # Subfamily clustering
+  02_profiles/         # MSAs and HMM profiles
+  03_hmm_hmm_edges/    # Profile-profile edge tables
+  04_embeddings/       # Embedding vectors and KNN edges
+  05_domain_hits/      # Protein-to-family mapping
+  06_family_clustering/ # Family assignment tables
+  07_membership_matrices/ # Sparse/dense matrices
+  qc_plots/            # Diagnostic figures
+  manifests/           # Run metadata and reproducibility
+  logs/                # Per-command log files
 ```
 
-## Compatibility note
+## Documentation
 
-`06_family_clustering/subfamily_to_family.tsv` is preserved as a strict-family alias for older consumers.
+| Document | Contents |
+|----------|----------|
+| [Algorithm background](docs/algorithm_background.md) | Scientific rationale and method details |
+| [CLI workflow](docs/cli_workflow_and_options.md) | Step-by-step and `run-all` usage |
+| [Config reference](docs/config.template.yaml) | All parameters with inline comments |
+| [Output schemas](docs/output_schemas.md) | File formats and column descriptions |
+| [Installation](docs/installation_and_containers.md) | Conda, containers, and HPC tips |
 
 ## HPC and containers
 
 - SLURM examples: `scripts/slurm/`
-- CPU graph/profile Apptainer: `container/container_cpu_graph.def` (alias of `graph_profile.def`)
-- GPU embedder Apptainer: `container/container_embedder.def` (alias of `embedder.def`)
-- Single container: `container/Dockerfile`
+- CPU container: `container/container_cpu_graph.def`
+- GPU container: `container/container_embedder.def`
+- Docker: `container/Dockerfile`
 
 ## Testing
-
-- Packaged test/example FASTA is installed at `plm_cluster/data/toy_proteins.faa` to support isolated test environments.
 
 ```bash
 pytest -q
 ```
 
-Includes unit tests and a mocked-tool smoke workflow test.
+Includes unit tests and a mocked-tool smoke test covering the full pipeline.
 
+## License
 
-Pytest note: some HPC images miss `iniconfig` and `pygments`; the installer script now installs both into the conda env before running tests.
+See repository root.

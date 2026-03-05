@@ -15,6 +15,7 @@ from .pipeline import (
     mmseqs_cluster,
     write_matrices,
 )
+from .qc_plots import generate_qc_plots
 from .runtime import executable_version, require_executables, setup_logging, write_manifest
 
 
@@ -92,6 +93,9 @@ def main() -> None:
     p.add_argument("--protein_family_segments", required=True)
     p.add_argument("--outdir", default="results/07_membership_matrices")
 
+    p = sub.add_parser("qc-plots")
+    add_common(p)
+
     p = sub.add_parser("run-all")
     add_common(p)
     p.add_argument("--proteins_fasta", required=True)
@@ -148,27 +152,40 @@ def main() -> None:
         )
     elif cmd == "write-matrices":
         write_matrices(args.subfamily_map, args.protein_family_segments, args.outdir, cfg)
+    elif cmd == "qc-plots":
+        generate_qc_plots(args.results_root, logger)
     elif cmd == "run-all":
+        import time as _time
         root = Path(args.results_root)
         logger.info("Starting run-all pipeline")
         
-        logger.info("Step 1/8: MMseqs clustering")
-        mmseqs_cluster(args.proteins_fasta, str(root / "01_mmseqs"), cfg, logger)
+        def _timed_step(label, func, *a, **kw):
+            logger.info("Starting %s", label)
+            t0 = _time.time()
+            result = func(*a, **kw)
+            elapsed = _time.time() - t0
+            logger.info("Completed %s in %.1fs", label, elapsed)
+            if isinstance(result, dict):
+                manifest_tools.update(result)
+            return result
+
+        _timed_step("Step 1/8: MMseqs clustering",
+            mmseqs_cluster, args.proteins_fasta, str(root / "01_mmseqs"), cfg, logger)
         
-        logger.info("Step 2/8: Building profiles")
-        build_profiles(args.proteins_fasta, str(root / "01_mmseqs/subfamily_map.tsv"), str(root / "02_profiles"), cfg, logger)
+        _timed_step("Step 2/8: Building profiles",
+            build_profiles, args.proteins_fasta, str(root / "01_mmseqs/subfamily_map.tsv"), str(root / "02_profiles"), cfg, logger)
         
-        logger.info("Step 3/8: Embedding subfamily representatives")
-        embed(str(root / "01_mmseqs/subfamily_reps.faa"), str(root / "04_embeddings"), cfg, args.weights_path, logger)
+        _timed_step("Step 3/8: Embedding subfamily representatives",
+            embed, str(root / "01_mmseqs/subfamily_reps.faa"), str(root / "04_embeddings"), cfg, args.weights_path, logger)
         
-        logger.info("Step 4/8: Computing KNN edges")
-        knn(str(root / "04_embeddings/embeddings.npy"), str(root / "04_embeddings/ids.txt"), str(root / "04_embeddings/lengths.tsv"), str(root / "04_embeddings/embedding_knn_edges.tsv"), cfg)
+        _timed_step("Step 4/8: Computing KNN edges",
+            knn, str(root / "04_embeddings/embeddings.npy"), str(root / "04_embeddings/ids.txt"), str(root / "04_embeddings/lengths.tsv"), str(root / "04_embeddings/embedding_knn_edges.tsv"), cfg)
         
-        logger.info("Step 5/8: Computing HMM-HMM edges")
-        hmm_hmm_edges(str(root / "02_profiles/subfamily_profile_index.tsv"), str(root / "03_hmm_hmm_edges"), cfg, logger, str(root / "04_embeddings/embedding_knn_edges.tsv"))
+        _timed_step("Step 5/8: Computing HMM-HMM edges",
+            hmm_hmm_edges, str(root / "02_profiles/subfamily_profile_index.tsv"), str(root / "03_hmm_hmm_edges"), cfg, logger, str(root / "04_embeddings/embedding_knn_edges.tsv"))
         
-        logger.info("Step 6/8: Merging graphs")
-        merge_graph(
+        _timed_step("Step 6/8: Merging graphs",
+            merge_graph,
             str(root / "03_hmm_hmm_edges/hmm_hmm_edges_core.tsv"),
             str(root / "04_embeddings/embedding_knn_edges.tsv"),
             str(root / "06_family_clustering/merged_edges_strict.tsv"),
@@ -177,8 +194,8 @@ def main() -> None:
             str(root / "03_hmm_hmm_edges/hmm_hmm_edges_relaxed.tsv"),
         )
         
-        logger.info("Step 7/8: Clustering families")
-        cluster_families(
+        _timed_step("Step 7/8: Clustering families",
+            cluster_families,
             str(root / "06_family_clustering/merged_edges_strict.tsv"),
             str(root / "06_family_clustering/merged_edges_functional.tsv"),
             str(root / "01_mmseqs/subfamily_map.tsv"),
@@ -187,8 +204,8 @@ def main() -> None:
             "leiden",
         )
         
-        logger.info("Step 8/8: Mapping proteins to families and writing matrices")
-        map_proteins_to_families(
+        _timed_step("Step 8a/8: Mapping proteins to families",
+            map_proteins_to_families,
             args.proteins_fasta,
             str(root / "06_family_clustering/subfamily_to_family_strict.tsv"),
             str(root / "06_family_clustering/subfamily_to_family_functional.tsv"),
@@ -197,7 +214,11 @@ def main() -> None:
             cfg,
             logger,
         )
-        write_matrices(str(root / "01_mmseqs/subfamily_map.tsv"), str(root / "05_domain_hits/protein_family_segments.tsv"), str(root / "07_membership_matrices"), cfg)
+        _timed_step("Step 8b/8: Writing matrices",
+            write_matrices, str(root / "01_mmseqs/subfamily_map.tsv"), str(root / "05_domain_hits/protein_family_segments.tsv"), str(root / "07_membership_matrices"), cfg)
+        
+        _timed_step("Step 9/9: Generating QC plots",
+            generate_qc_plots, args.results_root, logger)
         
         logger.info("Pipeline completed successfully")
 

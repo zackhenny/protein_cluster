@@ -1,66 +1,122 @@
-seed: 42
+# ============================================================================
+# plm-cluster configuration
+# ============================================================================
+# This file controls every tuneable parameter of the pipeline.
+# Any key you omit here falls back to built-in defaults.
+# Copy this file and edit to taste: plm_cluster run-all --config my_config.yaml
+
+seed: 42                          # Global random seed for reproducibility
+
+# ---------------------------------------------------------------------------
+# External tool paths
+# ---------------------------------------------------------------------------
+# Leave empty ("") to auto-detect from $PATH.  Set full paths if tools are
+# installed in non-standard locations (e.g. HPC module loads).
 tools:
-  mmseqs_path: ""
-  hhmake_path: ""
-  hhsearch_path: ""
-  hhalign_path: ""
-  mafft_path: ""
-  mcl_path: ""
+  mmseqs_path: ""                 # Path to mmseqs binary
+  hhmake_path: ""                 # Path to hhmake (HH-suite)
+  hhsearch_path: ""               # Path to hhsearch (optional)
+  hhalign_path: ""                # Path to hhalign (HH-suite)
+  mafft_path: ""                  # Path to mafft aligner
+  mcl_path: ""                    # Path to mcl (only if --method mcl)
 
+# ---------------------------------------------------------------------------
+# Step 1 — MMseqs2 subfamily clustering
+# ---------------------------------------------------------------------------
+# Proteins are clustered into subfamilies at high sequence identity.
+# Each subfamily gets a representative sequence used downstream.
 mmseqs:
-  mode: linclust
-  min_seq_id: 0.6
-  coverage: 0.8
-  cov_mode: 1
-  evalue: 1e-3
-  sensitivity: 7.5  # used for non-linclust modes
-  threads: 16
-  tmpdir: tmp/mmseqs
+  mode: linclust                  # "linclust" (fast linear) or "cluster" (sensitive)
+  min_seq_id: 0.6                 # Minimum sequence identity to join a cluster [0-1]
+  coverage: 0.8                   # Minimum alignment coverage fraction [0-1]
+  cov_mode: 1                     # MMseqs2 coverage mode (0=query, 1=target, 2=bidirectional)
+  evalue: 1e-3                    # E-value threshold for clustering
+  sensitivity: 7.5                # Sensitivity (-s); ignored for linclust mode
+  threads: 16                     # CPU threads for MMseqs2 (and profile/edge workers)
+  tmpdir: tmp/mmseqs              # Temporary directory for MMseqs2
 
+# ---------------------------------------------------------------------------
+# Step 2 — Subfamily profile construction (MAFFT + HH-suite)
+# ---------------------------------------------------------------------------
+# MSAs and HMM profiles are built for each subfamily.
 profiles:
-  max_members_per_subfamily: 256
+  max_members_per_subfamily: 256  # Cap sequences per subfamily MSA to limit memory
 
+# ---------------------------------------------------------------------------
+# Step 3 — HMM-HMM edge construction (hhalign)
+# ---------------------------------------------------------------------------
+# Profile-profile alignments detect remote homology between subfamilies.
+# Two edge tiers are produced: strict ("core") and relaxed ("functional").
 hmm_hmm:
-  topN: 200
-  mincov_core: 0.70
-  min_prob_core: 90
-  max_evalue_core: 1e-5
-  min_aln_len_core: 120
-  mincov_relaxed: 0.60
-  min_prob_relaxed: 80
-  max_evalue_relaxed: 1e-3
-  min_aln_len_relaxed: 80
+  topN: 200                       # Max candidate neighbors per subfamily from KNN
+  # --- Core (strict) edge thresholds ---
+  mincov_core: 0.70               # Min bidirectional alignment coverage [0-1]
+  min_prob_core: 90               # Min HHalign probability [0-100]
+  max_evalue_core: 1e-5           # Max E-value (alternative to probability gate)
+  min_aln_len_core: 120           # Min aligned columns (amino acids)
+  # --- Relaxed (functional) edge thresholds ---
+  mincov_relaxed: 0.60            # Broader coverage tolerance [0-1]
+  min_prob_relaxed: 80            # Lower probability gate [0-100]
+  max_evalue_relaxed: 1e-3        # Relaxed E-value gate
+  min_aln_len_relaxed: 80         # Shorter alignment tolerance
 
+# ---------------------------------------------------------------------------
+# Step 4 — ESM-2 protein language model embeddings
+# ---------------------------------------------------------------------------
+# Mean-pooled residue embeddings are computed on subfamily reps and used for
+# KNN candidate generation and (optionally) functional graph edges.
 embed:
-  esm_model_name: esm2_t33_650M_UR50D
-  pooling: mean
-  long_seq_policy: truncate
-  max_len: 2048
-  batch_size: 4
+  esm_model_name: esm2_t33_650M_UR50D   # Model identifier (for metadata only)
+  pooling: mean                          # Pooling strategy: "mean" (residue avg)
+  long_seq_policy: truncate              # "truncate" | "skip" | "full"
+  max_len: 2048                          # Max residues per sequence (truncate above)
+  batch_size: 4                          # Sequences per forward pass
+  device: cpu                            # "cpu" or "cuda" / "cuda:0" for GPU
 
+# ---------------------------------------------------------------------------
+# Step 5 — KNN edge construction (embedding space)
+# ---------------------------------------------------------------------------
 knn:
-  k: 100
-  min_cosine: 0.35
-  min_len_ratio: 0.5
-  max_len_ratio: 2.0
+  k: 100                         # Number of nearest neighbors to retrieve
+  min_cosine: 0.35                # Min cosine similarity to keep an edge [-1, 1]
+  min_len_ratio: 0.5              # Min query/target length ratio filter
+  max_len_ratio: 2.0              # Max query/target length ratio filter
 
+# ---------------------------------------------------------------------------
+# Step 6 — Graph merge and Leiden clustering
+# ---------------------------------------------------------------------------
+# Two graphs are constructed (strict & functional) and clustered separately.
 graph:
-  edge_weight_policy: downweight_embeddings  # strict|union|gated|downweight_embeddings
-  w_hmm: 1.0
-  w_emb: 0.35
-  weak_hmm_threshold: 0.2
-  leiden_resolution_strict: 0.7
-  leiden_resolution_functional: 1.0
-  seed: 42
+  # How to combine HMM and embedding edges for the functional graph:
+  #   strict              — HMM core edges only (ignore embeddings)
+  #   union               — max(hmm, emb) weight
+  #   gated               — embedding edges only if weak HMM support exists
+  #   downweight_embeddings — w_hmm*hmm + w_emb*emb (recommended)
+  edge_weight_policy: downweight_embeddings
+  w_hmm: 1.0                     # HMM edge weight multiplier
+  w_emb: 0.35                    # Embedding edge weight multiplier
+  weak_hmm_threshold: 0.2        # Min HMM weight to allow embedding boost (gated)
+  leiden_resolution_strict: 0.7   # Leiden resolution for strict families (lower = larger)
+  leiden_resolution_functional: 1.0  # Leiden resolution for functional families
+  seed: 42                        # Random seed for Leiden
 
+# ---------------------------------------------------------------------------
+# Step 7 — Protein-to-family mapping
+# ---------------------------------------------------------------------------
+# Full-length proteins are aligned against subfamily reps with mmseqs easy-search.
+# A greedy overlap filter prevents the same protein region from being assigned
+# to multiple families (fusion-safe mapping).
 mapping:
-  search_mode: family_reps
-  profile_cov_min: 0.70
-  min_prob: 90
-  max_evalue: 1e-5
-  min_segment_len: 120
-  max_overlap_aa: 30
+  search_mode: family_reps        # Search strategy (currently only family_reps)
+  profile_cov_min: 0.70           # Min fraction of profile (target) covered [0-1]
+  min_prob: 90                    # Min percent identity to accept a hit [0-100]
+  max_evalue: 1e-5                # Max E-value for mmseqs easy-search
+  min_segment_len: 120            # Min alignment length (aa) to accept a segment
+  max_overlap_aa: 30              # Max overlap (aa) between accepted segments
 
+# ---------------------------------------------------------------------------
+# Step 8 — Output matrices
+# ---------------------------------------------------------------------------
 outputs:
-  write_dense_threshold: 2000000
-  write_matrix_market: true
+  write_dense_threshold: 2000000  # Max cells before skipping dense matrix output
+  write_matrix_market: true       # Also write Matrix Market (.mtx) format
