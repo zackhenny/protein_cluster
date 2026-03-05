@@ -107,6 +107,8 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger) -> di
     stats = stats.merge(reps, on="subfamily_id", how="left")
     stats["rep_length_aa"] = stats["rep_protein_id"].map(lambda x: len(seqs.get(x, "")))
     stats.sort_values("subfamily_id").to_csv(out / "subfamily_stats.tsv", sep="\t", index=False)
+    logger.info("MMseqs2 clustering complete: %d proteins → %d subfamilies (median size: %.0f)",
+                len(raw), len(reps_sorted), float(stats["n_members"].median()))
     return tools
 
 
@@ -165,6 +167,7 @@ def build_profiles(proteins_fasta: str, subfamily_map: str, outdir: str, config:
         logger.warning("%d subfamily profile(s) failed: %s", len(failed), ", ".join(failed[:20]))
 
     pd.DataFrame(rows).sort_values("subfamily_id").to_csv(out / "subfamily_profile_index.tsv", sep="\t", index=False)
+    logger.info("Profile construction complete: %d profiles built, %d failed", len(rows), len(failed))
     return tools
 
 
@@ -301,7 +304,18 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
 
     out = _ensure_dir(outdir)
     recs = sorted(read_fasta(reps_fasta), key=lambda x: x.id)
-    model, alphabet = esm.pretrained.load_model_and_alphabet_local(weights_path)
+
+    # PyTorch >= 2.6 defaults torch.load to weights_only=True, which breaks
+    # ESM checkpoints that contain argparse.Namespace objects.  Temporarily
+    # patch torch.load so esm.pretrained.load_model_and_alphabet_local works.
+    import functools
+    _orig_torch_load = torch.load
+    torch.load = functools.partial(_orig_torch_load, weights_only=False)
+    try:
+        logger.info("Loading ESM model from %s", weights_path)
+        model, alphabet = esm.pretrained.load_model_and_alphabet_local(weights_path)
+    finally:
+        torch.load = _orig_torch_load
     model.eval()
     batch_converter = alphabet.get_batch_converter()
 

@@ -28,7 +28,14 @@ def main() -> None:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    model, alphabet = esm.pretrained.load_model_and_alphabet_local(args.model_path)
+    # PyTorch >= 2.6 defaults weights_only=True; ESM checkpoints need False.
+    import functools
+    _orig_torch_load = torch.load
+    torch.load = functools.partial(_orig_torch_load, weights_only=False)
+    try:
+        model, alphabet = esm.pretrained.load_model_and_alphabet_local(args.model_path)
+    finally:
+        torch.load = _orig_torch_load
     model.eval()
     batch_converter = alphabet.get_batch_converter()
 

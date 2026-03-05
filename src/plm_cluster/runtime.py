@@ -14,17 +14,40 @@ import importlib.metadata as importlib_metadata
 
 
 def setup_logging(log_dir: str | Path, name: str) -> logging.Logger:
+    """Configure logging to file + stdout + stderr.
+
+    SLURM captures stdout → .out and stderr → .err, so we send INFO to both
+    streams to ensure the user can track progress in either file.
+    """
+    import sys
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     logger.handlers = []
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    detailed_fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)-7s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # File handler — captures everything (DEBUG+)
     fh = logging.FileHandler(Path(log_dir) / f"{name}.log")
-    fh.setFormatter(fmt)
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(detailed_fmt)
     logger.addHandler(fh)
-    logger.addHandler(sh)
+
+    # stdout handler — captures INFO+ so SLURM .out gets step progress
+    stdout_h = logging.StreamHandler(sys.stdout)
+    stdout_h.setLevel(logging.INFO)
+    stdout_h.setFormatter(detailed_fmt)
+    logger.addHandler(stdout_h)
+
+    # stderr handler — captures WARNING+ so SLURM .err gets problems
+    stderr_h = logging.StreamHandler(sys.stderr)
+    stderr_h.setLevel(logging.WARNING)
+    stderr_h.setFormatter(detailed_fmt)
+    logger.addHandler(stderr_h)
+
     return logger
 
 
