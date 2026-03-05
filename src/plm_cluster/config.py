@@ -136,13 +136,23 @@ def _deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]
 
 
 def load_config(path: str | None) -> dict[str, Any]:
-    """Load config from YAML file, deep-merged over defaults. Validates ranges."""
+    """Load config from a YAML or JSON file, deep-merged over defaults.
+
+    File format is detected by extension: ``.json`` → JSON, anything else → YAML.
+    Validates parameter ranges and raises ``ValueError`` on problems.
+    """
     if not path:
         return deepcopy(DEFAULT_CONFIG)
-    with Path(path).open() as f:
-        user = yaml.safe_load(f) or {}
+    p = Path(path)
+    with p.open() as f:
+        if p.suffix.lower() == ".json":
+            import json
+            user = json.load(f) or {}
+        else:
+            user = yaml.safe_load(f) or {}
     cfg = _deep_merge(DEFAULT_CONFIG, user)
     errors = validate_config(cfg)
     if errors:
         raise ValueError("Config validation errors:\n  " + "\n  ".join(errors))
     return cfg
+

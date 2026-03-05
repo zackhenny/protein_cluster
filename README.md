@@ -62,8 +62,17 @@ plm_cluster run-all \
 
 ## Configuration
 
-Copy `docs/config.template.yaml` and edit to taste.  Every parameter has inline
-comments explaining its purpose, allowed range, and impact.
+The pipeline accepts both **JSON** and **YAML** config files (auto-detected by
+extension).  A ready-to-edit JSON config lives in the project root:
+
+```bash
+plm_cluster run-all --config config.json ...
+# or YAML:
+plm_cluster run-all --config docs/config.template.yaml ...
+```
+
+Copy `config.json` (or `docs/config.template.yaml`) and edit to taste.  Every
+parameter has inline comments explaining its purpose and allowed range.
 
 Key tuning knobs:
 
