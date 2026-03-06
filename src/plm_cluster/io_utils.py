@@ -22,13 +22,13 @@ def read_fasta(path: str | Path) -> list[FastaRecord]:
                 continue
             if line.startswith(">"):
                 if rec_id is not None:
-                    records.append(FastaRecord(rec_id, "".join(seq_parts)))
+                    records.append(FastaRecord(rec_id, "".join(seq_parts).replace("*", "")))
                 rec_id = line[1:].split()[0]
                 seq_parts = []
             else:
                 seq_parts.append(line)
     if rec_id is not None:
-        records.append(FastaRecord(rec_id, "".join(seq_parts)))
+        records.append(FastaRecord(rec_id, "".join(seq_parts).replace("*", "")))
     return records
 
 
