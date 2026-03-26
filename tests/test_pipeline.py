@@ -1,9 +1,38 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from plm_cluster.config import load_config
 from plm_cluster.pipeline import merge_graph, write_matrices
+
+
+def test_load_config_rejects_json(tmp_path: Path):
+    cfg_json = tmp_path / "config.json"
+    cfg_json.write_text('{"seed": 1}')
+    with pytest.raises(ValueError, match="JSON config files are no longer supported"):
+        load_config(str(cfg_json))
+
+
+def test_load_config_rejects_unsupported_extension(tmp_path: Path):
+    cfg_txt = tmp_path / "config.toml"
+    cfg_txt.write_text("seed = 1")
+    with pytest.raises(ValueError, match="Unsupported config file extension"):
+        load_config(str(cfg_txt))
+
+
+def test_load_config_accepts_yaml(tmp_path: Path):
+    cfg_yaml = tmp_path / "config.yaml"
+    cfg_yaml.write_text("seed: 99\n")
+    cfg = load_config(str(cfg_yaml))
+    assert cfg["seed"] == 99
+
+
+def test_load_config_accepts_yml(tmp_path: Path):
+    cfg_yml = tmp_path / "config.yml"
+    cfg_yml.write_text("seed: 77\n")
+    cfg = load_config(str(cfg_yml))
+    assert cfg["seed"] == 77
 
 
 def test_merge_graph_writes_strict_and_functional(tmp_path: Path):

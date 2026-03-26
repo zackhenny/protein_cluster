@@ -137,20 +137,27 @@ def _deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]
 
 
 def load_config(path: str | None) -> dict[str, Any]:
-    """Load config from a YAML or JSON file, deep-merged over defaults.
+    """Load config from a YAML file, deep-merged over defaults.
 
-    File format is detected by extension: ``.json`` → JSON, anything else → YAML.
+    Only ``.yaml`` and ``.yml`` files are accepted.  Passing a ``.json`` file
+    raises a ``ValueError`` with a clear message.
     Validates parameter ranges and raises ``ValueError`` on problems.
     """
     if not path:
         return deepcopy(DEFAULT_CONFIG)
     p = Path(path)
+    if p.suffix.lower() == ".json":
+        raise ValueError(
+            f"JSON config files are no longer supported: '{path}'. "
+            "Please convert your configuration to YAML (.yaml or .yml)."
+        )
+    if p.suffix.lower() not in {".yaml", ".yml"}:
+        raise ValueError(
+            f"Unsupported config file extension '{p.suffix}' for '{path}'. "
+            "Only .yaml and .yml files are accepted."
+        )
     with p.open() as f:
-        if p.suffix.lower() == ".json":
-            import json
-            user = json.load(f) or {}
-        else:
-            user = yaml.safe_load(f) or {}
+        user = yaml.safe_load(f) or {}
     cfg = _deep_merge(DEFAULT_CONFIG, user)
     errors = validate_config(cfg)
     if errors:
