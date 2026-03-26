@@ -79,6 +79,8 @@ Run example:
 ```bash
 apptainer exec plm_cpu_graph.sif plm_cluster --help
 apptainer exec --nv plm_embedder.sif plm_cluster --help
+# Get subcommand-specific help:
+apptainer exec plm_cpu_graph.sif plm_cluster hmm-hmm-edges --help
 ```
 
 ## Single-container Docker build
@@ -93,11 +95,24 @@ Run example:
 docker run --rm -it -v $PWD:/work -w /work plm-cluster:latest
 ```
 
+> **Note:** The Docker entry point launches the top-level `plm_cluster` CLI.
+> To see options for a specific subcommand, pass the subcommand and `--help`:
+>
+> ```bash
+> docker run --rm plm-cluster:latest plm_cluster hmm-hmm-edges --help
+> docker run --rm plm-cluster:latest plm_cluster run-all --help
+> ```
+
 ## Reproducibility notes
 
 - Each run writes `results/manifests/run_manifest.json` with parameters, tool paths, versions, git hash, and input checksums.
 - External commands are logged in `results/logs/`.
 - Keep config YAML checked into your project for exact reruns.
+- The `hmm-hmm-edges` stage writes a real-time NDJSON progress file
+  (`results/03_hmm_hmm_edges/hmm_hmm_progress.ndjson`, or
+  `hmm_hmm_progress.shard_N.ndjson` for sharded runs) that enables safe
+  resumption with `--resume`.  See
+  [cli_workflow_and_options.md](cli_workflow_and_options.md) for details.
 
 ## Why `esm-extract` may be missing after installing `fair-esm`
 
