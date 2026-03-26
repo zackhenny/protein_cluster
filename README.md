@@ -100,8 +100,49 @@ plm_cluster qc-plots             # Generate QC figures
 plm_cluster run-all              # Run everything end-to-end
 ```
 
+To see all options for a subcommand, use `--help`:
+
+```bash
+plm_cluster hmm-hmm-edges --help
+plm_cluster run-all --help
+```
+
 Backward-compatible aliases: `cluster` → `cluster-families`,
 `map-proteins` → `map-proteins-to-families`.
+
+## Resuming interrupted runs and progress logging
+
+The `hmm-hmm-edges` stage (and `run-all`) supports `--resume` to safely
+restart after interruption.  Each processed pair is appended to an NDJSON
+progress log in real time, so only incomplete work is re-run:
+
+| Scenario | Progress file |
+|----------|--------------|
+| Single run | `results/03_hmm_hmm_edges/hmm_hmm_progress.ndjson` |
+| Sharded run (shard *N*) | `results/03_hmm_hmm_edges/hmm_hmm_progress.shard_N.ndjson` |
+
+```bash
+# Resume an interrupted HMM-HMM edge computation
+plm_cluster hmm-hmm-edges \
+  --profile_index results/02_profiles/subfamily_profile_index.tsv \
+  --candidate_edges results/04_embeddings/embedding_knn_edges.tsv \
+  --outdir results/03_hmm_hmm_edges \
+  --resume
+
+# Resume a specific shard
+plm_cluster hmm-hmm-edges \
+  --profile_index results/02_profiles/subfamily_profile_index.tsv \
+  --candidate_edges results/04_embeddings/embedding_knn_edges.tsv \
+  --outdir results/03_hmm_hmm_edges \
+  --shard-id 2 --n-shards 4 --resume
+```
+
+Per-command log files are written to `results/logs/` and a full run manifest
+(parameters, tool versions, input checksums) is saved to
+`results/manifests/run_manifest.json` after every command.
+
+See [`docs/cli_workflow_and_options.md`](docs/cli_workflow_and_options.md) for
+detailed resume and sharding guidance.
 
 ## Requirements
 
