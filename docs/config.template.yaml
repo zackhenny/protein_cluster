@@ -43,11 +43,13 @@ profiles:
   max_members_per_subfamily: 256  # Cap sequences per subfamily MSA to limit memory
 
 # ---------------------------------------------------------------------------
-# Step 3 — HMM-HMM edge construction (hhalign)
+# Step 3 — HMM-HMM edge construction (hhalign / hhsearch)
 # ---------------------------------------------------------------------------
 # Profile-profile alignments detect remote homology between subfamilies.
 # Two edge tiers are produced: strict ("core") and relaxed ("functional").
 hmm_hmm:
+  mode: pairwise                  # "pairwise" (hhalign per pair, default) or
+                                  # "db-search" (build ffindex DB + hhsearch per query)
   topN: 200                       # Max candidate neighbors per subfamily from KNN
   # --- Core (strict) edge thresholds ---
   mincov_core: 0.70               # Min bidirectional alignment coverage [0-1]

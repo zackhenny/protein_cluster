@@ -3,6 +3,8 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import re
+import threading
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -47,6 +49,126 @@ def _parse_hhr_metrics(path: str | Path) -> dict[str, float]:
                 m["pident"] = float(i.group(1))
             break
     return m
+
+
+def _parse_hhr_all_hits(path: str | Path) -> list[dict]:
+    """Parse all hits from an hhsearch .hhr file.
+
+    Returns a list of dicts with keys: target_id, prob, evalue, aln_len, pident.
+    Suitable for parsing hhsearch output where a single file contains many hits.
+    """
+    lines = Path(path).read_text(errors="ignore").splitlines()
+    hits: list[dict] = []
+    i = 0
+    while i < len(lines):
+        # Hit detail blocks start with "No N" followed by ">target_id ..."
+        if lines[i].startswith(">") and i > 0 and re.match(r"^No \d+\s*$", lines[i - 1]):
+            target_id = lines[i][1:].strip().split()[0]
+            m: dict = {"prob": 0.0, "evalue": 1.0, "pident": np.nan, "aln_len": 0}
+            for j in range(i + 1, min(i + 20, len(lines))):
+                line = lines[j]
+                if "Probab=" in line and "E-value=" in line:
+                    p = re.search(r"Probab=([0-9.]+)", line)
+                    e = re.search(r"E-value=([0-9eE+\-.]+)", line)
+                    a = re.search(r"Aligned_cols=([0-9]+)", line)
+                    ii = re.search(r"Identities=([0-9.]+)%", line)
+                    if p:
+                        m["prob"] = float(p.group(1))
+                    if e:
+                        m["evalue"] = float(e.group(1))
+                    if a:
+                        m["aln_len"] = int(a.group(1))
+                    if ii:
+                        m["pident"] = float(ii.group(1))
+                    break
+            hits.append({"target_id": target_id, **m})
+        i += 1
+    return hits
+
+
+_HMM_EDGE_COLS = [
+    "q_subfamily_id", "t_subfamily_id", "prob", "evalue", "bits",
+    "qcov", "tcov", "aln_len", "pident", "tool", "run_id",
+]
+
+
+def _load_hmm_progress(path: Path) -> set[tuple[str, str]]:
+    """Load a set of already-processed (query_id, target_id) pairs from an NDJSON progress file."""
+    done: set[tuple[str, str]] = set()
+    if not path.exists():
+        return done
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            q = rec.get("q")
+            t = rec.get("t")
+            if q and t and rec.get("status") == "ok":
+                done.add((q, t))
+        except Exception:
+            continue
+    return done
+
+
+def _append_hmm_progress(path: Path, rec: dict, lock: threading.Lock) -> None:
+    """Append a single JSON record to the NDJSON progress file (thread-safe)."""
+    line = json.dumps(rec, ensure_ascii=False) + "\n"
+    with lock:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+
+
+def _filter_raw_to_core_relaxed(raw: pd.DataFrame, hc: dict, out: Path) -> None:
+    """Compute and write core and relaxed edge TSVs from a raw edge DataFrame."""
+    raw2 = raw.copy()
+    raw2["mincov"] = raw2[["qcov", "tcov"]].min(axis=1)
+    raw2["edge_weight"] = (raw2["prob"] / 100.0) * raw2["mincov"]
+
+    out_cols = ["q_subfamily_id", "t_subfamily_id", "edge_weight", "prob", "evalue",
+                "qcov", "tcov", "mincov", "aln_len", "source"]
+
+    core = raw2[
+        (raw2["mincov"] >= float(hc["mincov_core"]))
+        & ((raw2["prob"] >= float(hc["min_prob_core"])) | (raw2["evalue"] <= float(hc["max_evalue_core"])))
+        & (raw2["aln_len"] >= int(hc["min_aln_len_core"]))
+    ].copy()
+    core["source"] = "hmm_hmm_core"
+    core[out_cols].to_csv(out / "hmm_hmm_edges_core.tsv", sep="\t", index=False)
+
+    relaxed = raw2[
+        (raw2["mincov"] >= float(hc["mincov_relaxed"]))
+        & ((raw2["prob"] >= float(hc["min_prob_relaxed"])) | (raw2["evalue"] <= float(hc["max_evalue_relaxed"])))
+        & (raw2["aln_len"] >= int(hc["min_aln_len_relaxed"]))
+    ].copy()
+    relaxed["source"] = "hmm_hmm_relaxed"
+    relaxed[out_cols].to_csv(out / "hmm_hmm_edges_relaxed.tsv", sep="\t", index=False)
+
+
+def merge_hmm_shards(outdir: str, config: dict, logger) -> str:
+    """Merge per-shard raw TSV files into a combined raw TSV and produce core/relaxed TSVs.
+
+    Call this after all shards have finished.  Reads every
+    ``hmm_hmm_edges_raw.shard_*.tsv`` found in *outdir*, concatenates them,
+    writes ``hmm_hmm_edges_raw.tsv``, and derives ``hmm_hmm_edges_core.tsv``
+    and ``hmm_hmm_edges_relaxed.tsv`` using the standard thresholds.
+
+    Returns the path to the merged raw TSV.
+    """
+    out = Path(outdir)
+    shard_files = sorted(out.glob("hmm_hmm_edges_raw.shard_*.tsv"))
+    if not shard_files:
+        raise FileNotFoundError(f"No shard TSV files found in {outdir}")
+    logger.info("Merging %d shard TSV(s) from %s", len(shard_files), outdir)
+    dfs = [pd.read_csv(f, sep="\t") for f in shard_files]
+    raw = pd.concat(dfs, ignore_index=True).sort_values(["q_subfamily_id", "t_subfamily_id"])
+    raw_path = out / "hmm_hmm_edges_raw.tsv"
+    raw.to_csv(raw_path, sep="\t", index=False)
+    _filter_raw_to_core_relaxed(raw, config["hmm_hmm"], out)
+    logger.info("Merged raw TSV written to %s", str(raw_path))
+    return str(raw_path)
 
 
 def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger) -> dict[str, str]:
@@ -177,19 +299,56 @@ def hmm_hmm_edges(
     config: dict,
     logger,
     candidate_edges_tsv: str | None = None,
+    *,
+    mode: str | None = None,
+    resume: bool = False,
+    shard_id: int = 0,
+    n_shards: int = 1,
 ) -> dict[str, str]:
-    """Step 3: Compute HMM-HMM profile-profile edges via hhalign.
+    """Step 3: Compute HMM-HMM profile-profile edges.
 
-    If *candidate_edges_tsv* is provided (from KNN), only those pairs are
-    aligned. Otherwise, falls back to all-vs-all (slow for large datasets).
-    Produces core (strict) and relaxed edge tables.
+    Supports two execution modes selected via *mode* (or ``config["hmm_hmm"]["mode"]``):
+
+    ``pairwise`` (default)
+        Runs one ``hhalign`` invocation per candidate pair using a thread pool.
+        Backward-compatible with the original implementation.
+
+    ``db-search``
+        Builds an HH-suite ffindex database from all profiles and runs one
+        ``hhsearch`` invocation per unique query subfamily against the whole
+        database.  Requires ``hhsearch`` and ``ffindex_build`` in PATH (or
+        configured via ``tools``).  Falls back to pairwise if the tools are
+        unavailable.
+
+    *resume*
+        When ``True``, loads already-completed pairs from the NDJSON progress
+        log (``hmm_hmm_progress[.shard_N].ndjson``) and skips them.
+
+    *shard_id* / *n_shards*
+        Split the candidate list across multiple independent jobs.  Each shard
+        writes its own raw TSV (``hmm_hmm_edges_raw.shard_N.tsv``) and progress
+        file.  Call :func:`merge_hmm_shards` afterwards to produce the combined
+        ``hmm_hmm_edges_raw.tsv`` and core/relaxed TSVs.
     """
     out = _ensure_dir(outdir)
-    tools = require_executables(["hhalign"], config["tools"])
+
+    # Resolve execution mode: CLI arg > config > default
+    effective_mode = mode or config.get("hmm_hmm", {}).get("mode", "pairwise")
+
+    # Shard-aware output file names
+    if n_shards > 1:
+        raw_tsv_path = out / f"hmm_hmm_edges_raw.shard_{shard_id}.tsv"
+        progress_path = out / f"hmm_hmm_progress.shard_{shard_id}.ndjson"
+    else:
+        raw_tsv_path = out / "hmm_hmm_edges_raw.tsv"
+        progress_path = out / "hmm_hmm_progress.ndjson"
+
+    # Load profile index
     idx = pd.read_csv(profile_index, sep="\t").sort_values("subfamily_id")
     lengths = {r.subfamily_id: _parse_hhm_len(r.hhm_path) for _, r in idx.iterrows()}
     hhm = {r.subfamily_id: r.hhm_path for _, r in idx.iterrows()}
 
+    # Build candidate list
     cands: list[tuple[str, str]] = []
     topn = int(config["hmm_hmm"]["topN"])
     if candidate_edges_tsv and Path(candidate_edges_tsv).exists():
@@ -209,12 +368,37 @@ def hmm_hmm_edges(
             for t in subfams[i + 1 :]:
                 cands.append((q, t))
 
+    # Deduplicate and canonicalize (always q < t lexicographically)
+    unique_cands = sorted(set(tuple(sorted(x)) for x in cands))
+
+    # Apply sharding
+    if n_shards > 1:
+        unique_cands = [p for i, p in enumerate(unique_cands) if i % n_shards == shard_id]
+        logger.info("Shard %d/%d: %d candidate pairs", shard_id, n_shards, len(unique_cands))
+
+    # Load resume set
+    processed: set[tuple[str, str]] = set()
+    if resume:
+        processed = _load_hmm_progress(progress_path)
+        logger.info("Resume: %d already-processed pairs loaded from %s", len(processed), str(progress_path))
+
+    pending_cands = [p for p in unique_cands if p not in processed]
+    logger.info(
+        "Running HMM-HMM (%s mode) on %d candidate pairs (%d skipped by resume)",
+        effective_mode, len(pending_cands), len(unique_cands) - len(pending_cands),
+    )
+
+    # Prepare raw TSV (append mode for resume, write mode for fresh start)
+    write_header = not (resume and raw_tsv_path.exists())
+    raw_fh_mode = "a" if (resume and raw_tsv_path.exists()) else "w"
+
     run_id = "hmm_hmm_v2"
-    
-    def _process_hh_edge(q, t):
-        out_hhr = out / f"{q}__{t}.hhr"
-        run_cmd([tools["hhalign"], "-i", hhm[q], "-t", hhm[t], "-o", str(out_hhr)], logger)
-        m = _parse_hhr_metrics(out_hhr)
+    prog_lock = threading.Lock()
+
+    # -----------------------------------------------------------------------
+    # Helper: build one row dict from raw metrics
+    # -----------------------------------------------------------------------
+    def _make_row(q: str, t: str, m: dict, tool_name: str) -> dict:
         qlen = max(1, lengths.get(q, 0))
         tlen = max(1, lengths.get(t, 0))
         aln_len = int(m["aln_len"])
@@ -230,58 +414,178 @@ def hmm_hmm_edges(
             "tcov": tcov,
             "aln_len": aln_len,
             "pident": float(m["pident"]) if not np.isnan(m["pident"]) else "NA",
-            "tool": "hhalign",
+            "tool": tool_name,
             "run_id": run_id,
         }
 
     threads = int(config.get("mmseqs", {}).get("threads", 8))
-    raw_rows: list[dict] = []
-    failed_edges: list[str] = []
-    unique_cands = sorted(set(tuple(sorted(x)) for x in cands))
-    logger.info("Running hhalign on %d candidate edge pairs", len(unique_cands))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-        future_to_pair: dict[concurrent.futures.Future, tuple[str, str]] = {}
-        for q, t in unique_cands:
-            fut = executor.submit(_process_hh_edge, q, t)
-            future_to_pair[fut] = (q, t)
-        for future in concurrent.futures.as_completed(future_to_pair):
-            pair = future_to_pair[future]
+
+    # -----------------------------------------------------------------------
+    # Pairwise mode (original behaviour)
+    # -----------------------------------------------------------------------
+    if effective_mode == "pairwise":
+        tools = require_executables(["hhalign"], config["tools"])
+
+        raw_rows: list[dict] = []
+        failed_edges: list[str] = []
+
+        def _process_hh_edge(q: str, t: str) -> dict:
+            out_hhr = out / f"{q}__{t}.hhr"
+            run_cmd([tools["hhalign"], "-i", hhm[q], "-t", hhm[t], "-o", str(out_hhr)], logger)
+            return _make_row(q, t, _parse_hhr_metrics(out_hhr), "hhalign")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            future_to_pair: dict[concurrent.futures.Future, tuple[str, str]] = {}
+            for q, t in pending_cands:
+                fut = executor.submit(_process_hh_edge, q, t)
+                future_to_pair[fut] = (q, t)
+            for future in concurrent.futures.as_completed(future_to_pair):
+                pair = future_to_pair[future]
+                try:
+                    row = future.result()
+                    raw_rows.append(row)
+                    _append_hmm_progress(
+                        progress_path,
+                        {"ts": time.time(), "q": pair[0], "t": pair[1], "status": "ok",
+                         "prob": row["prob"], "evalue": row["evalue"], "aln_len": row["aln_len"]},
+                        prog_lock,
+                    )
+                except Exception as exc:
+                    logger.error("hhalign FAILED for %s vs %s: %s", pair[0], pair[1], exc)
+                    failed_edges.append(f"{pair[0]}__{pair[1]}")
+                    _append_hmm_progress(
+                        progress_path,
+                        {"ts": time.time(), "q": pair[0], "t": pair[1], "status": "failed", "error": str(exc)},
+                        prog_lock,
+                    )
+
+        if failed_edges:
+            logger.warning("%d hhalign edge(s) failed: %s", len(failed_edges), ", ".join(failed_edges[:20]))
+
+        # Write raw TSV (append previously-completed rows when resuming)
+        if resume and raw_tsv_path.exists() and processed:
+            existing = pd.read_csv(raw_tsv_path, sep="\t")
+            new_df = pd.DataFrame(raw_rows) if raw_rows else pd.DataFrame(columns=_HMM_EDGE_COLS)
+            all_rows = pd.concat([existing, new_df], ignore_index=True)
+            all_rows.sort_values(["q_subfamily_id", "t_subfamily_id"]).to_csv(raw_tsv_path, sep="\t", index=False)
+        else:
+            raw_df = (
+                pd.DataFrame(raw_rows).sort_values(["q_subfamily_id", "t_subfamily_id"])
+                if raw_rows
+                else pd.DataFrame(columns=_HMM_EDGE_COLS)
+            )
+            raw_df.to_csv(raw_tsv_path, sep="\t", index=False)
+
+    # -----------------------------------------------------------------------
+    # DB-search mode (hhsearch against ffindex database)
+    # -----------------------------------------------------------------------
+    else:
+        # Try to get hhsearch and ffindex_build; fall back to pairwise on failure
+        try:
+            db_tools = require_executables(["hhsearch", "ffindex_build"], config["tools"])
+        except RuntimeError as exc:
+            logger.warning(
+                "db-search mode requested but tools unavailable (%s); falling back to pairwise hhalign.", exc
+            )
+            return hmm_hmm_edges(
+                profile_index, outdir, config, logger, candidate_edges_tsv,
+                mode="pairwise", resume=resume, shard_id=shard_id, n_shards=n_shards,
+            )
+
+        tools = {**db_tools}
+
+        # Build the ffindex HH-suite DB (shared across shards; idempotent)
+        db_dir = out / "hhsearch_db"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        db_prefix = db_dir / "profiles_db"
+        ffdata = db_dir / "profiles_db.ffdata"
+        ffindex = db_dir / "profiles_db.ffindex"
+
+        if not (ffdata.exists() and ffindex.exists()):
+            logger.info("Building HH-suite ffindex DB from %d profiles", len(hhm))
+            run_cmd(
+                [db_tools["ffindex_build"], str(ffdata), str(ffindex)] + list(hhm.values()),
+                logger,
+            )
+        else:
+            logger.info("HH-suite DB already exists at %s, reusing.", str(db_prefix))
+
+        # Build per-query candidate set (only queries present in pending_cands)
+        query_to_targets: dict[str, set[str]] = defaultdict(set)
+        for q, t in pending_cands:
+            query_to_targets[q].add(t)
+            query_to_targets[t].add(q)  # hhsearch covers both orientations
+
+        # For resume: skip queries where every target candidate is already done
+        pending_queries = sorted(
+            q for q in query_to_targets
+            if any((q, t) not in processed and (t, q) not in processed for t in query_to_targets[q])
+        )
+
+        logger.info("Running hhsearch for %d unique query profiles", len(pending_queries))
+
+        raw_rows_db: list[dict] = []
+        failed_queries: list[str] = []
+
+        for q in pending_queries:
+            out_hhr = out / f"{q}__hhsearch.hhr"
             try:
-                raw_rows.append(future.result())
+                run_cmd(
+                    [db_tools["hhsearch"], "-i", hhm[q], "-d", str(db_prefix),
+                     "-o", str(out_hhr), "-cpu", str(threads)],
+                    logger,
+                )
+                hits = _parse_hhr_all_hits(out_hhr)
+                for hit in hits:
+                    t = hit["target_id"]
+                    if t == q:
+                        continue
+                    # Canonicalize pair
+                    canon = tuple(sorted((q, t)))
+                    if canon in processed:
+                        continue
+                    # Only include if this pair is in our candidate set
+                    if t not in query_to_targets.get(q, set()) and q not in query_to_targets.get(t, set()):
+                        continue
+                    row = _make_row(q, t, hit, "hhsearch")
+                    raw_rows_db.append(row)
+                    processed.add(canon)
+                    _append_hmm_progress(
+                        progress_path,
+                        {"ts": time.time(), "q": canon[0], "t": canon[1], "status": "ok",
+                         "prob": row["prob"], "evalue": row["evalue"], "aln_len": row["aln_len"]},
+                        prog_lock,
+                    )
             except Exception as exc:
-                logger.error("hhalign FAILED for %s vs %s: %s", pair[0], pair[1], exc)
-                failed_edges.append(f"{pair[0]}__{pair[1]}")
-    if failed_edges:
-        logger.warning("%d hhalign edge(s) failed: %s", len(failed_edges), ", ".join(failed_edges[:20]))
+                logger.error("hhsearch FAILED for query %s: %s", q, exc)
+                failed_queries.append(q)
+                _append_hmm_progress(
+                    progress_path,
+                    {"ts": time.time(), "q": q, "t": "", "status": "failed", "error": str(exc)},
+                    prog_lock,
+                )
 
-    raw = pd.DataFrame(raw_rows).sort_values(["q_subfamily_id", "t_subfamily_id"])
-    raw.to_csv(out / "hmm_hmm_edges_raw.tsv", sep="\t", index=False)
+        if failed_queries:
+            logger.warning("%d hhsearch query/queries failed: %s", len(failed_queries), ", ".join(failed_queries[:20]))
 
-    raw2 = raw.copy()
-    raw2["mincov"] = raw2[["qcov", "tcov"]].min(axis=1)
-    raw2["edge_weight"] = (raw2["prob"] / 100.0) * raw2["mincov"]
+        # Write raw TSV
+        if resume and raw_tsv_path.exists() and len(processed) > len(raw_rows_db):
+            existing = pd.read_csv(raw_tsv_path, sep="\t")
+            all_rows = pd.concat([existing, pd.DataFrame(raw_rows_db)], ignore_index=True)
+            all_rows.sort_values(["q_subfamily_id", "t_subfamily_id"]).to_csv(raw_tsv_path, sep="\t", index=False)
+        else:
+            raw_df = pd.DataFrame(raw_rows_db).sort_values(["q_subfamily_id", "t_subfamily_id"]) if raw_rows_db else pd.DataFrame(columns=_HMM_EDGE_COLS)
+            raw_df.to_csv(raw_tsv_path, sep="\t", index=False)
 
-    hc = config["hmm_hmm"]
-    core = raw2[
-        (raw2["mincov"] >= float(hc["mincov_core"]))
-        & ((raw2["prob"] >= float(hc["min_prob_core"])) | (raw2["evalue"] <= float(hc["max_evalue_core"])))
-        & (raw2["aln_len"] >= int(hc["min_aln_len_core"]))
-    ].copy()
-    core["source"] = "hmm_hmm_core"
-    core[
-        ["q_subfamily_id", "t_subfamily_id", "edge_weight", "prob", "evalue", "qcov", "tcov", "mincov", "aln_len", "source"]
-    ].to_csv(out / "hmm_hmm_edges_core.tsv", sep="\t", index=False)
+    # -----------------------------------------------------------------------
+    # Final core/relaxed TSVs (only for non-sharded runs)
+    # -----------------------------------------------------------------------
+    if n_shards == 1:
+        raw = pd.read_csv(raw_tsv_path, sep="\t")
+        _filter_raw_to_core_relaxed(raw, config["hmm_hmm"], out)
 
-    relaxed = raw2[
-        (raw2["mincov"] >= float(hc["mincov_relaxed"]))
-        & ((raw2["prob"] >= float(hc["min_prob_relaxed"])) | (raw2["evalue"] <= float(hc["max_evalue_relaxed"])))
-        & (raw2["aln_len"] >= int(hc["min_aln_len_relaxed"]))
-    ].copy()
-    relaxed["source"] = "hmm_hmm_relaxed"
-    relaxed[
-        ["q_subfamily_id", "t_subfamily_id", "edge_weight", "prob", "evalue", "qcov", "tcov", "mincov", "aln_len", "source"]
-    ].to_csv(out / "hmm_hmm_edges_relaxed.tsv", sep="\t", index=False)
     return tools
+
 
 
 def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, logger) -> None:

@@ -12,6 +12,7 @@ from .pipeline import (
     knn,
     map_proteins_to_families,
     merge_graph,
+    merge_hmm_shards,
     mmseqs_cluster,
     write_matrices,
 )
@@ -62,7 +63,20 @@ def main() -> None:
     add_common(p)
     p.add_argument("--profile_index", required=True)
     p.add_argument("--candidate_edges", default=None)
+    p.add_argument("--mode", default=None, choices=["pairwise", "db-search"],
+                   help="Execution mode: 'pairwise' (default) or 'db-search' (hhsearch DB search)")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip already-completed pairs using the NDJSON progress log")
+    p.add_argument("--shard-id", type=int, default=0, dest="shard_id",
+                   help="Zero-based shard index for parallel execution (default: 0)")
+    p.add_argument("--n-shards", type=int, default=1, dest="n_shards",
+                   help="Total number of shards (default: 1 = no sharding)")
     p.add_argument("--outdir", default="results/03_hmm_hmm_edges")
+
+    p = sub.add_parser("merge-hmm-shards")
+    add_common(p)
+    p.add_argument("--outdir", default="results/03_hmm_hmm_edges",
+                   help="Directory containing per-shard TSV files to merge")
 
     p = sub.add_parser("merge-graph")
     add_common(p)
@@ -100,6 +114,15 @@ def main() -> None:
     add_common(p)
     p.add_argument("--proteins_fasta", required=True)
     p.add_argument("--weights_path", required=True)
+    p.add_argument("--resume", action="store_true",
+                   help="Resume long-running stages where supported (hmm-hmm-edges)")
+    p.add_argument("--hmm-mode", default=None, dest="hmm_mode",
+                   choices=["pairwise", "db-search"],
+                   help="HMM-HMM execution mode for run-all (overrides config)")
+    p.add_argument("--shard-id", type=int, default=0, dest="shard_id",
+                   help="Shard index for the HMM-HMM step in run-all")
+    p.add_argument("--n-shards", type=int, default=1, dest="n_shards",
+                   help="Total shards for the HMM-HMM step in run-all")
 
     args = ap.parse_args()
     cmd = ALIASES.get(args.cmd, args.cmd)
@@ -126,7 +149,12 @@ def main() -> None:
     elif cmd == "knn":
         knn(args.embeddings, args.ids, args.lengths, args.out_tsv, cfg)
     elif cmd == "hmm-hmm-edges":
-        manifest_tools.update(hmm_hmm_edges(args.profile_index, args.outdir, cfg, logger, args.candidate_edges))
+        manifest_tools.update(hmm_hmm_edges(
+            args.profile_index, args.outdir, cfg, logger, args.candidate_edges,
+            mode=args.mode, resume=args.resume, shard_id=args.shard_id, n_shards=args.n_shards,
+        ))
+    elif cmd == "merge-hmm-shards":
+        merge_hmm_shards(args.outdir, cfg, logger)
     elif cmd == "merge-graph":
         out = Path(args.outdir)
         out.mkdir(parents=True, exist_ok=True)
@@ -182,7 +210,9 @@ def main() -> None:
             knn, str(root / "04_embeddings/embeddings.npy"), str(root / "04_embeddings/ids.txt"), str(root / "04_embeddings/lengths.tsv"), str(root / "04_embeddings/embedding_knn_edges.tsv"), cfg)
         
         _timed_step("Step 5/8: Computing HMM-HMM edges",
-            hmm_hmm_edges, str(root / "02_profiles/subfamily_profile_index.tsv"), str(root / "03_hmm_hmm_edges"), cfg, logger, str(root / "04_embeddings/embedding_knn_edges.tsv"))
+            hmm_hmm_edges, str(root / "02_profiles/subfamily_profile_index.tsv"), str(root / "03_hmm_hmm_edges"), cfg, logger, str(root / "04_embeddings/embedding_knn_edges.tsv"),
+            mode=getattr(args, "hmm_mode", None), resume=getattr(args, "resume", False),
+            shard_id=getattr(args, "shard_id", 0), n_shards=getattr(args, "n_shards", 1))
         
         _timed_step("Step 6/8: Merging graphs",
             merge_graph,
