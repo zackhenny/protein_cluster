@@ -29,6 +29,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "profiles": {"max_members_per_subfamily": 256},
     "hmm_hmm": {
+        "mode": "pairwise",
         "topN": 200,
         "mincov_core": 0.70,
         "min_prob_core": 90.0,

@@ -54,6 +54,65 @@ plm_cluster hmm-hmm-edges \
   --config my_config.yaml
 ```
 
+### Resume after interruption
+
+Add `--resume` to pick up where the stage left off.  Progress is recorded in
+`results/03_hmm_hmm_edges/hmm_hmm_progress.ndjson` (one JSON record per line).
+
+```bash
+plm_cluster hmm-hmm-edges \
+  --profile_index results/02_profiles/subfamily_profile_index.tsv \
+  --candidate_edges results/04_embeddings/embedding_knn_edges.tsv \
+  --outdir results/03_hmm_hmm_edges \
+  --config my_config.yaml \
+  --resume
+```
+
+### DB-search mode (faster for dense candidate sets)
+
+Use `--mode db-search` (or set `hmm_hmm.mode: db-search` in your config) to
+build an HH-suite ffindex database and run one `hhsearch` per query instead of
+one `hhalign` per pair.  Requires `hhsearch` and `ffindex_build` in `$PATH`.
+
+```bash
+plm_cluster hmm-hmm-edges \
+  --profile_index results/02_profiles/subfamily_profile_index.tsv \
+  --candidate_edges results/04_embeddings/embedding_knn_edges.tsv \
+  --outdir results/03_hmm_hmm_edges \
+  --config my_config.yaml \
+  --mode db-search
+```
+
+### Sharded parallel execution
+
+Split the candidate list across *N* independent jobs using `--shard-id` and
+`--n-shards`.  Each shard writes its own raw TSV and progress file; call
+`merge-hmm-shards` afterwards to produce the combined outputs.
+
+```bash
+# Run 4 shards in parallel (e.g. across 4 SLURM array jobs)
+for i in 0 1 2 3; do
+  plm_cluster hmm-hmm-edges \
+    --profile_index results/02_profiles/subfamily_profile_index.tsv \
+    --candidate_edges results/04_embeddings/embedding_knn_edges.tsv \
+    --outdir results/03_hmm_hmm_edges \
+    --config my_config.yaml \
+    --shard-id $i --n-shards 4 &
+done
+wait
+
+# Merge shard results
+plm_cluster merge-hmm-shards \
+  --outdir results/03_hmm_hmm_edges \
+  --config my_config.yaml
+```
+
+Individual shards can also use `--resume` to recover from preemption:
+
+```bash
+plm_cluster hmm-hmm-edges ... --shard-id 2 --n-shards 4 --resume
+```
+
 ## 5. Merge graphs (strict + functional)
 ```bash
 plm_cluster merge-graph \
@@ -97,6 +156,7 @@ plm_cluster write-matrices \
 ## Major tuning options
 
 - `mmseqs.*`: subfamily granularity and sensitivity
+- `hmm_hmm.mode`: `pairwise` (default) or `db-search`
 - `hmm_hmm.topN`: candidate density and compute load
 - `hmm_hmm.mincov_core/min_prob_core`: strict evolutionary confidence
 - `hmm_hmm.mincov_relaxed/min_prob_relaxed`: functional neighborhood breadth
