@@ -179,11 +179,13 @@ def test_hmm_hmm_edges_db_search_mode(tmp_path: Path, monkeypatch):
     def fake_require(tools, config_paths=None):
         return {t: t for t in tools}
 
-    def fake_run_db(cmd, logger, cwd=None):
+    def fake_run_db(cmd, logger, cwd=None, stdin=None):
         if cmd[0] == "ffindex_build":
-            # Create the ffdata and ffindex files
-            Path(cmd[1]).write_text("dummy_ffdata")
-            Path(cmd[2]).write_text("dummy_ffindex")
+            # Find .ffdata and .ffindex paths regardless of flag positions
+            ffdata = next(c for c in cmd if c.endswith(".ffdata"))
+            ffindex = next(c for c in cmd if c.endswith(".ffindex"))
+            Path(ffdata).write_text("dummy_ffdata")
+            Path(ffindex).write_text("dummy_ffindex")
         elif cmd[0] == "hhsearch":
             out_path = Path(cmd[cmd.index("-o") + 1])
             # Write a minimal .hhr output with one hit
@@ -295,3 +297,120 @@ def test_hmm_hmm_edges_sharding(tmp_path: Path, monkeypatch):
     assert (out / "hmm_hmm_edges_raw.tsv").exists()
     assert (out / "hmm_hmm_edges_core.tsv").exists()
     assert (out / "hmm_hmm_edges_relaxed.tsv").exists()
+
+
+def test_build_profiles_uses_name_flag_and_partial_resume(tmp_path: Path, monkeypatch):
+    """build-profiles passes -name <subfamily_id> to hhmake; partial resume rebuilds only missing profiles."""
+    cfg = load_config(None)
+    proteins = tmp_path / "toy.faa"
+    proteins.write_text(">p1\nMKTAYIAK\n>p2\nMKTAYIAK\n>p3\nGAVLILKK\n")
+    outdir = tmp_path / "profiles"
+    outdir.mkdir()
+    smap = tmp_path / "subfamily_map.tsv"
+    pd.DataFrame([
+        {"protein_id": "p1", "subfamily_id": "subfam_000000", "is_rep": 1},
+        {"protein_id": "p2", "subfamily_id": "subfam_000000", "is_rep": 0},
+        {"protein_id": "p3", "subfamily_id": "subfam_000001", "is_rep": 1},
+    ]).to_csv(smap, sep="\t", index=False)
+
+    hhmake_name_args: list[str] = []
+
+    def fake_require(tools, config_paths=None):
+        return {t: t for t in tools}
+
+    def fake_run(cmd, logger, cwd=None, stdin=None):
+        if cmd[0] == "mafft":
+            return Path(cmd[-1]).read_text()
+        if cmd[0] == "hhmake":
+            assert "-name" in cmd, "hhmake must include -name for correct hhsearch target IDs"
+            name_idx = cmd.index("-name")
+            hhmake_name_args.append(cmd[name_idx + 1])
+            out_path = Path(cmd[cmd.index("-o") + 1])
+            out_path.write_text(f"HHsearch 3.3\nNAME {cmd[name_idx + 1]}\nLENG 8\n")
+        return ""
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", fake_require)
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", fake_run)
+
+    class DummyLogger:
+        def info(self, *a, **kw): pass
+        def warning(self, *a, **kw): pass
+        def error(self, *a, **kw): pass
+
+    logger = DummyLogger()
+
+    # First full run
+    build_profiles(str(proteins), str(smap), str(outdir), cfg, logger)
+    assert sorted(hhmake_name_args) == ["subfam_000000", "subfam_000001"]
+
+    # Simulate partial failure: delete one profile
+    (outdir / "subfam_000001.hhm").unlink()
+    hhmake_name_args.clear()
+
+    # Resume: only missing profile rebuilt
+    build_profiles(str(proteins), str(smap), str(outdir), cfg, logger, resume=True)
+    assert hhmake_name_args == ["subfam_000001"], "Only the missing profile should be rebuilt on resume"
+
+
+def test_resume_skips_completed_steps(tmp_path: Path, monkeypatch):
+    """Steps skip execution when outputs already exist and resume=True."""
+    cfg = load_config(None)
+
+    def fake_require(tools, config_paths=None):
+        return {t: t for t in tools}
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", fake_require)
+
+    class DummyLogger:
+        def info(self, *a, **kw): pass
+        def warning(self, *a, **kw): pass
+        def error(self, *a, **kw): pass
+
+    logger = DummyLogger()
+
+    # mmseqs_cluster: skip when subfamily_map.tsv exists
+    mm_out = tmp_path / "01_mmseqs"
+    mm_out.mkdir()
+    (mm_out / "subfamily_map.tsv").write_text("protein_id\tsubfamily_id\tis_rep\n")
+    cmd_ran = {"flag": False}
+
+    def fake_run_sentinel(cmd, logger, cwd=None, stdin=None):
+        cmd_ran["flag"] = True
+        return ""
+
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", fake_run_sentinel)
+    mmseqs_cluster("proteins.faa", str(mm_out), cfg, logger, resume=True)
+    assert not cmd_ran["flag"], "mmseqs_cluster should be skipped when resume=True and outputs exist"
+
+    # knn: skip when out_tsv exists
+    emb_out = tmp_path / "04_embeddings"
+    emb_out.mkdir()
+    ids = ["subfam_000000", "subfam_000001"]
+    import numpy as np
+    np.save(emb_out / "embeddings.npy", np.array([[1.0, 0.0], [0.8, 0.2]], dtype=np.float32))
+    (emb_out / "ids.txt").write_text("\n".join(ids) + "\n")
+    pd.DataFrame({"subfamily_id": ids, "rep_length_aa": [8, 8]}).to_csv(
+        emb_out / "lengths.tsv", sep="\t", index=False)
+    knn_out = emb_out / "embedding_knn_edges.tsv"
+    knn_out.write_text("sentinel_knn\n")
+    knn(str(emb_out / "embeddings.npy"), str(emb_out / "ids.txt"),
+        str(emb_out / "lengths.tsv"), str(knn_out), cfg, logger=logger, resume=True)
+    assert "sentinel_knn" in knn_out.read_text(), "knn should preserve existing file when resume=True"
+
+    # merge_graph: skip when both output files exist
+    mg_out = tmp_path / "06_fc"
+    mg_out.mkdir()
+    strict_f = mg_out / "merged_edges_strict.tsv"
+    func_f = mg_out / "merged_edges_functional.tsv"
+    strict_f.write_text("sentinel_strict\n")
+    func_f.write_text("sentinel_functional\n")
+    merge_graph("hmm_core.tsv", "emb.tsv", str(strict_f), str(func_f), cfg,
+                logger=logger, resume=True)
+    assert "sentinel_strict" in strict_f.read_text(), "merge_graph should skip when resume=True and outputs exist"
+
+    # write_matrices: skip when sparse output exists
+    wm_out = tmp_path / "07_matrices"
+    wm_out.mkdir()
+    (wm_out / "subfamily_x_protein_sparse.tsv").write_text("sentinel_matrix\n")
+    write_matrices("smap.tsv", "segs.tsv", str(wm_out), cfg, logger=logger, resume=True)
+    assert "sentinel_matrix" in (wm_out / "subfamily_x_protein_sparse.tsv").read_text()

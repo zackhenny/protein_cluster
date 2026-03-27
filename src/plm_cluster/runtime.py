@@ -72,9 +72,9 @@ def require_executables(tools: list[str], config_paths: dict[str, str] | None = 
     return resolved
 
 
-def run_cmd(cmd: list[str], logger: logging.Logger, cwd: str | None = None) -> str:
+def run_cmd(cmd: list[str], logger: logging.Logger, cwd: str | None = None, stdin: str | None = None) -> str:
     logger.info("CMD: %s", " ".join(cmd))
-    out = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    out = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, input=stdin)
     if out.stdout:
         logger.info("STDOUT: %s", out.stdout.strip())
     if out.stderr:

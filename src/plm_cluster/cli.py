@@ -39,18 +39,24 @@ def main() -> None:
     add_common(p)
     p.add_argument("--proteins_fasta", required=True)
     p.add_argument("--outdir", default="results/01_mmseqs")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip this step if its output files already exist")
 
     p = sub.add_parser("build-profiles")
     add_common(p)
     p.add_argument("--proteins_fasta", required=True)
     p.add_argument("--subfamily_map", required=True)
     p.add_argument("--outdir", default="results/02_profiles")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip already-built per-subfamily profiles; rebuild only missing ones")
 
     p = sub.add_parser("embed")
     add_common(p)
     p.add_argument("--reps_fasta", required=True)
     p.add_argument("--weights_path", required=True)
     p.add_argument("--outdir", default="results/04_embeddings")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip this step if embeddings.npy already exists")
 
     p = sub.add_parser("knn")
     add_common(p)
@@ -58,6 +64,8 @@ def main() -> None:
     p.add_argument("--ids", required=True)
     p.add_argument("--lengths", required=True)
     p.add_argument("--out_tsv", default="results/04_embeddings/embedding_knn_edges.tsv")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip this step if the output TSV already exists")
 
     p = sub.add_parser("hmm-hmm-edges")
     add_common(p)
@@ -77,6 +85,8 @@ def main() -> None:
     add_common(p)
     p.add_argument("--outdir", default="results/03_hmm_hmm_edges",
                    help="Directory containing per-shard TSV files to merge")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip this step if the merged output already exists")
 
     p = sub.add_parser("merge-graph")
     add_common(p)
@@ -84,6 +94,8 @@ def main() -> None:
     p.add_argument("--embedding_edges", required=True)
     p.add_argument("--hmm_relaxed", default=None)
     p.add_argument("--outdir", default="results/06_family_clustering")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip this step if merged graph files already exist")
 
     p = sub.add_parser("cluster-families")
     add_common(p)
@@ -92,6 +104,8 @@ def main() -> None:
     p.add_argument("--subfamily_map", required=True)
     p.add_argument("--outdir", default="results/06_family_clustering")
     p.add_argument("--method", default="leiden", choices=["leiden", "mcl"])
+    p.add_argument("--resume", action="store_true",
+                   help="Skip this step if family assignment files already exist")
 
     p = sub.add_parser("map-proteins-to-families")
     add_common(p)
@@ -100,15 +114,21 @@ def main() -> None:
     p.add_argument("--subfamily_to_family_functional", required=True)
     p.add_argument("--subfamily_map", required=True)
     p.add_argument("--outdir", default="results/05_domain_hits")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip this step if protein mapping outputs already exist")
 
     p = sub.add_parser("write-matrices")
     add_common(p)
     p.add_argument("--subfamily_map", required=True)
     p.add_argument("--protein_family_segments", required=True)
     p.add_argument("--outdir", default="results/07_membership_matrices")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip this step if matrix output files already exist")
 
     p = sub.add_parser("qc-plots")
     add_common(p)
+    p.add_argument("--resume", action="store_true",
+                   help="Skip QC plot generation if the output directory already has plots")
 
     p = sub.add_parser("run-all")
     add_common(p)
@@ -141,20 +161,22 @@ def main() -> None:
         logger.info("hhmake version: %s", executable_version(manifest_tools["hhmake"]))
 
     if cmd == "mmseqs-cluster":
-        manifest_tools.update(mmseqs_cluster(args.proteins_fasta, args.outdir, cfg, logger))
+        manifest_tools.update(mmseqs_cluster(args.proteins_fasta, args.outdir, cfg, logger,
+                                              resume=args.resume))
     elif cmd == "build-profiles":
-        manifest_tools.update(build_profiles(args.proteins_fasta, args.subfamily_map, args.outdir, cfg, logger))
+        manifest_tools.update(build_profiles(args.proteins_fasta, args.subfamily_map, args.outdir, cfg, logger,
+                                             resume=args.resume))
     elif cmd == "embed":
-        embed(args.reps_fasta, args.outdir, cfg, args.weights_path, logger)
+        embed(args.reps_fasta, args.outdir, cfg, args.weights_path, logger, resume=args.resume)
     elif cmd == "knn":
-        knn(args.embeddings, args.ids, args.lengths, args.out_tsv, cfg)
+        knn(args.embeddings, args.ids, args.lengths, args.out_tsv, cfg, logger=logger, resume=args.resume)
     elif cmd == "hmm-hmm-edges":
         manifest_tools.update(hmm_hmm_edges(
             args.profile_index, args.outdir, cfg, logger, args.candidate_edges,
             mode=args.mode, resume=args.resume, shard_id=args.shard_id, n_shards=args.n_shards,
         ))
     elif cmd == "merge-hmm-shards":
-        merge_hmm_shards(args.outdir, cfg, logger)
+        merge_hmm_shards(args.outdir, cfg, logger, resume=args.resume)
     elif cmd == "merge-graph":
         out = Path(args.outdir)
         out.mkdir(parents=True, exist_ok=True)
@@ -165,9 +187,12 @@ def main() -> None:
             str(out / "merged_edges_functional.tsv"),
             cfg,
             args.hmm_relaxed,
+            logger=logger,
+            resume=args.resume,
         )
     elif cmd == "cluster-families":
-        cluster_families(args.merged_edges_strict, args.merged_edges_functional, args.subfamily_map, args.outdir, cfg, args.method)
+        cluster_families(args.merged_edges_strict, args.merged_edges_functional, args.subfamily_map, args.outdir, cfg,
+                         args.method, logger=logger, resume=args.resume)
     elif cmd == "map-proteins-to-families":
         map_proteins_to_families(
             args.proteins_fasta,
@@ -177,16 +202,19 @@ def main() -> None:
             args.outdir,
             cfg,
             logger,
+            resume=args.resume,
         )
     elif cmd == "write-matrices":
-        write_matrices(args.subfamily_map, args.protein_family_segments, args.outdir, cfg)
+        write_matrices(args.subfamily_map, args.protein_family_segments, args.outdir, cfg,
+                       logger=logger, resume=args.resume)
     elif cmd == "qc-plots":
         generate_qc_plots(args.results_root, logger)
     elif cmd == "run-all":
         import time as _time
         root = Path(args.results_root)
-        logger.info("Starting run-all pipeline")
-        
+        resume = args.resume
+        logger.info("Starting run-all pipeline%s", " (resume mode)" if resume else "")
+
         def _timed_step(label, func, *a, **kw):
             logger.info("Starting %s", label)
             t0 = _time.time()
@@ -197,24 +225,32 @@ def main() -> None:
                 manifest_tools.update(result)
             return result
 
-        _timed_step("Step 1/8: MMseqs clustering",
-            mmseqs_cluster, args.proteins_fasta, str(root / "01_mmseqs"), cfg, logger)
-        
-        _timed_step("Step 2/8: Building profiles",
-            build_profiles, args.proteins_fasta, str(root / "01_mmseqs/subfamily_map.tsv"), str(root / "02_profiles"), cfg, logger)
-        
-        _timed_step("Step 3/8: Embedding subfamily representatives",
-            embed, str(root / "01_mmseqs/subfamily_reps.faa"), str(root / "04_embeddings"), cfg, args.weights_path, logger)
-        
-        _timed_step("Step 4/8: Computing KNN edges",
-            knn, str(root / "04_embeddings/embeddings.npy"), str(root / "04_embeddings/ids.txt"), str(root / "04_embeddings/lengths.tsv"), str(root / "04_embeddings/embedding_knn_edges.tsv"), cfg)
-        
-        _timed_step("Step 5/8: Computing HMM-HMM edges",
-            hmm_hmm_edges, str(root / "02_profiles/subfamily_profile_index.tsv"), str(root / "03_hmm_hmm_edges"), cfg, logger, str(root / "04_embeddings/embedding_knn_edges.tsv"),
-            mode=getattr(args, "hmm_mode", None), resume=getattr(args, "resume", False),
+        _timed_step("Step 1/9: MMseqs clustering",
+            mmseqs_cluster, args.proteins_fasta, str(root / "01_mmseqs"), cfg, logger,
+            resume=resume)
+
+        _timed_step("Step 2/9: Building profiles",
+            build_profiles, args.proteins_fasta, str(root / "01_mmseqs/subfamily_map.tsv"),
+            str(root / "02_profiles"), cfg, logger, resume=resume)
+
+        _timed_step("Step 3/9: Embedding subfamily representatives",
+            embed, str(root / "01_mmseqs/subfamily_reps.faa"), str(root / "04_embeddings"),
+            cfg, args.weights_path, logger, resume=resume)
+
+        _timed_step("Step 4/9: Computing KNN edges",
+            knn, str(root / "04_embeddings/embeddings.npy"), str(root / "04_embeddings/ids.txt"),
+            str(root / "04_embeddings/lengths.tsv"),
+            str(root / "04_embeddings/embedding_knn_edges.tsv"),
+            cfg, logger=logger, resume=resume)
+
+        _timed_step("Step 5/9: Computing HMM-HMM edges",
+            hmm_hmm_edges, str(root / "02_profiles/subfamily_profile_index.tsv"),
+            str(root / "03_hmm_hmm_edges"), cfg, logger,
+            str(root / "04_embeddings/embedding_knn_edges.tsv"),
+            mode=getattr(args, "hmm_mode", None), resume=resume,
             shard_id=getattr(args, "shard_id", 0), n_shards=getattr(args, "n_shards", 1))
-        
-        _timed_step("Step 6/8: Merging graphs",
+
+        _timed_step("Step 6/9: Merging graphs",
             merge_graph,
             str(root / "03_hmm_hmm_edges/hmm_hmm_edges_core.tsv"),
             str(root / "04_embeddings/embedding_knn_edges.tsv"),
@@ -222,9 +258,11 @@ def main() -> None:
             str(root / "06_family_clustering/merged_edges_functional.tsv"),
             cfg,
             str(root / "03_hmm_hmm_edges/hmm_hmm_edges_relaxed.tsv"),
+            logger=logger,
+            resume=resume,
         )
-        
-        _timed_step("Step 7/8: Clustering families",
+
+        _timed_step("Step 7/9: Clustering families",
             cluster_families,
             str(root / "06_family_clustering/merged_edges_strict.tsv"),
             str(root / "06_family_clustering/merged_edges_functional.tsv"),
@@ -232,9 +270,11 @@ def main() -> None:
             str(root / "06_family_clustering"),
             cfg,
             "leiden",
+            logger=logger,
+            resume=resume,
         )
-        
-        _timed_step("Step 8a/8: Mapping proteins to families",
+
+        _timed_step("Step 8a/9: Mapping proteins to families",
             map_proteins_to_families,
             args.proteins_fasta,
             str(root / "06_family_clustering/subfamily_to_family_strict.tsv"),
@@ -243,13 +283,22 @@ def main() -> None:
             str(root / "05_domain_hits"),
             cfg,
             logger,
+            resume=resume,
         )
-        _timed_step("Step 8b/8: Writing matrices",
-            write_matrices, str(root / "01_mmseqs/subfamily_map.tsv"), str(root / "05_domain_hits/protein_family_segments.tsv"), str(root / "07_membership_matrices"), cfg)
-        
+
+        _timed_step("Step 8b/9: Writing matrices",
+            write_matrices,
+            str(root / "01_mmseqs/subfamily_map.tsv"),
+            str(root / "05_domain_hits/protein_family_segments.tsv"),
+            str(root / "07_membership_matrices"),
+            cfg,
+            logger=logger,
+            resume=resume,
+        )
+
         _timed_step("Step 9/9: Generating QC plots",
             generate_qc_plots, args.results_root, logger)
-        
+
         logger.info("Pipeline completed successfully")
 
     write_manifest(
