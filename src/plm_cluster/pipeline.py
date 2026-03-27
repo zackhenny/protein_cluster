@@ -64,6 +64,9 @@ def _parse_hhr_all_hits(path: str | Path) -> list[dict]:
         # Hit detail blocks start with "No N" followed by ">target_id ..."
         if lines[i].startswith(">") and i > 0 and re.match(r"^No \d+\s*$", lines[i - 1]):
             target_id = lines[i][1:].strip().split()[0]
+            # Strip .hhm extension when ffindex_build stored entries by filename
+            if target_id.endswith(".hhm"):
+                target_id = target_id[:-4]
             m: dict = {"prob": 0.0, "evalue": 1.0, "pident": np.nan, "aln_len": 0}
             for j in range(i + 1, min(i + 20, len(lines))):
                 line = lines[j]
@@ -147,7 +150,7 @@ def _filter_raw_to_core_relaxed(raw: pd.DataFrame, hc: dict, out: Path) -> None:
     relaxed[out_cols].to_csv(out / "hmm_hmm_edges_relaxed.tsv", sep="\t", index=False)
 
 
-def merge_hmm_shards(outdir: str, config: dict, logger) -> str:
+def merge_hmm_shards(outdir: str, config: dict, logger, resume: bool = False) -> str:
     """Merge per-shard raw TSV files into a combined raw TSV and produce core/relaxed TSVs.
 
     Call this after all shards have finished.  Reads every
@@ -158,6 +161,10 @@ def merge_hmm_shards(outdir: str, config: dict, logger) -> str:
     Returns the path to the merged raw TSV.
     """
     out = Path(outdir)
+    merged_path = out / "hmm_hmm_edges_raw.tsv"
+    if resume and merged_path.exists():
+        logger.info("Resume: merged HMM-HMM edges already exist at %s, skipping.", str(merged_path))
+        return str(merged_path)
     shard_files = sorted(out.glob("hmm_hmm_edges_raw.shard_*.tsv"))
     if not shard_files:
         raise FileNotFoundError(f"No shard TSV files found in {outdir}")
@@ -171,13 +178,16 @@ def merge_hmm_shards(outdir: str, config: dict, logger) -> str:
     return str(raw_path)
 
 
-def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger) -> dict[str, str]:
+def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger, resume: bool = False) -> dict[str, str]:
     """Step 1: Cluster proteins into subfamilies using MMseqs2.
 
     Produces subfamily_map.tsv, subfamily_reps.faa, and subfamily_stats.tsv.
     Returns a dict of resolved tool paths for manifest tracking.
     """
     out = _ensure_dir(outdir)
+    if resume and (out / "subfamily_map.tsv").exists():
+        logger.info("Resume: mmseqs-cluster outputs already exist in %s, skipping.", str(out))
+        return require_executables(["mmseqs"], config["tools"])
     mm = config["mmseqs"]
     tools = require_executables(["mmseqs"], config["tools"])
     tmpdir = _ensure_dir(mm["tmpdir"])
@@ -234,11 +244,16 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger) -> di
     return tools
 
 
-def build_profiles(proteins_fasta: str, subfamily_map: str, outdir: str, config: dict, logger) -> dict[str, str]:
+def build_profiles(proteins_fasta: str, subfamily_map: str, outdir: str, config: dict, logger, resume: bool = False) -> dict[str, str]:
     """Step 2: Build MSAs (MAFFT) and profile HMMs (hhmake) for each subfamily.
 
     Profiles are used downstream for HMM-HMM edge detection. Large subfamilies
     are capped at ``profiles.max_members_per_subfamily`` members.
+
+    When *resume* is True, subfamilies whose ``.hhm`` file already exists are
+    skipped; newly built profiles are combined with previously built ones before
+    writing ``subfamily_profile_index.tsv``.
+
     Returns resolved tool paths.
     """
     out = _ensure_dir(outdir)
@@ -258,7 +273,9 @@ def build_profiles(proteins_fasta: str, subfamily_map: str, outdir: str, config:
         write_fasta(fa, [FastaRecord(pid, seqs[pid]) for pid in members if pid in seqs])
         msa = run_cmd([tools["mafft"], "--auto", str(fa)], logger)
         a3m.write_text(msa)
-        run_cmd([tools["hhmake"], "-i", str(a3m), "-o", str(hhm)], logger)
+        # -name ensures the HMM NAME field matches the subfamily ID so that
+        # hhsearch hit output contains correct target IDs for db-search mode.
+        run_cmd([tools["hhmake"], "-i", str(a3m), "-o", str(hhm), "-name", subfam], logger)
         return {
             "subfamily_id": subfam,
             "hhm_path": str(hhm),
@@ -270,12 +287,37 @@ def build_profiles(proteins_fasta: str, subfamily_map: str, outdir: str, config:
 
     threads = int(config.get("mmseqs", {}).get("threads", 8))
     rows: list[dict] = []
-    
+
+    # Collect all subfamily → member lists (pandas groupby keys are strings here)
+    subfam_members: dict[str, list[str]] = {
+        subfam: sorted(grp["protein_id"].tolist())[:cap]
+        for subfam, grp in smap.groupby("subfamily_id", sort=True)
+    }
+
+    # Resume: collect rows for already-built profiles; only rebuild missing ones
+    if resume:
+        for subfam, members in subfam_members.items():
+            hhm_path = out / f"{subfam}.hhm"
+            if hhm_path.exists():
+                a3m_path = out / f"{subfam}.a3m"
+                rows.append({
+                    "subfamily_id": subfam,
+                    "hhm_path": str(hhm_path),
+                    "msa_path": str(a3m_path) if a3m_path.exists() else "",
+                    "n_members_used": len(members),
+                    "build_tool": "mafft+hhmake",
+                    "build_params_json": json.dumps({"mafft": "--auto", "max_members": cap}),
+                })
+        pending_subfams = [(s, m) for s, m in subfam_members.items() if not (out / f"{s}.hhm").exists()]
+        logger.info("Resume: %d profiles already built, building %d missing.",
+                    len(rows), len(pending_subfams))
+    else:
+        pending_subfams = list(subfam_members.items())
+
     failed: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
         future_to_subfam: dict[concurrent.futures.Future, str] = {}
-        for subfam, grp in smap.groupby("subfamily_id", sort=True):
-            members = sorted(grp["protein_id"].tolist())[:cap]
+        for subfam, members in pending_subfams:
             fut = executor.submit(_process_subfam, subfam, members)
             future_to_subfam[fut] = subfam
         for future in concurrent.futures.as_completed(future_to_subfam):
@@ -289,7 +331,7 @@ def build_profiles(proteins_fasta: str, subfamily_map: str, outdir: str, config:
         logger.warning("%d subfamily profile(s) failed: %s", len(failed), ", ".join(failed[:20]))
 
     pd.DataFrame(rows).sort_values("subfamily_id").to_csv(out / "subfamily_profile_index.tsv", sep="\t", index=False)
-    logger.info("Profile construction complete: %d profiles built, %d failed", len(rows), len(failed))
+    logger.info("Profile construction complete: %d profiles built/loaded, %d failed", len(rows), len(failed))
     return tools
 
 
@@ -503,9 +545,15 @@ def hmm_hmm_edges(
 
         if not (ffdata.exists() and ffindex.exists()):
             logger.info("Building HH-suite ffindex DB from %d profiles", len(hhm))
+            # Pass file list via stdin to avoid ARG_MAX limits for large datasets.
+            # sorted() ensures a consistent, reproducible entry order in the DB.
+            # The -s flag sorts the ffindex, which is required by hhsearch for
+            # efficient binary-search lookups.
+            file_list_str = "\n".join(sorted(hhm.values())) + "\n"
             run_cmd(
-                [db_tools["ffindex_build"], str(ffdata), str(ffindex)] + list(hhm.values()),
+                [db_tools["ffindex_build"], "-s", str(ffdata), str(ffindex)],
                 logger,
+                stdin=file_list_str,
             )
         else:
             logger.info("HH-suite DB already exists at %s, reusing.", str(db_prefix))
@@ -588,13 +636,17 @@ def hmm_hmm_edges(
 
 
 
-def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, logger) -> None:
+def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, logger, resume: bool = False) -> None:
     """Step 4: Generate ESM-2 mean-pooled embeddings for subfamily representatives.
 
     Runs on CPU or GPU depending on ``embed.device`` in config.
     Sequences longer than ``embed.max_len`` are handled per ``embed.long_seq_policy``.
     Saves embeddings.npy, ids.txt, lengths.tsv, and metadata.json.
     """
+    out_path = Path(outdir) / "embeddings.npy"
+    if resume and out_path.exists():
+        logger.info("Resume: embeddings already exist at %s, skipping.", str(out_path))
+        return
     try:
         import esm
         import torch
@@ -689,12 +741,16 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
     )
 
 
-def knn(embeddings_npy: str, ids_txt: str, lengths_tsv: str, out_tsv: str, config: dict) -> None:
+def knn(embeddings_npy: str, ids_txt: str, lengths_tsv: str, out_tsv: str, config: dict, logger=None, resume: bool = False) -> None:
     """Step 5: Find K-nearest neighbors in embedding space.
 
     Uses FAISS if available, otherwise falls back to sklearn NearestNeighbors.
     Edges are filtered by cosine similarity and length ratio thresholds.
     """
+    if resume and Path(out_tsv).exists():
+        if logger:
+            logger.info("Resume: KNN edges already exist at %s, skipping.", out_tsv)
+        return
     X = np.load(embeddings_npy)
     ids = [x.strip() for x in Path(ids_txt).read_text().splitlines() if x.strip()]
     lens = pd.read_csv(lengths_tsv, sep="\t").set_index("subfamily_id")["rep_length_aa"].to_dict()
@@ -746,12 +802,18 @@ def merge_graph(
     out_functional_tsv: str,
     config: dict,
     hmm_relaxed_tsv: str | None = None,
+    logger=None,
+    resume: bool = False,
 ) -> None:
     """Step 6: Merge HMM and embedding edges into strict and functional graphs.
 
     The strict graph uses only core HMM edges. The functional graph merges
     relaxed HMM and embedding edges according to ``graph.edge_weight_policy``.
     """
+    if resume and Path(out_strict_tsv).exists() and Path(out_functional_tsv).exists():
+        if logger:
+            logger.info("Resume: merged graph files already exist, skipping merge-graph.")
+        return
     Path(out_strict_tsv).parent.mkdir(parents=True, exist_ok=True)
     Path(out_functional_tsv).parent.mkdir(parents=True, exist_ok=True)
     core = pd.read_csv(hmm_core_tsv, sep="\t") if Path(hmm_core_tsv).exists() else pd.DataFrame()
@@ -826,8 +888,14 @@ def cluster_families(
     outdir: str,
     config: dict,
     method: str = "leiden",
+    logger=None,
+    resume: bool = False,
 ) -> None:
     out = _ensure_dir(outdir)
+    if resume and (out / "subfamily_to_family_strict.tsv").exists() and (out / "subfamily_to_family_functional.tsv").exists():
+        if logger:
+            logger.info("Resume: cluster-families outputs already exist in %s, skipping.", str(out))
+        return
     if method == "mcl":
         require_executables(["mcl"], config["tools"])
         raise RuntimeError("MCL comparison requested but not implemented in this minimal release.")
@@ -873,11 +941,15 @@ def map_proteins_to_families(
     outdir: str,
     config: dict,
     logger=None,
+    resume: bool = False,
 ) -> None:
     if logger is None:
         import logging
         logger = logging.getLogger(__name__)
     out = _ensure_dir(outdir)
+    if resume and (out / "protein_vs_profile_hits.tsv").exists():
+        logger.info("Resume: map-proteins-to-families outputs already exist in %s, skipping.", str(out))
+        return
     
     tools = require_executables(["mmseqs"], config["tools"])
     sub_reps = Path(outdir).parent / "01_mmseqs" / "subfamily_reps.faa"
@@ -1027,8 +1099,12 @@ def _write_dense_if_small(sparse: pd.DataFrame, row_col: tuple[str, str], out_pa
         sparse.pivot_table(index=row_col[0], columns=row_col[1], values="value", fill_value=0).to_csv(out_path, sep="\t")
 
 
-def write_matrices(subfamily_map: str, protein_family_segments: str, outdir: str, config: dict) -> None:
+def write_matrices(subfamily_map: str, protein_family_segments: str, outdir: str, config: dict, logger=None, resume: bool = False) -> None:
     out = _ensure_dir(outdir)
+    if resume and (out / "subfamily_x_protein_sparse.tsv").exists():
+        if logger:
+            logger.info("Resume: write-matrices outputs already exist in %s, skipping.", str(out))
+        return
     smap = pd.read_csv(subfamily_map, sep="\t")
     if Path(protein_family_segments).exists() and Path(protein_family_segments).stat().st_size > 0:
         seg = pd.read_csv(protein_family_segments, sep="\t")
