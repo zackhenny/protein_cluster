@@ -846,8 +846,8 @@ def _cluster_leiden(edges: pl.DataFrame, resolution: float, seed: int) -> pl.Dat
         seed=seed,
     )
     return pl.DataFrame({
-        "subfamily_id": pl.Series("subfamily_id", nodes, dtype=pl.String),
-        "community": pl.Series("community", part.membership, dtype=pl.Int64),
+        "subfamily_id": pl.Series(name="subfamily_id", values=nodes, dtype=pl.String),
+        "community": pl.Series(name="community", values=part.membership, dtype=pl.Int64),
     })
 
 
