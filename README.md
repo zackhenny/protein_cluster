@@ -112,9 +112,73 @@ Backward-compatible aliases: `cluster` → `cluster-families`,
 
 ## Resuming interrupted runs and progress logging
 
-The `hmm-hmm-edges` stage (and `run-all`) supports `--resume` to safely
-restart after interruption.  Each processed pair is appended to an NDJSON
-progress log in real time, so only incomplete work is re-run:
+Every pipeline stage supports `--resume`.  Add `--resume` to any command to
+safely restart it after an interruption; stages that have already completed
+their work will skip redundant computation.
+
+| Stage | `--resume` behaviour |
+|-------|----------------------|
+| `mmseqs-cluster` | Skips the step entirely if its output files already exist |
+| `build-profiles` | Skips already-built per-subfamily `.hhm` profiles; rebuilds only the missing ones |
+| `embed` | Skips the step entirely if `embeddings.npy` already exists |
+| `knn` | Skips the step entirely if the output KNN TSV already exists |
+| `hmm-hmm-edges` | Skips already-completed pairs; reads an NDJSON progress log in real time |
+| `merge-hmm-shards` | Skips the step if the merged output already exists |
+| `merge-graph` | Skips the step if the merged graph files already exist |
+| `cluster-families` | Skips the step if family assignment files already exist |
+| `map-proteins-to-families` | Skips the step if protein mapping outputs already exist |
+| `write-matrices` | Skips the step if matrix output files already exist |
+| `qc-plots` | Skips the step if the QC output directory already contains plots |
+| `run-all` | Passes `--resume` to every supported stage above |
+
+```bash
+# Resume any individual stage — just add --resume
+plm_cluster mmseqs-cluster       --proteins_fasta proteins.faa --resume
+plm_cluster build-profiles       --proteins_fasta proteins.faa \
+                                  --subfamily_map results/01_mmseqs/subfamily_map.tsv --resume
+plm_cluster embed                --reps_fasta results/01_mmseqs/subfamily_reps.faa \
+                                  --weights_path /path/to/esm2.pt --resume
+plm_cluster knn                  --embeddings results/04_embeddings/embeddings.npy \
+                                  --ids results/04_embeddings/ids.txt \
+                                  --lengths results/04_embeddings/lengths.tsv \
+                                  --out_tsv results/04_embeddings/embedding_knn_edges.tsv --resume
+plm_cluster hmm-hmm-edges        --profile_index results/02_profiles/subfamily_profile_index.tsv \
+                                  --candidate_edges results/04_embeddings/embedding_knn_edges.tsv \
+                                  --outdir results/03_hmm_hmm_edges --resume
+plm_cluster merge-hmm-shards     --outdir results/03_hmm_hmm_edges --resume
+plm_cluster merge-graph          --hmm_core results/03_hmm_hmm_edges/hmm_hmm_edges_core.tsv \
+                                  --hmm_relaxed results/03_hmm_hmm_edges/hmm_hmm_edges_relaxed.tsv \
+                                  --embedding_edges results/04_embeddings/embedding_knn_edges.tsv \
+                                  --outdir results/06_family_clustering --resume
+plm_cluster cluster-families     --merged_edges_strict results/06_family_clustering/merged_edges_strict.tsv \
+                                  --merged_edges_functional results/06_family_clustering/merged_edges_functional.tsv \
+                                  --subfamily_map results/01_mmseqs/subfamily_map.tsv \
+                                  --outdir results/06_family_clustering --resume
+plm_cluster map-proteins-to-families \
+                                  --proteins_fasta proteins.faa \
+                                  --subfamily_to_family_strict results/06_family_clustering/subfamily_to_family_strict.tsv \
+                                  --subfamily_to_family_functional results/06_family_clustering/subfamily_to_family_functional.tsv \
+                                  --subfamily_map results/01_mmseqs/subfamily_map.tsv \
+                                  --outdir results/05_domain_hits --resume
+plm_cluster write-matrices       --subfamily_map results/01_mmseqs/subfamily_map.tsv \
+                                  --protein_family_segments results/05_domain_hits/protein_family_segments.tsv \
+                                  --outdir results/07_membership_matrices --resume
+
+# Or resume the entire pipeline end-to-end
+plm_cluster run-all \
+  --proteins_fasta proteins.faa \
+  --weights_path /path/to/esm2.pt \
+  --config docs/config.template.yaml \
+  --results_root results \
+  --resume
+```
+
+### Resuming the `hmm-hmm-edges` stage (pairwise and db-search modes)
+
+The `hmm-hmm-edges` stage has fine-grained resume support: each processed pair
+is appended to an NDJSON progress log in real time, so only incomplete work is
+re-run.  This works for both `pairwise` and `db-search` modes — if the
+ffindex DB was not built yet, it will be built on resume.
 
 | Scenario | Progress file |
 |----------|--------------|
@@ -122,7 +186,7 @@ progress log in real time, so only incomplete work is re-run:
 | Sharded run (shard *N*) | `results/03_hmm_hmm_edges/hmm_hmm_progress.shard_N.ndjson` |
 
 ```bash
-# Resume an interrupted HMM-HMM edge computation
+# Resume an interrupted HMM-HMM edge computation (pairwise or db-search)
 plm_cluster hmm-hmm-edges \
   --profile_index results/02_profiles/subfamily_profile_index.tsv \
   --candidate_edges results/04_embeddings/embedding_knn_edges.tsv \
