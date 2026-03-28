@@ -24,6 +24,7 @@ dependencies:
   - pip:
       - fair-esm
       - pytest
+      - polars
 
 # Install this repo after env creation (HPC-safe, forces pip into env):
 #   bash scripts/install_in_conda_env.sh plm_cluster . test,embed
