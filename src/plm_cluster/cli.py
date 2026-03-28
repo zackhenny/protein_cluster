@@ -17,7 +17,7 @@ from .pipeline import (
     write_matrices,
 )
 from .qc_plots import generate_qc_plots
-from .runtime import executable_version, require_executables, setup_logging, write_manifest
+from .runtime import add_step_log_handler, executable_version, require_executables, setup_logging, write_manifest
 
 
 ALIASES = {
@@ -160,6 +160,14 @@ def main() -> None:
         logger.info("hhalign version: %s", executable_version(manifest_tools["hhalign"]))
         logger.info("hhmake version: %s", executable_version(manifest_tools["hhmake"]))
 
+    # For single-step commands also write a log into the step's own output directory
+    # so all outputs for a given step are co-located.
+    if cmd != "run-all" and hasattr(args, "outdir"):
+        add_step_log_handler(logger, args.outdir, cmd)
+    elif cmd == "knn":
+        # knn uses out_tsv instead of outdir
+        add_step_log_handler(logger, Path(args.out_tsv).parent, cmd)
+
     if cmd == "mmseqs-cluster":
         manifest_tools.update(mmseqs_cluster(args.proteins_fasta, args.outdir, cfg, logger,
                                               resume=args.resume))
@@ -215,38 +223,55 @@ def main() -> None:
         resume = args.resume
         logger.info("Starting run-all pipeline%s", " (resume mode)" if resume else "")
 
-        def _timed_step(label, func, *a, **kw):
+        def _timed_step(label, func, *a, step_log_dir=None, step_log_name=None, **kw):
+            """Run a pipeline step, timing it and optionally logging to the step's output dir."""
             logger.info("Starting %s", label)
             t0 = _time.time()
-            result = func(*a, **kw)
-            elapsed = _time.time() - t0
-            logger.info("Completed %s in %.1fs", label, elapsed)
+            step_fh = None
+            if step_log_dir and step_log_name:
+                step_fh = add_step_log_handler(logger, step_log_dir, step_log_name)
+            try:
+                result = func(*a, **kw)
+            finally:
+                elapsed = _time.time() - t0
+                logger.info("Completed %s in %.1fs", label, elapsed)
+                if step_fh is not None:
+                    logger.removeHandler(step_fh)
+                    step_fh.close()
             if isinstance(result, dict):
                 manifest_tools.update(result)
             return result
 
         _timed_step("Step 1/9: MMseqs clustering",
             mmseqs_cluster, args.proteins_fasta, str(root / "01_mmseqs"), cfg, logger,
+            step_log_dir=root / "01_mmseqs", step_log_name="mmseqs-cluster",
             resume=resume)
 
         _timed_step("Step 2/9: Building profiles",
             build_profiles, args.proteins_fasta, str(root / "01_mmseqs/subfamily_map.tsv"),
-            str(root / "02_profiles"), cfg, logger, resume=resume)
+            str(root / "02_profiles"), cfg, logger,
+            step_log_dir=root / "02_profiles", step_log_name="build-profiles",
+            resume=resume)
 
         _timed_step("Step 3/9: Embedding subfamily representatives",
             embed, str(root / "01_mmseqs/subfamily_reps.faa"), str(root / "04_embeddings"),
-            cfg, args.weights_path, logger, resume=resume)
+            cfg, args.weights_path, logger,
+            step_log_dir=root / "04_embeddings", step_log_name="embed",
+            resume=resume)
 
         _timed_step("Step 4/9: Computing KNN edges",
             knn, str(root / "04_embeddings/embeddings.npy"), str(root / "04_embeddings/ids.txt"),
             str(root / "04_embeddings/lengths.tsv"),
             str(root / "04_embeddings/embedding_knn_edges.tsv"),
-            cfg, logger=logger, resume=resume)
+            cfg,
+            step_log_dir=root / "04_embeddings", step_log_name="knn",
+            logger=logger, resume=resume)
 
         _timed_step("Step 5/9: Computing HMM-HMM edges",
             hmm_hmm_edges, str(root / "02_profiles/subfamily_profile_index.tsv"),
             str(root / "03_hmm_hmm_edges"), cfg, logger,
             str(root / "04_embeddings/embedding_knn_edges.tsv"),
+            step_log_dir=root / "03_hmm_hmm_edges", step_log_name="hmm-hmm-edges",
             mode=getattr(args, "hmm_mode", None), resume=resume,
             shard_id=getattr(args, "shard_id", 0), n_shards=getattr(args, "n_shards", 1))
 
@@ -258,6 +283,7 @@ def main() -> None:
             str(root / "06_family_clustering/merged_edges_functional.tsv"),
             cfg,
             str(root / "03_hmm_hmm_edges/hmm_hmm_edges_relaxed.tsv"),
+            step_log_dir=root / "06_family_clustering", step_log_name="merge-graph",
             logger=logger,
             resume=resume,
         )
@@ -270,6 +296,7 @@ def main() -> None:
             str(root / "06_family_clustering"),
             cfg,
             "leiden",
+            step_log_dir=root / "06_family_clustering", step_log_name="cluster-families",
             logger=logger,
             resume=resume,
         )
@@ -283,6 +310,7 @@ def main() -> None:
             str(root / "05_domain_hits"),
             cfg,
             logger,
+            step_log_dir=root / "05_domain_hits", step_log_name="map-proteins-to-families",
             resume=resume,
         )
 
@@ -292,6 +320,7 @@ def main() -> None:
             str(root / "05_domain_hits/protein_family_segments.tsv"),
             str(root / "07_membership_matrices"),
             cfg,
+            step_log_dir=root / "07_membership_matrices", step_log_name="write-matrices",
             logger=logger,
             resume=resume,
         )
