@@ -9,7 +9,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from .io_utils import FastaRecord, read_fasta, write_fasta
 from .runtime import require_executables, run_cmd
@@ -52,19 +52,13 @@ def _parse_hhr_metrics(path: str | Path) -> dict[str, float]:
 
 
 def _parse_hhr_all_hits(path: str | Path) -> list[dict]:
-    """Parse all hits from an hhsearch .hhr file.
-
-    Returns a list of dicts with keys: target_id, prob, evalue, aln_len, pident.
-    Suitable for parsing hhsearch output where a single file contains many hits.
-    """
+    """Parse all hits from an hhsearch .hhr file."""
     lines = Path(path).read_text(errors="ignore").splitlines()
     hits: list[dict] = []
     i = 0
     while i < len(lines):
-        # Hit detail blocks start with "No N" followed by ">target_id ..."
         if lines[i].startswith(">") and i > 0 and re.match(r"^No \d+\s*$", lines[i - 1]):
             target_id = lines[i][1:].strip().split()[0]
-            # Strip .hhm extension when ffindex_build stored entries by filename
             if target_id.endswith(".hhm"):
                 target_id = target_id[:-4]
             m: dict = {"prob": 0.0, "evalue": 1.0, "pident": np.nan, "aln_len": 0}
@@ -94,9 +88,24 @@ _HMM_EDGE_COLS = [
     "qcov", "tcov", "aln_len", "pident", "tool", "run_id",
 ]
 
+# Polars schema for HMM edge DataFrames. "bits" and "pident" are nullable float
+# columns; null values are serialised as "NA" in TSV output for backward compat.
+_HMM_EDGE_SCHEMA: dict[str, pl.DataType] = {
+    "q_subfamily_id": pl.String,
+    "t_subfamily_id": pl.String,
+    "prob": pl.Float64,
+    "evalue": pl.Float64,
+    "bits": pl.Float64,
+    "qcov": pl.Float64,
+    "tcov": pl.Float64,
+    "aln_len": pl.Int64,
+    "pident": pl.Float64,
+    "tool": pl.String,
+    "run_id": pl.String,
+}
+
 
 def _load_hmm_progress(path: Path) -> set[tuple[str, str]]:
-    """Load a set of already-processed (query_id, target_id) pairs from an NDJSON progress file."""
     done: set[tuple[str, str]] = set()
     if not path.exists():
         return done
@@ -116,7 +125,6 @@ def _load_hmm_progress(path: Path) -> set[tuple[str, str]]:
 
 
 def _append_hmm_progress(path: Path, rec: dict, lock: threading.Lock) -> None:
-    """Append a single JSON record to the NDJSON progress file (thread-safe)."""
     line = json.dumps(rec, ensure_ascii=False) + "\n"
     with lock:
         with open(path, "a", encoding="utf-8") as fh:
@@ -124,42 +132,34 @@ def _append_hmm_progress(path: Path, rec: dict, lock: threading.Lock) -> None:
             fh.flush()
 
 
-def _filter_raw_to_core_relaxed(raw: pd.DataFrame, hc: dict, out: Path) -> None:
+def _filter_raw_to_core_relaxed(raw: pl.DataFrame, hc: dict, out: Path) -> None:
     """Compute and write core and relaxed edge TSVs from a raw edge DataFrame."""
-    raw2 = raw.copy()
-    raw2["mincov"] = raw2[["qcov", "tcov"]].min(axis=1)
-    raw2["edge_weight"] = (raw2["prob"] / 100.0) * raw2["mincov"]
+    raw2 = raw.with_columns(
+        pl.min_horizontal(pl.col("qcov"), pl.col("tcov")).alias("mincov"),
+    ).with_columns(
+        (pl.col("prob") / 100.0 * pl.col("mincov")).alias("edge_weight"),
+    )
 
     out_cols = ["q_subfamily_id", "t_subfamily_id", "edge_weight", "prob", "evalue",
                 "qcov", "tcov", "mincov", "aln_len", "source"]
 
-    core = raw2[
-        (raw2["mincov"] >= float(hc["mincov_core"]))
-        & ((raw2["prob"] >= float(hc["min_prob_core"])) | (raw2["evalue"] <= float(hc["max_evalue_core"])))
-        & (raw2["aln_len"] >= int(hc["min_aln_len_core"]))
-    ].copy()
-    core["source"] = "hmm_hmm_core"
-    core[out_cols].to_csv(out / "hmm_hmm_edges_core.tsv", sep="\t", index=False)
+    core = raw2.filter(
+        (pl.col("mincov") >= float(hc["mincov_core"]))
+        & ((pl.col("prob") >= float(hc["min_prob_core"])) | (pl.col("evalue") <= float(hc["max_evalue_core"])))
+        & (pl.col("aln_len") >= int(hc["min_aln_len_core"]))
+    ).with_columns(pl.lit("hmm_hmm_core").alias("source")).select(out_cols)
+    core.write_csv(out / "hmm_hmm_edges_core.tsv", separator="\t")
 
-    relaxed = raw2[
-        (raw2["mincov"] >= float(hc["mincov_relaxed"]))
-        & ((raw2["prob"] >= float(hc["min_prob_relaxed"])) | (raw2["evalue"] <= float(hc["max_evalue_relaxed"])))
-        & (raw2["aln_len"] >= int(hc["min_aln_len_relaxed"]))
-    ].copy()
-    relaxed["source"] = "hmm_hmm_relaxed"
-    relaxed[out_cols].to_csv(out / "hmm_hmm_edges_relaxed.tsv", sep="\t", index=False)
+    relaxed = raw2.filter(
+        (pl.col("mincov") >= float(hc["mincov_relaxed"]))
+        & ((pl.col("prob") >= float(hc["min_prob_relaxed"])) | (pl.col("evalue") <= float(hc["max_evalue_relaxed"])))
+        & (pl.col("aln_len") >= int(hc["min_aln_len_relaxed"]))
+    ).with_columns(pl.lit("hmm_hmm_relaxed").alias("source")).select(out_cols)
+    relaxed.write_csv(out / "hmm_hmm_edges_relaxed.tsv", separator="\t")
 
 
 def merge_hmm_shards(outdir: str, config: dict, logger, resume: bool = False) -> str:
-    """Merge per-shard raw TSV files into a combined raw TSV and produce core/relaxed TSVs.
-
-    Call this after all shards have finished.  Reads every
-    ``hmm_hmm_edges_raw.shard_*.tsv`` found in *outdir*, concatenates them,
-    writes ``hmm_hmm_edges_raw.tsv``, and derives ``hmm_hmm_edges_core.tsv``
-    and ``hmm_hmm_edges_relaxed.tsv`` using the standard thresholds.
-
-    Returns the path to the merged raw TSV.
-    """
+    """Merge per-shard raw TSV files into a combined raw TSV and produce core/relaxed TSVs."""
     out = Path(outdir)
     merged_path = out / "hmm_hmm_edges_raw.tsv"
     if resume and merged_path.exists():
@@ -169,21 +169,16 @@ def merge_hmm_shards(outdir: str, config: dict, logger, resume: bool = False) ->
     if not shard_files:
         raise FileNotFoundError(f"No shard TSV files found in {outdir}")
     logger.info("Merging %d shard TSV(s) from %s", len(shard_files), outdir)
-    dfs = [pd.read_csv(f, sep="\t") for f in shard_files]
-    raw = pd.concat(dfs, ignore_index=True).sort_values(["q_subfamily_id", "t_subfamily_id"])
-    raw_path = out / "hmm_hmm_edges_raw.tsv"
-    raw.to_csv(raw_path, sep="\t", index=False)
+    dfs = [pl.read_csv(f, separator="\t", null_values=["NA"], schema_overrides=_HMM_EDGE_SCHEMA) for f in shard_files]
+    raw = pl.concat(dfs).sort(["q_subfamily_id", "t_subfamily_id"])
+    raw.write_csv(merged_path, separator="\t", null_value="NA")
     _filter_raw_to_core_relaxed(raw, config["hmm_hmm"], out)
-    logger.info("Merged raw TSV written to %s", str(raw_path))
-    return str(raw_path)
+    logger.info("Merged raw TSV written to %s", str(merged_path))
+    return str(merged_path)
 
 
 def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger, resume: bool = False) -> dict[str, str]:
-    """Step 1: Cluster proteins into subfamilies using MMseqs2.
-
-    Produces subfamily_map.tsv, subfamily_reps.faa, and subfamily_stats.tsv.
-    Returns a dict of resolved tool paths for manifest tracking.
-    """
+    """Step 1: Cluster proteins into subfamilies using MMseqs2."""
     out = _ensure_dir(outdir)
     if resume and (out / "subfamily_map.tsv").exists():
         logger.info("Resume: mmseqs-cluster outputs already exist in %s, skipping.", str(out))
@@ -198,23 +193,13 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger, resum
     rep_db = out / "repDB"
     run_cmd([tools["mmseqs"], "createdb", proteins_fasta, str(db)], logger)
     mmseqs_cmd = [
-        tools["mmseqs"],
-        mm["mode"],
-        str(db),
-        str(clu),
-        str(tmpdir),
-        "--min-seq-id",
-        str(mm["min_seq_id"]),
-        "-c",
-        str(mm["coverage"]),
-        "--cov-mode",
-        str(mm["cov_mode"]),
-        "-e",
-        str(mm["evalue"]),
-        "--threads",
-        str(mm["threads"]),
+        tools["mmseqs"], mm["mode"], str(db), str(clu), str(tmpdir),
+        "--min-seq-id", str(mm["min_seq_id"]),
+        "-c", str(mm["coverage"]),
+        "--cov-mode", str(mm["cov_mode"]),
+        "-e", str(mm["evalue"]),
+        "--threads", str(mm["threads"]),
     ]
-    # Some MMseqs2 builds do not accept -s for linclust; keep it for search/cluster style modes only.
     if str(mm["mode"]).lower() != "linclust":
         mmseqs_cmd.extend(["-s", str(mm["sensitivity"])])
     run_cmd(mmseqs_cmd, logger)
@@ -222,47 +207,53 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger, resum
     run_cmd([tools["mmseqs"], "result2repseq", str(db), str(clu), str(rep_db)], logger)
     run_cmd([tools["mmseqs"], "result2flat", str(db), str(db), str(rep_db), str(out / "subfamily_reps_raw.faa")], logger)
 
-    raw = pd.read_csv(tsv, sep="\t", names=["rep_protein_id", "protein_id"], header=None)
-    reps_sorted = sorted(raw["rep_protein_id"].unique())
+    raw = pl.read_csv(tsv, separator="\t", has_header=False, new_columns=["rep_protein_id", "protein_id"])
+    reps_sorted = sorted(raw["rep_protein_id"].unique().to_list())
     rep_to_sub = {r: f"subfam_{i:06d}" for i, r in enumerate(reps_sorted)}
-    raw["subfamily_id"] = raw["rep_protein_id"].map(rep_to_sub)
-    raw["is_rep"] = (raw["rep_protein_id"] == raw["protein_id"]).astype(int)
-    mapping = raw[["protein_id", "subfamily_id", "is_rep"]].sort_values(["subfamily_id", "protein_id"])
-    mapping.to_csv(out / "subfamily_map.tsv", sep="\t", index=False)
+
+    sub_lookup = pl.DataFrame({
+        "rep_protein_id": list(rep_to_sub.keys()),
+        "subfamily_id": list(rep_to_sub.values()),
+    })
+    raw = (
+        raw.join(sub_lookup, on="rep_protein_id", how="left")
+        .with_columns((pl.col("rep_protein_id") == pl.col("protein_id")).cast(pl.Int8).alias("is_rep"))
+    )
+    mapping = raw.select(["protein_id", "subfamily_id", "is_rep"]).sort(["subfamily_id", "protein_id"])
+    mapping.write_csv(out / "subfamily_map.tsv", separator="\t")
 
     seqs = {r.id: r.seq for r in read_fasta(proteins_fasta)}
     rep_records = [FastaRecord(rep_to_sub[rid], seqs[rid]) for rid in reps_sorted if rid in seqs]
     write_fasta(out / "subfamily_reps.faa", rep_records)
 
-    stats = raw.groupby("subfamily_id")["protein_id"].count().reset_index(name="n_members")
-    reps = raw[raw["is_rep"] == 1][["subfamily_id", "protein_id"]].rename(columns={"protein_id": "rep_protein_id"})
-    stats = stats.merge(reps, on="subfamily_id", how="left")
-    stats["rep_length_aa"] = stats["rep_protein_id"].map(lambda x: len(seqs.get(x, "")))
-    stats.sort_values("subfamily_id").to_csv(out / "subfamily_stats.tsv", sep="\t", index=False)
-    logger.info("MMseqs2 clustering complete: %d proteins → %d subfamilies (median size: %.0f)",
+    stats = raw.group_by("subfamily_id").agg(pl.col("protein_id").len().alias("n_members"))
+    reps_df = (
+        raw.filter(pl.col("is_rep") == 1)
+        .select(["subfamily_id", "protein_id"])
+        .rename({"protein_id": "rep_protein_id"})
+    )
+    stats = stats.join(reps_df, on="subfamily_id", how="left")
+    rep_ids = stats["rep_protein_id"].to_list()
+    stats = stats.with_columns(
+        pl.Series("rep_length_aa", [len(seqs.get(rid, "")) if rid else 0 for rid in rep_ids])
+    )
+    stats.sort("subfamily_id").write_csv(out / "subfamily_stats.tsv", separator="\t")
+    logger.info("MMseqs2 clustering complete: %d proteins -> %d subfamilies (median size: %.0f)",
                 len(raw), len(reps_sorted), float(stats["n_members"].median()))
     return tools
 
 
-def build_profiles(proteins_fasta: str, subfamily_map: str, outdir: str, config: dict, logger, resume: bool = False) -> dict[str, str]:
-    """Step 2: Build MSAs (MAFFT) and profile HMMs (hhmake) for each subfamily.
-
-    Profiles are used downstream for HMM-HMM edge detection. Large subfamilies
-    are capped at ``profiles.max_members_per_subfamily`` members.
-
-    When *resume* is True, subfamilies whose ``.hhm`` file already exists are
-    skipped; newly built profiles are combined with previously built ones before
-    writing ``subfamily_profile_index.tsv``.
-
-    Returns resolved tool paths.
-    """
+def build_profiles(
+    proteins_fasta: str, subfamily_map: str, outdir: str, config: dict, logger, resume: bool = False
+) -> dict[str, str]:
+    """Step 2: Build MSAs (MAFFT) and profile HMMs (hhmake) for each subfamily."""
     out = _ensure_dir(outdir)
     tools = require_executables(["mafft", "hhmake"], config["tools"])
     if not Path(subfamily_map).exists():
         raise RuntimeError(
-            f"subfamily_map not found: {subfamily_map}. Run mmseqs-cluster first and confirm step 01 outputs."
+            f"subfamily_map not found: {subfamily_map}. Run mmseqs-cluster first."
         )
-    smap = pd.read_csv(subfamily_map, sep="\t")
+    smap = pl.read_csv(subfamily_map, separator="\t")
     seqs = {r.id: r.seq for r in read_fasta(proteins_fasta)}
     cap = int(config["profiles"]["max_members_per_subfamily"])
 
@@ -288,13 +279,16 @@ def build_profiles(proteins_fasta: str, subfamily_map: str, outdir: str, config:
     threads = int(config.get("mmseqs", {}).get("threads", 8))
     rows: list[dict] = []
 
-    # Collect all subfamily → member lists (pandas groupby keys are strings here)
+    agg = (
+        smap.group_by("subfamily_id")
+        .agg(pl.col("protein_id").sort().head(cap))
+        .sort("subfamily_id")
+    )
     subfam_members: dict[str, list[str]] = {
-        subfam: sorted(grp["protein_id"].tolist())[:cap]
-        for subfam, grp in smap.groupby("subfamily_id", sort=True)
+        row["subfamily_id"]: row["protein_id"]
+        for row in agg.iter_rows(named=True)
     }
 
-    # Resume: collect rows for already-built profiles; only rebuild missing ones
     if resume:
         for subfam, members in subfam_members.items():
             hhm_path = out / f"{subfam}.hhm"
@@ -330,7 +324,7 @@ def build_profiles(proteins_fasta: str, subfamily_map: str, outdir: str, config:
     if failed:
         logger.warning("%d subfamily profile(s) failed: %s", len(failed), ", ".join(failed[:20]))
 
-    pd.DataFrame(rows).sort_values("subfamily_id").to_csv(out / "subfamily_profile_index.tsv", sep="\t", index=False)
+    pl.from_dicts(rows).sort("subfamily_id").write_csv(out / "subfamily_profile_index.tsv", separator="\t")
     logger.info("Profile construction complete: %d profiles built/loaded, %d failed", len(rows), len(failed))
     return tools
 
@@ -353,31 +347,16 @@ def hmm_hmm_edges(
 
     ``pairwise`` (default)
         Runs one ``hhalign`` invocation per candidate pair using a thread pool.
-        Backward-compatible with the original implementation.
 
     ``db-search``
         Builds an HH-suite ffindex database from all profiles and runs one
         ``hhsearch`` invocation per unique query subfamily against the whole
-        database.  Requires ``hhsearch`` and ``ffindex_build`` in PATH (or
-        configured via ``tools``).  Falls back to pairwise if the tools are
-        unavailable.
-
-    *resume*
-        When ``True``, loads already-completed pairs from the NDJSON progress
-        log (``hmm_hmm_progress[.shard_N].ndjson``) and skips them.
-
-    *shard_id* / *n_shards*
-        Split the candidate list across multiple independent jobs.  Each shard
-        writes its own raw TSV (``hmm_hmm_edges_raw.shard_N.tsv``) and progress
-        file.  Call :func:`merge_hmm_shards` afterwards to produce the combined
-        ``hmm_hmm_edges_raw.tsv`` and core/relaxed TSVs.
+        database.  The ffindex files use the ``_hhm`` suffix required by
+        HH-suite 3.x (``profiles_db_hhm.ffdata`` / ``profiles_db_hhm.ffindex``).
     """
     out = _ensure_dir(outdir)
-
-    # Resolve execution mode: CLI arg > config > default
     effective_mode = mode or config.get("hmm_hmm", {}).get("mode", "pairwise")
 
-    # Shard-aware output file names
     if n_shards > 1:
         raw_tsv_path = out / f"hmm_hmm_edges_raw.shard_{shard_id}.tsv"
         progress_path = out / f"hmm_hmm_progress.shard_{shard_id}.ndjson"
@@ -385,40 +364,41 @@ def hmm_hmm_edges(
         raw_tsv_path = out / "hmm_hmm_edges_raw.tsv"
         progress_path = out / "hmm_hmm_progress.ndjson"
 
-    # Load profile index
-    idx = pd.read_csv(profile_index, sep="\t").sort_values("subfamily_id")
-    lengths = {r.subfamily_id: _parse_hhm_len(r.hhm_path) for _, r in idx.iterrows()}
-    hhm = {r.subfamily_id: r.hhm_path for _, r in idx.iterrows()}
+    idx = pl.read_csv(profile_index, separator="\t").sort("subfamily_id")
+    lengths = dict(zip(idx["subfamily_id"].to_list(), [_parse_hhm_len(p) for p in idx["hhm_path"].to_list()]))
+    hhm = dict(zip(idx["subfamily_id"].to_list(), idx["hhm_path"].to_list()))
 
-    # Build candidate list
     cands: list[tuple[str, str]] = []
     topn = int(config["hmm_hmm"]["topN"])
     if candidate_edges_tsv and Path(candidate_edges_tsv).exists():
-        cdf = pd.read_csv(candidate_edges_tsv, sep="\t")
-        for q, g in cdf.groupby("q_subfamily_id"):
-            for t in sorted(g.sort_values("cosine", ascending=False)["t_subfamily_id"].head(topn).tolist()):
+        cdf = pl.read_csv(candidate_edges_tsv, separator="\t")
+        top_cands = (
+            cdf.sort("cosine", descending=True)
+            .group_by("q_subfamily_id")
+            .agg(pl.col("t_subfamily_id").head(topn))
+        )
+        for row in top_cands.iter_rows(named=True):
+            q = row["q_subfamily_id"]
+            for t in sorted(row["t_subfamily_id"]):
                 cands.append((q, t))
     else:
-        subfams = idx["subfamily_id"].tolist()
+        subfams = idx["subfamily_id"].to_list()
         n_pairs = len(subfams) * (len(subfams) - 1) // 2
         logger.warning(
-            "No candidate edges provided — using ALL-vs-ALL (%d pairs for %d subfamilies). "
+            "No candidate edges provided -- using ALL-vs-ALL (%d pairs for %d subfamilies). "
             "This is slow for large datasets; consider running embed+knn first.",
             n_pairs, len(subfams),
         )
         for i, q in enumerate(subfams):
-            for t in subfams[i + 1 :]:
+            for t in subfams[i + 1:]:
                 cands.append((q, t))
 
-    # Deduplicate and canonicalize (always q < t lexicographically)
     unique_cands = sorted(set(tuple(sorted(x)) for x in cands))
 
-    # Apply sharding
     if n_shards > 1:
         unique_cands = [p for i, p in enumerate(unique_cands) if i % n_shards == shard_id]
         logger.info("Shard %d/%d: %d candidate pairs", shard_id, n_shards, len(unique_cands))
 
-    # Load resume set
     processed: set[tuple[str, str]] = set()
     if resume:
         processed = _load_hmm_progress(progress_path)
@@ -430,16 +410,9 @@ def hmm_hmm_edges(
         effective_mode, len(pending_cands), len(unique_cands) - len(pending_cands),
     )
 
-    # Prepare raw TSV (append mode for resume, write mode for fresh start)
-    write_header = not (resume and raw_tsv_path.exists())
-    raw_fh_mode = "a" if (resume and raw_tsv_path.exists()) else "w"
-
     run_id = "hmm_hmm_v2"
     prog_lock = threading.Lock()
 
-    # -----------------------------------------------------------------------
-    # Helper: build one row dict from raw metrics
-    # -----------------------------------------------------------------------
     def _make_row(q: str, t: str, m: dict, tool_name: str) -> dict:
         qlen = max(1, lengths.get(q, 0))
         tlen = max(1, lengths.get(t, 0))
@@ -451,23 +424,22 @@ def hmm_hmm_edges(
             "t_subfamily_id": t,
             "prob": float(m["prob"]),
             "evalue": float(m["evalue"]),
-            "bits": "NA",
+            "bits": None,
             "qcov": qcov,
             "tcov": tcov,
             "aln_len": aln_len,
-            "pident": float(m["pident"]) if not np.isnan(m["pident"]) else "NA",
+            "pident": float(m["pident"]) if not np.isnan(m["pident"]) else None,
             "tool": tool_name,
             "run_id": run_id,
         }
 
     threads = int(config.get("mmseqs", {}).get("threads", 8))
 
-    # -----------------------------------------------------------------------
-    # Pairwise mode (original behaviour)
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Pairwise mode
+    # ------------------------------------------------------------------
     if effective_mode == "pairwise":
         tools = require_executables(["hhalign"], config["tools"])
-
         raw_rows: list[dict] = []
         failed_edges: list[str] = []
 
@@ -504,25 +476,24 @@ def hmm_hmm_edges(
         if failed_edges:
             logger.warning("%d hhalign edge(s) failed: %s", len(failed_edges), ", ".join(failed_edges[:20]))
 
-        # Write raw TSV (append previously-completed rows when resuming)
         if resume and raw_tsv_path.exists() and processed:
-            existing = pd.read_csv(raw_tsv_path, sep="\t")
-            new_df = pd.DataFrame(raw_rows) if raw_rows else pd.DataFrame(columns=_HMM_EDGE_COLS)
-            all_rows = pd.concat([existing, new_df], ignore_index=True)
-            all_rows.sort_values(["q_subfamily_id", "t_subfamily_id"]).to_csv(raw_tsv_path, sep="\t", index=False)
+            existing = pl.read_csv(raw_tsv_path, separator="\t", null_values=["NA"], schema_overrides=_HMM_EDGE_SCHEMA)
+            new_df = pl.from_dicts(raw_rows, schema=_HMM_EDGE_SCHEMA) if raw_rows else pl.DataFrame(schema=_HMM_EDGE_SCHEMA)
+            pl.concat([existing, new_df]).sort(["q_subfamily_id", "t_subfamily_id"]).write_csv(
+                raw_tsv_path, separator="\t", null_value="NA"
+            )
         else:
             raw_df = (
-                pd.DataFrame(raw_rows).sort_values(["q_subfamily_id", "t_subfamily_id"])
+                pl.from_dicts(raw_rows, schema=_HMM_EDGE_SCHEMA).sort(["q_subfamily_id", "t_subfamily_id"])
                 if raw_rows
-                else pd.DataFrame(columns=_HMM_EDGE_COLS)
+                else pl.DataFrame(schema=_HMM_EDGE_SCHEMA)
             )
-            raw_df.to_csv(raw_tsv_path, sep="\t", index=False)
+            raw_df.write_csv(raw_tsv_path, separator="\t", null_value="NA")
 
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # DB-search mode (hhsearch against ffindex database)
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     else:
-        # Try to get hhsearch and ffindex_build; fall back to pairwise on failure
         try:
             db_tools = require_executables(["hhsearch", "ffindex_build"], config["tools"])
         except RuntimeError as exc:
@@ -536,19 +507,17 @@ def hmm_hmm_edges(
 
         tools = {**db_tools}
 
-        # Build the ffindex HH-suite DB (shared across shards; idempotent)
+        # HH-suite 3.x hhsearch expects the profile database files to carry the
+        # "_hhm" suffix: profiles_db_hhm.ffdata / profiles_db_hhm.ffindex.
+        # Passing -d profiles_db to hhsearch resolves these files automatically.
         db_dir = out / "hhsearch_db"
         db_dir.mkdir(parents=True, exist_ok=True)
         db_prefix = db_dir / "profiles_db"
-        ffdata = db_dir / "profiles_db.ffdata"
-        ffindex = db_dir / "profiles_db.ffindex"
+        ffdata = db_dir / "profiles_db_hhm.ffdata"
+        ffindex = db_dir / "profiles_db_hhm.ffindex"
 
         if not (ffdata.exists() and ffindex.exists()):
             logger.info("Building HH-suite ffindex DB from %d profiles", len(hhm))
-            # Pass file list via stdin (-f /dev/stdin) to avoid ARG_MAX limits
-            # for large datasets.  sorted() ensures a consistent, reproducible
-            # entry order in the DB.  The -s flag sorts the ffindex, which is
-            # required by hhsearch for efficient binary-search lookups.
             file_list_str = "\n".join(sorted(hhm.values())) + "\n"
             run_cmd(
                 [db_tools["ffindex_build"], "-s", "-f", "/dev/stdin",
@@ -559,13 +528,11 @@ def hmm_hmm_edges(
         else:
             logger.info("HH-suite DB already exists at %s, reusing.", str(db_prefix))
 
-        # Build per-query candidate set (only queries present in pending_cands)
         query_to_targets: dict[str, set[str]] = defaultdict(set)
         for q, t in pending_cands:
             query_to_targets[q].add(t)
-            query_to_targets[t].add(q)  # hhsearch covers both orientations
+            query_to_targets[t].add(q)
 
-        # For resume: skip queries where every target candidate is already done
         pending_queries = sorted(
             q for q in query_to_targets
             if any((q, t) not in processed and (t, q) not in processed for t in query_to_targets[q])
@@ -589,11 +556,9 @@ def hmm_hmm_edges(
                     t = hit["target_id"]
                     if t == q:
                         continue
-                    # Canonicalize pair
                     canon = tuple(sorted((q, t)))
                     if canon in processed:
                         continue
-                    # Only include if this pair is in our candidate set
                     if t not in query_to_targets.get(q, set()) and q not in query_to_targets.get(t, set()):
                         continue
                     row = _make_row(q, t, hit, "hhsearch")
@@ -617,33 +582,29 @@ def hmm_hmm_edges(
         if failed_queries:
             logger.warning("%d hhsearch query/queries failed: %s", len(failed_queries), ", ".join(failed_queries[:20]))
 
-        # Write raw TSV
         if resume and raw_tsv_path.exists() and len(processed) > len(raw_rows_db):
-            existing = pd.read_csv(raw_tsv_path, sep="\t")
-            all_rows = pd.concat([existing, pd.DataFrame(raw_rows_db)], ignore_index=True)
-            all_rows.sort_values(["q_subfamily_id", "t_subfamily_id"]).to_csv(raw_tsv_path, sep="\t", index=False)
+            existing = pl.read_csv(raw_tsv_path, separator="\t", null_values=["NA"], schema_overrides=_HMM_EDGE_SCHEMA)
+            new_df = pl.from_dicts(raw_rows_db, schema=_HMM_EDGE_SCHEMA) if raw_rows_db else pl.DataFrame(schema=_HMM_EDGE_SCHEMA)
+            pl.concat([existing, new_df]).sort(["q_subfamily_id", "t_subfamily_id"]).write_csv(
+                raw_tsv_path, separator="\t", null_value="NA"
+            )
         else:
-            raw_df = pd.DataFrame(raw_rows_db).sort_values(["q_subfamily_id", "t_subfamily_id"]) if raw_rows_db else pd.DataFrame(columns=_HMM_EDGE_COLS)
-            raw_df.to_csv(raw_tsv_path, sep="\t", index=False)
+            raw_df = (
+                pl.from_dicts(raw_rows_db, schema=_HMM_EDGE_SCHEMA).sort(["q_subfamily_id", "t_subfamily_id"])
+                if raw_rows_db
+                else pl.DataFrame(schema=_HMM_EDGE_SCHEMA)
+            )
+            raw_df.write_csv(raw_tsv_path, separator="\t", null_value="NA")
 
-    # -----------------------------------------------------------------------
-    # Final core/relaxed TSVs (only for non-sharded runs)
-    # -----------------------------------------------------------------------
     if n_shards == 1:
-        raw = pd.read_csv(raw_tsv_path, sep="\t")
+        raw = pl.read_csv(raw_tsv_path, separator="\t", null_values=["NA"], schema_overrides=_HMM_EDGE_SCHEMA)
         _filter_raw_to_core_relaxed(raw, config["hmm_hmm"], out)
 
     return tools
 
 
-
 def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, logger, resume: bool = False) -> None:
-    """Step 4: Generate ESM-2 mean-pooled embeddings for subfamily representatives.
-
-    Runs on CPU or GPU depending on ``embed.device`` in config.
-    Sequences longer than ``embed.max_len`` are handled per ``embed.long_seq_policy``.
-    Saves embeddings.npy, ids.txt, lengths.tsv, and metadata.json.
-    """
+    """Step 4: Generate ESM-2 mean-pooled embeddings for subfamily representatives."""
     out_path = Path(outdir) / "embeddings.npy"
     if resume and out_path.exists():
         logger.info("Resume: embeddings already exist at %s, skipping.", str(out_path))
@@ -662,9 +623,6 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
     out = _ensure_dir(outdir)
     recs = sorted(read_fasta(reps_fasta), key=lambda x: x.id)
 
-    # PyTorch >= 2.6 defaults torch.load to weights_only=True, which breaks
-    # ESM checkpoints that contain argparse.Namespace objects.  Temporarily
-    # patch torch.load so esm.pretrained.load_model_and_alphabet_local works.
     import functools
     _orig_torch_load = torch.load
     torch.load = functools.partial(_orig_torch_load, weights_only=False)
@@ -676,7 +634,6 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
     model.eval()
     batch_converter = alphabet.get_batch_converter()
 
-    # Device selection: "cpu", "cuda", or "cuda:0" etc.
     device_str = str(config["embed"].get("device", "cpu"))
     device = torch.device(device_str)
     model = model.to(device)
@@ -694,28 +651,22 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
             seq = seq[:max_len]
         seqs.append((r.id, seq))
 
-    # Process in batches to avoid OOM
     embs = []
     total_batches = (len(seqs) + batch_size - 1) // batch_size
     logger.info(f"Processing {len(seqs)} sequences in {total_batches} batches of size {batch_size}")
-    
+
     for i in range(0, len(seqs), batch_size):
         batch = seqs[i:i + batch_size]
         batch_num = i // batch_size + 1
         logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} sequences)")
-        
         labels, strs, toks = batch_converter(batch)
         toks = toks.to(device)
         with torch.no_grad():
             outp = model(toks, repr_layers=[model.num_layers], return_contacts=False)
         reps = outp["representations"][model.num_layers]
-
-        # Extract embeddings from this batch
         for j, seq in enumerate(strs):
             L = len(seq)
-            embs.append(reps[j, 1 : L + 1].mean(0).cpu().numpy())
-        
-        # Clear GPU memory after each batch
+            embs.append(reps[j, 1: L + 1].mean(0).cpu().numpy())
         del toks, outp, reps
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -723,50 +674,45 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
     mat = np.vstack(embs).astype(np.float32)
     np.save(out / "embeddings.npy", mat)
     (out / "ids.txt").write_text("\n".join([r.id for r in recs]) + "\n")
-    pd.DataFrame({"subfamily_id": [r.id for r in recs], "rep_length_aa": lengths}).to_csv(
-        out / "lengths.tsv", sep="\t", index=False
+    pl.DataFrame({"subfamily_id": [r.id for r in recs], "rep_length_aa": lengths}).write_csv(
+        out / "lengths.tsv", separator="\t"
     )
     (out / "metadata.json").write_text(
-        json.dumps(
-            {
-                "model_name": config["embed"]["esm_model_name"],
-                "weights_path": str(weights_path),
-                "pooling": config["embed"]["pooling"],
-                "long_seq_policy": policy,
-                "max_len": max_len,
-                "n_subfamilies": len(recs),
-                "dim": int(mat.shape[1]),
-            },
-            indent=2,
-        )
+        json.dumps({
+            "model_name": config["embed"]["esm_model_name"],
+            "weights_path": str(weights_path),
+            "pooling": config["embed"]["pooling"],
+            "long_seq_policy": policy,
+            "max_len": max_len,
+            "n_subfamilies": len(recs),
+            "dim": int(mat.shape[1]),
+        }, indent=2)
     )
 
 
-def knn(embeddings_npy: str, ids_txt: str, lengths_tsv: str, out_tsv: str, config: dict, logger=None, resume: bool = False) -> None:
-    """Step 5: Find K-nearest neighbors in embedding space.
-
-    Uses FAISS if available, otherwise falls back to sklearn NearestNeighbors.
-    Edges are filtered by cosine similarity and length ratio thresholds.
-    """
+def knn(
+    embeddings_npy: str, ids_txt: str, lengths_tsv: str, out_tsv: str,
+    config: dict, logger=None, resume: bool = False
+) -> None:
+    """Step 5: Find K-nearest neighbors in embedding space."""
     if resume and Path(out_tsv).exists():
         if logger:
             logger.info("Resume: KNN edges already exist at %s, skipping.", out_tsv)
         return
     X = np.load(embeddings_npy)
     ids = [x.strip() for x in Path(ids_txt).read_text().splitlines() if x.strip()]
-    lens = pd.read_csv(lengths_tsv, sep="\t").set_index("subfamily_id")["rep_length_aa"].to_dict()
+    _lens_df = pl.read_csv(lengths_tsv, separator="\t")
+    lens = dict(zip(_lens_df["subfamily_id"].to_list(), _lens_df["rep_length_aa"].to_list()))
     X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
     k = max(1, min(int(config["knn"]["k"]), len(ids) - 1))
 
     try:
         import faiss  # type: ignore
-
         index = faiss.IndexFlatIP(X.shape[1])
         index.add(X.astype(np.float32))
         sims, nbrs = index.search(X.astype(np.float32), k + 1)
     except Exception:
         from sklearn.neighbors import NearestNeighbors
-
         nn = NearestNeighbors(n_neighbors=k + 1, metric="cosine")
         nn.fit(X)
         d, nbrs = nn.kneighbors(X)
@@ -782,18 +728,18 @@ def knn(embeddings_npy: str, ids_txt: str, lengths_tsv: str, out_tsv: str, confi
             ratio = qlen / max(1, tlen)
             pass_lr = int(float(config["knn"]["min_len_ratio"]) <= ratio <= float(config["knn"]["max_len_ratio"]))
             if cosine >= float(config["knn"]["min_cosine"]) and pass_lr:
-                rows.append(
-                    {
-                        "q_subfamily_id": q,
-                        "t_subfamily_id": t,
-                        "cosine": cosine,
-                        "q_len": qlen,
-                        "t_len": tlen,
-                        "len_ratio": ratio,
-                        "pass_len_ratio": pass_lr,
-                    }
-                )
-    pd.DataFrame(rows).sort_values(["q_subfamily_id", "t_subfamily_id"]).to_csv(out_tsv, sep="\t", index=False)
+                rows.append({
+                    "q_subfamily_id": q, "t_subfamily_id": t, "cosine": cosine,
+                    "q_len": qlen, "t_len": tlen, "len_ratio": ratio, "pass_len_ratio": pass_lr,
+                })
+    Path(out_tsv).parent.mkdir(parents=True, exist_ok=True)
+    if rows:
+        pl.from_dicts(rows).sort(["q_subfamily_id", "t_subfamily_id"]).write_csv(out_tsv, separator="\t")
+    else:
+        pl.DataFrame(schema={
+            "q_subfamily_id": pl.String, "t_subfamily_id": pl.String, "cosine": pl.Float64,
+            "q_len": pl.Int64, "t_len": pl.Int64, "len_ratio": pl.Float64, "pass_len_ratio": pl.Int32,
+        }).write_csv(out_tsv, separator="\t")
 
 
 def merge_graph(
@@ -806,37 +752,46 @@ def merge_graph(
     logger=None,
     resume: bool = False,
 ) -> None:
-    """Step 6: Merge HMM and embedding edges into strict and functional graphs.
-
-    The strict graph uses only core HMM edges. The functional graph merges
-    relaxed HMM and embedding edges according to ``graph.edge_weight_policy``.
-    """
+    """Step 6: Merge HMM and embedding edges into strict and functional graphs."""
     if resume and Path(out_strict_tsv).exists() and Path(out_functional_tsv).exists():
         if logger:
             logger.info("Resume: merged graph files already exist, skipping merge-graph.")
         return
     Path(out_strict_tsv).parent.mkdir(parents=True, exist_ok=True)
     Path(out_functional_tsv).parent.mkdir(parents=True, exist_ok=True)
-    core = pd.read_csv(hmm_core_tsv, sep="\t") if Path(hmm_core_tsv).exists() else pd.DataFrame()
-    emb = pd.read_csv(emb_tsv, sep="\t") if Path(emb_tsv).exists() else pd.DataFrame()
-    relaxed = pd.read_csv(hmm_relaxed_tsv, sep="\t") if hmm_relaxed_tsv and Path(hmm_relaxed_tsv).exists() else pd.DataFrame()
 
-    strict = core.copy()
-    strict = strict.rename(columns={"q_subfamily_id": "qid", "t_subfamily_id": "tid"})
-    strict["weight"] = strict["edge_weight"]
-    strict["source"] = "hmm_core"
-    strict[["qid", "tid", "weight", "source"]].sort_values(["qid", "tid"]).to_csv(out_strict_tsv, sep="\t", index=False)
+    _hmm_schema = {"q_subfamily_id": pl.String, "t_subfamily_id": pl.String, "edge_weight": pl.Float64}
+    _emb_schema = {"q_subfamily_id": pl.String, "t_subfamily_id": pl.String, "cosine": pl.Float64}
+
+    core = pl.read_csv(hmm_core_tsv, separator="\t") if Path(hmm_core_tsv).exists() else pl.DataFrame(schema=_hmm_schema)
+    emb = pl.read_csv(emb_tsv, separator="\t") if Path(emb_tsv).exists() else pl.DataFrame(schema=_emb_schema)
+    relaxed = (
+        pl.read_csv(hmm_relaxed_tsv, separator="\t")
+        if hmm_relaxed_tsv and Path(hmm_relaxed_tsv).exists()
+        else pl.DataFrame(schema=_hmm_schema)
+    )
+
+    if len(core) > 0:
+        strict = (
+            core.rename({"q_subfamily_id": "qid", "t_subfamily_id": "tid"})
+            .with_columns(pl.col("edge_weight").alias("weight"), pl.lit("hmm_core").alias("source"))
+            .select(["qid", "tid", "weight", "source"])
+            .sort(["qid", "tid"])
+        )
+    else:
+        strict = pl.DataFrame(schema={"qid": pl.String, "tid": pl.String, "weight": pl.Float64, "source": pl.String})
+    strict.write_csv(out_strict_tsv, separator="\t")
 
     policy = config["graph"]["edge_weight_policy"]
     edges: dict[tuple[str, str], dict[str, float | str]] = {}
 
     for df, src in [(core, "hmm_core"), (relaxed, "hmm_relaxed")]:
-        for _, r in df.iterrows():
-            k = tuple(sorted((r.q_subfamily_id, r.t_subfamily_id)))
-            edges[k] = {"hmm": float(r.edge_weight), "emb": 0.0, "source": src}
+        for row in df.iter_rows(named=True):
+            k = tuple(sorted((row["q_subfamily_id"], row["t_subfamily_id"])))
+            edges[k] = {"hmm": float(row["edge_weight"]), "emb": 0.0, "source": src}
 
-    for _, r in emb.iterrows():
-        k = tuple(sorted((r.q_subfamily_id, r.t_subfamily_id)))
+    for row in emb.iter_rows(named=True):
+        k = tuple(sorted((row["q_subfamily_id"], row["t_subfamily_id"])))
         if policy == "strict":
             continue
         if policy == "gated":
@@ -844,9 +799,9 @@ def merge_graph(
             if float(weak) < float(config["graph"]["weak_hmm_threshold"]):
                 continue
         if k not in edges:
-            edges[k] = {"hmm": 0.0, "emb": float(r.cosine), "source": "emb"}
+            edges[k] = {"hmm": 0.0, "emb": float(row["cosine"]), "source": "emb"}
         else:
-            edges[k]["emb"] = max(float(edges[k]["emb"]), float(r.cosine))
+            edges[k]["emb"] = max(float(edges[k]["emb"]), float(row["cosine"]))
             edges[k]["source"] = "both"
 
     rows = []
@@ -859,19 +814,30 @@ def merge_graph(
             weight = float(config["graph"]["w_hmm"]) * hmm_w + float(config["graph"]["w_emb"]) * emb_w
         else:
             weight = hmm_w
-        rows.append({"qid": q, "tid": t, "weight": weight, "source": str(w["source"]), "hmm_weight": hmm_w, "emb_weight": emb_w})
+        rows.append({"qid": q, "tid": t, "weight": weight, "source": str(w["source"]),
+                     "hmm_weight": hmm_w, "emb_weight": emb_w})
 
-    pd.DataFrame(rows).sort_values(["qid", "tid"]).to_csv(out_functional_tsv, sep="\t", index=False)
+    if rows:
+        pl.from_dicts(rows).sort(["qid", "tid"]).write_csv(out_functional_tsv, separator="\t")
+    else:
+        pl.DataFrame(schema={
+            "qid": pl.String, "tid": pl.String, "weight": pl.Float64,
+            "source": pl.String, "hmm_weight": pl.Float64, "emb_weight": pl.Float64,
+        }).write_csv(out_functional_tsv, separator="\t")
 
 
-def _cluster_leiden(edges: pd.DataFrame, resolution: float, seed: int) -> pd.DataFrame:
+def _cluster_leiden(edges: pl.DataFrame, resolution: float, seed: int) -> pl.DataFrame:
     import igraph as ig
     import leidenalg
 
-    nodes = sorted(set(edges["qid"]).union(set(edges["tid"])))
+    nodes = sorted(set(edges["qid"].to_list()).union(set(edges["tid"].to_list())))
     n2i = {n: i for i, n in enumerate(nodes)}
-    g = ig.Graph(n=len(nodes), edges=[(n2i[a], n2i[b]) for a, b in edges[["qid", "tid"]].itertuples(index=False)], directed=False)
-    g.es["weight"] = edges["weight"].tolist()
+    g = ig.Graph(
+        n=len(nodes),
+        edges=[(n2i[a], n2i[b]) for a, b in edges.select(["qid", "tid"]).iter_rows()],
+        directed=False,
+    )
+    g.es["weight"] = edges["weight"].to_list()
     part = leidenalg.find_partition(
         g,
         leidenalg.RBConfigurationVertexPartition,
@@ -879,7 +845,10 @@ def _cluster_leiden(edges: pd.DataFrame, resolution: float, seed: int) -> pd.Dat
         resolution_parameter=resolution,
         seed=seed,
     )
-    return pd.DataFrame({"subfamily_id": nodes, "community": part.membership})
+    return pl.DataFrame({
+        "subfamily_id": pl.Series(name="subfamily_id", values=nodes, dtype=pl.String),
+        "community": pl.Series(name="community", values=part.membership, dtype=pl.Int64),
+    })
 
 
 def cluster_families(
@@ -901,37 +870,52 @@ def cluster_families(
         require_executables(["mcl"], config["tools"])
         raise RuntimeError("MCL comparison requested but not implemented in this minimal release.")
 
-    strict_edges = pd.read_csv(merged_edges_strict, sep="\t")
-    func_edges = pd.read_csv(merged_edges_functional, sep="\t")
+    strict_edges = pl.read_csv(merged_edges_strict, separator="\t")
+    func_edges = pl.read_csv(merged_edges_functional, separator="\t")
 
     strict = _cluster_leiden(strict_edges, float(config["graph"]["leiden_resolution_strict"]), int(config["graph"]["seed"]))
     func = _cluster_leiden(func_edges, float(config["graph"]["leiden_resolution_functional"]), int(config["graph"]["seed"]))
 
-    strict["family_id"] = strict["community"].map(lambda x: f"famS_{int(x):06d}")
-    func["family_id"] = func["community"].map(lambda x: f"famF_{int(x):06d}")
+    strict = strict.with_columns(
+        pl.col("community").map_elements(lambda x: f"famS_{int(x):06d}", return_dtype=pl.String).alias("family_id")
+    )
+    func = func.with_columns(
+        pl.col("community").map_elements(lambda x: f"famF_{int(x):06d}", return_dtype=pl.String).alias("family_id")
+    )
 
-    strict_out = strict[["subfamily_id", "family_id"]].copy()
-    strict_out["method"] = method
-    strict_out["method_params_json"] = json.dumps({"resolution": config["graph"]["leiden_resolution_strict"], "seed": config["graph"]["seed"]})
-    strict_out["notes"] = "Mode A strict core-domain families"
-    strict_out.to_csv(out / "subfamily_to_family_strict.tsv", sep="\t", index=False)
-    strict_out.to_csv(out / "subfamily_to_family.tsv", sep="\t", index=False)
+    strict_out = strict.select(["subfamily_id", "family_id"]).with_columns(
+        pl.lit(method).alias("method"),
+        pl.lit(json.dumps({"resolution": config["graph"]["leiden_resolution_strict"], "seed": config["graph"]["seed"]})).alias("method_params_json"),
+        pl.lit("Mode A strict core-domain families").alias("notes"),
+    )
+    strict_out.write_csv(out / "subfamily_to_family_strict.tsv", separator="\t")
+    strict_out.write_csv(out / "subfamily_to_family.tsv", separator="\t")
 
-    func_out = func[["subfamily_id", "family_id"]].copy()
-    func_out["method"] = method
-    func_out["method_params_json"] = json.dumps({"resolution": config["graph"]["leiden_resolution_functional"], "seed": config["graph"]["seed"]})
-    func_out["notes"] = "Mode B functional neighborhoods"
-    func_out.to_csv(out / "subfamily_to_family_functional.tsv", sep="\t", index=False)
+    func_out = func.select(["subfamily_id", "family_id"]).with_columns(
+        pl.lit(method).alias("method"),
+        pl.lit(json.dumps({"resolution": config["graph"]["leiden_resolution_functional"], "seed": config["graph"]["seed"]})).alias("method_params_json"),
+        pl.lit("Mode B functional neighborhoods").alias("notes"),
+    )
+    func_out.write_csv(out / "subfamily_to_family_functional.tsv", separator="\t")
 
-    smap = pd.read_csv(subfamily_map, sep="\t")
+    smap = pl.read_csv(subfamily_map, separator="\t")
     for tag, sdf in [("strict", strict_out), ("functional", func_out)]:
-        st = sdf.groupby("family_id")["subfamily_id"].count().reset_index(name="n_subfamilies")
-        prot = smap.merge(sdf[["subfamily_id", "family_id"]], on="subfamily_id", how="left").groupby("family_id")["protein_id"].nunique().reset_index(name="n_proteins")
-        stats = st.merge(prot, on="family_id", how="left")
-        stats["edge_density_core"] = np.nan
-        stats["mean_rep_len"] = np.nan
-        stats["edge_source_counts_json"] = "{}"
-        stats.sort_values("family_id").to_csv(out / f"family_stats_{tag}.tsv", sep="\t", index=False)
+        st = sdf.group_by("family_id").agg(pl.col("subfamily_id").len().alias("n_subfamilies"))
+        prot = (
+            smap.join(sdf.select(["subfamily_id", "family_id"]), on="subfamily_id", how="left")
+            .group_by("family_id")
+            .agg(pl.col("protein_id").n_unique().alias("n_proteins"))
+        )
+        stats = (
+            st.join(prot, on="family_id", how="left")
+            .with_columns(
+                pl.lit(None).cast(pl.Float64).alias("edge_density_core"),
+                pl.lit(None).cast(pl.Float64).alias("mean_rep_len"),
+                pl.lit("{}").alias("edge_source_counts_json"),
+            )
+            .sort("family_id")
+        )
+        stats.write_csv(out / f"family_stats_{tag}.tsv", separator="\t")
 
 
 def map_proteins_to_families(
@@ -951,178 +935,209 @@ def map_proteins_to_families(
     if resume and (out / "protein_vs_profile_hits.tsv").exists():
         logger.info("Resume: map-proteins-to-families outputs already exist in %s, skipping.", str(out))
         return
-    
+
     tools = require_executables(["mmseqs"], config["tools"])
     sub_reps = Path(outdir).parent / "01_mmseqs" / "subfamily_reps.faa"
     if not sub_reps.exists():
         raise RuntimeError(f"subfamily_reps.faa not found at {sub_reps}")
-        
+
     db_out = out / "mmseqs_search"
     db_out.mkdir(parents=True, exist_ok=True)
     res_tsv = db_out / "search_results.tsv"
     tmpdir = _ensure_dir(config.get("mmseqs", {}).get("tmpdir", "tmp/mmseqs"))
     threads = str(config.get("mmseqs", {}).get("threads", 8))
-    
+
     mmseqs_cmd = [
         tools["mmseqs"], "easy-search",
-        proteins_fasta,
-        str(sub_reps),
-        str(res_tsv),
-        str(tmpdir),
+        proteins_fasta, str(sub_reps), str(res_tsv), str(tmpdir),
         "--threads", threads,
         "-e", str(config["mapping"]["max_evalue"]),
         "--format-output", "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen",
     ]
     run_cmd(mmseqs_cmd, logger)
-    
-    s2f = pd.read_csv(subfamily_to_family_strict, sep="\t").set_index("subfamily_id")["family_id"].to_dict()
-    f2f = pd.read_csv(subfamily_to_family_functional, sep="\t").set_index("subfamily_id")["family_id"].to_dict()
-    
-    # Read search results
-    cols = ["query","target","pident","alnlen","mismatch","gapopen","qstart","qend","tstart","tend","evalue","bits","qlen","tlen"]
-    if res_tsv.stat().st_size > 0:
-        df = pd.read_csv(res_tsv, sep="\t", names=cols)
-    else:
-        df = pd.DataFrame(columns=cols)
 
-    # Filter hits
+    _s2f_df = pl.read_csv(subfamily_to_family_strict, separator="\t")
+    s2f = dict(zip(_s2f_df["subfamily_id"].to_list(), _s2f_df["family_id"].to_list()))
+    _f2f_df = pl.read_csv(subfamily_to_family_functional, separator="\t")
+    f2f = dict(zip(_f2f_df["subfamily_id"].to_list(), _f2f_df["family_id"].to_list()))
+
+    _cols = ["query", "target", "pident", "alnlen", "mismatch", "gapopen",
+             "qstart", "qend", "tstart", "tend", "evalue", "bits", "qlen", "tlen"]
+    if res_tsv.stat().st_size > 0:
+        df = pl.read_csv(res_tsv, separator="\t", has_header=False, new_columns=_cols)
+    else:
+        df = pl.DataFrame(schema={c: pl.String for c in _cols})
+
     min_cov = float(config["mapping"]["profile_cov_min"])
     min_pident = float(config["mapping"].get("min_prob", 0.0))
     min_seg_len = int(config["mapping"].get("min_segment_len", 0))
     if len(df) > 0:
-        df["profile_cov"] = df["alnlen"] / df["tlen"]
-        df["protein_cov"] = df["alnlen"] / df["qlen"]
+        df = df.with_columns([
+            pl.col("pident").cast(pl.Float64),
+            pl.col("alnlen").cast(pl.Int64),
+            pl.col("qstart").cast(pl.Int64),
+            pl.col("qend").cast(pl.Int64),
+            pl.col("tstart").cast(pl.Int64),
+            pl.col("tend").cast(pl.Int64),
+            pl.col("evalue").cast(pl.Float64),
+            pl.col("bits").cast(pl.Float64),
+            pl.col("qlen").cast(pl.Int64),
+            pl.col("tlen").cast(pl.Int64),
+        ]).with_columns([
+            (pl.col("alnlen") / pl.col("tlen")).alias("profile_cov"),
+            (pl.col("alnlen") / pl.col("qlen")).alias("protein_cov"),
+        ])
         pre_count = len(df)
-        df = df[df["profile_cov"] >= min_cov]
+        df = df.filter(pl.col("profile_cov") >= min_cov)
         if min_pident > 0:
-            df = df[df["pident"] >= min_pident]
+            df = df.filter(pl.col("pident") >= min_pident)
         if min_seg_len > 0:
-            df = df[df["alnlen"] >= min_seg_len]
+            df = df.filter(pl.col("alnlen") >= min_seg_len)
         if logger:
             logger.info("Mapping filter: %d -> %d hits (min_cov=%.2f, min_pident=%.1f, min_seg_len=%d)",
                         pre_count, len(df), min_cov, min_pident, min_seg_len)
-        df = df.sort_values(["query", "evalue", "bits"], ascending=[True, True, False])
+        df = df.sort(["query", "evalue", "bits"], descending=[False, False, True])
 
     max_overlap = int(config["mapping"]["max_overlap_aa"])
-    
+
     hits = []
     segs = []
-    
+
     def _overlap(s1, e1, s2, e2):
         return max(0, min(e1, e2) - max(s1, s2))
 
     if len(df) > 0:
-        for pid, grp in df.groupby("query", sort=False):
+        for grp in df.partition_by("query", maintain_order=True):
+            pid = grp["query"][0]
             accepted_intervals = []
             rank = 1
-            for _, row in grp.iterrows():
+            for row in grp.iter_rows(named=True):
                 qs, qe = int(row["qstart"]), int(row["qend"])
-                
-                # Check overlap
-                too_much_overlap = False
-                for (acc_s, acc_e) in accepted_intervals:
-                    if _overlap(qs, qe, acc_s, acc_e) > max_overlap:
-                        too_much_overlap = True
-                        break
-                
+                too_much_overlap = any(
+                    _overlap(qs, qe, acc_s, acc_e) > max_overlap
+                    for (acc_s, acc_e) in accepted_intervals
+                )
                 if not too_much_overlap:
                     accepted_intervals.append((qs, qe))
                     subfam = row["target"]
                     fam_s = s2f.get(subfam, "")
                     fam_f = f2f.get(subfam, "")
-                    
                     hits.append({
-                        "protein_id": pid,
-                        "profile_id": subfam,
-                        "subfamily_id": subfam,
+                        "protein_id": pid, "profile_id": subfam, "subfamily_id": subfam,
                         "family_id": fam_s if fam_s else "",
-                        "start_aa": qs,
-                        "end_aa": qe,
-                        "prob": row["pident"],
-                        "evalue": row["evalue"],
-                        "profile_cov": row["profile_cov"],
-                        "protein_cov": row["protein_cov"],
-                        "aln_len": row["alnlen"],
-                        "tool": "mmseqs",
-                        "hit_rank": rank,
-                        "run_id": "map_v3"
+                        "start_aa": qs, "end_aa": qe,
+                        "prob": row["pident"], "evalue": row["evalue"],
+                        "profile_cov": row["profile_cov"], "protein_cov": row["protein_cov"],
+                        "aln_len": row["alnlen"], "tool": "mmseqs",
+                        "hit_rank": rank, "run_id": "map_v3",
                     })
-                    
                     L = qe - qs + 1
                     if fam_s:
-                        segs.append({"protein_id": pid, "family_id": fam_s, "family_mode": "strict", "segment_start_aa": qs, "segment_end_aa": qe, "best_subfamily_id": subfam, "support_score": row["evalue"], "support_tool": "mmseqs", "profile_cov": row["profile_cov"], "segment_len": L})
+                        segs.append({"protein_id": pid, "family_id": fam_s, "family_mode": "strict",
+                                     "segment_start_aa": qs, "segment_end_aa": qe,
+                                     "best_subfamily_id": subfam, "support_score": row["evalue"],
+                                     "support_tool": "mmseqs", "profile_cov": row["profile_cov"],
+                                     "segment_len": L})
                     if fam_f:
-                        segs.append({"protein_id": pid, "family_id": fam_f, "family_mode": "functional", "segment_start_aa": qs, "segment_end_aa": qe, "best_subfamily_id": subfam, "support_score": row["evalue"], "support_tool": "mmseqs", "profile_cov": row["profile_cov"], "segment_len": L})
-                        
+                        segs.append({"protein_id": pid, "family_id": fam_f, "family_mode": "functional",
+                                     "segment_start_aa": qs, "segment_end_aa": qe,
+                                     "best_subfamily_id": subfam, "support_score": row["evalue"],
+                                     "support_tool": "mmseqs", "profile_cov": row["profile_cov"],
+                                     "segment_len": L})
                     rank += 1
 
-    # Now calculate architectures for all proteins (even those with no hits)
+    _seg_schema = {
+        "protein_id": pl.String, "family_id": pl.String, "family_mode": pl.String,
+        "segment_start_aa": pl.Int64, "segment_end_aa": pl.Int64, "best_subfamily_id": pl.String,
+        "support_score": pl.Float64, "support_tool": pl.String, "profile_cov": pl.Float64,
+        "segment_len": pl.Int64,
+    }
+    seg_df = pl.from_dicts(segs, schema=_seg_schema) if segs else pl.DataFrame(schema=_seg_schema)
+
     recs = {r.id: len(r.seq) for r in read_fasta(proteins_fasta)}
     arch = []
-    
-    seg_df = pd.DataFrame(segs, columns=["protein_id","family_id","family_mode","segment_start_aa","segment_end_aa","best_subfamily_id","support_score","support_tool","profile_cov","segment_len"])
-    
     for pid, L in recs.items():
         if len(seg_df) > 0:
-            p_segs = seg_df[(seg_df["protein_id"] == pid) & (seg_df["family_mode"] == "strict")].sort_values("segment_start_aa")
+            p_segs = seg_df.filter(
+                (pl.col("protein_id") == pid) & (pl.col("family_mode") == "strict")
+            ).sort("segment_start_aa")
         else:
-            p_segs = []
-            
+            p_segs = seg_df
         if len(p_segs) > 0:
-            arch_str = "|".join(p_segs["family_id"].tolist())
-            cov_aa = sum(p_segs["segment_len"].tolist())
-            arch.append({
-                "protein_id": pid,
-                "architecture": arch_str,
-                "n_segments": len(p_segs),
-                "total_covered_aa": cov_aa,
-                "coverage_fraction": min(1.0, cov_aa / L),
-                "is_fusion": 1 if len(p_segs) > 1 else 0
-            })
+            arch_str = "|".join(p_segs["family_id"].to_list())
+            cov_aa = sum(p_segs["segment_len"].to_list())
+            arch.append({"protein_id": pid, "architecture": arch_str, "n_segments": len(p_segs),
+                         "total_covered_aa": cov_aa, "coverage_fraction": min(1.0, cov_aa / L),
+                         "is_fusion": 1 if len(p_segs) > 1 else 0})
         else:
-            arch.append({
-                "protein_id": pid,
-                "architecture": "",
-                "n_segments": 0,
-                "total_covered_aa": 0,
-                "coverage_fraction": 0.0,
-                "is_fusion": 0
-            })
+            arch.append({"protein_id": pid, "architecture": "", "n_segments": 0,
+                         "total_covered_aa": 0, "coverage_fraction": 0.0, "is_fusion": 0})
 
-    pd.DataFrame(hits, columns=["protein_id","profile_id","subfamily_id","family_id","start_aa","end_aa","prob","evalue","profile_cov","protein_cov","aln_len","tool","hit_rank","run_id"]).to_csv(out / "protein_vs_profile_hits.tsv", sep="\t", index=False)
-    seg_df.to_csv(out / "protein_family_segments.tsv", sep="\t", index=False)
-    pd.DataFrame(arch, columns=["protein_id","architecture","n_segments","total_covered_aa","coverage_fraction","is_fusion"]).to_csv(out / "protein_architectures.tsv", sep="\t", index=False)
+    _hits_schema = {
+        "protein_id": pl.String, "profile_id": pl.String, "subfamily_id": pl.String,
+        "family_id": pl.String, "start_aa": pl.Int64, "end_aa": pl.Int64,
+        "prob": pl.Float64, "evalue": pl.Float64, "profile_cov": pl.Float64,
+        "protein_cov": pl.Float64, "aln_len": pl.Int64, "tool": pl.String,
+        "hit_rank": pl.Int64, "run_id": pl.String,
+    }
+    _arch_schema = {
+        "protein_id": pl.String, "architecture": pl.String, "n_segments": pl.Int64,
+        "total_covered_aa": pl.Int64, "coverage_fraction": pl.Float64, "is_fusion": pl.Int64,
+    }
+    hits_df = pl.from_dicts(hits, schema=_hits_schema) if hits else pl.DataFrame(schema=_hits_schema)
+    arch_df = pl.from_dicts(arch, schema=_arch_schema) if arch else pl.DataFrame(schema=_arch_schema)
+
+    hits_df.write_csv(out / "protein_vs_profile_hits.tsv", separator="\t")
+    seg_df.write_csv(out / "protein_family_segments.tsv", separator="\t")
+    arch_df.write_csv(out / "protein_architectures.tsv", separator="\t")
 
 
-def _write_dense_if_small(sparse: pd.DataFrame, row_col: tuple[str, str], out_path: Path, threshold: int) -> None:
-    n = sparse[row_col[0]].nunique() * sparse[row_col[1]].nunique()
-    if n <= threshold and len(sparse):
-        sparse.pivot_table(index=row_col[0], columns=row_col[1], values="value", fill_value=0).to_csv(out_path, sep="\t")
+def _write_dense_if_small(sparse: pl.DataFrame, row_col: tuple[str, str], out_path: Path, threshold: int) -> None:
+    n = sparse[row_col[0]].n_unique() * sparse[row_col[1]].n_unique()
+    if n <= threshold and len(sparse) > 0:
+        dense = sparse.pivot(
+            values="value", index=row_col[0], on=row_col[1], aggregate_function="first"
+        ).fill_null(0)
+        dense.write_csv(out_path, separator="\t")
 
 
-def write_matrices(subfamily_map: str, protein_family_segments: str, outdir: str, config: dict, logger=None, resume: bool = False) -> None:
+def write_matrices(
+    subfamily_map: str, protein_family_segments: str, outdir: str,
+    config: dict, logger=None, resume: bool = False
+) -> None:
     out = _ensure_dir(outdir)
     if resume and (out / "subfamily_x_protein_sparse.tsv").exists():
         if logger:
             logger.info("Resume: write-matrices outputs already exist in %s, skipping.", str(out))
         return
-    smap = pd.read_csv(subfamily_map, sep="\t")
+    smap = pl.read_csv(subfamily_map, separator="\t")
     if Path(protein_family_segments).exists() and Path(protein_family_segments).stat().st_size > 0:
-        seg = pd.read_csv(protein_family_segments, sep="\t")
+        seg = pl.read_csv(protein_family_segments, separator="\t")
     else:
-        seg = pd.DataFrame(columns=["protein_id","family_id","family_mode"])
+        seg = pl.DataFrame(schema={"protein_id": pl.String, "family_id": pl.String, "family_mode": pl.String})
 
-    sf = smap[["subfamily_id", "protein_id"]].drop_duplicates().sort_values(["subfamily_id", "protein_id"])
-    sf["value"] = 1
-    sf.to_csv(out / "subfamily_x_protein_sparse.tsv", sep="\t", index=False)
+    sf = (
+        smap.select(["subfamily_id", "protein_id"]).unique()
+        .sort(["subfamily_id", "protein_id"])
+        .with_columns(pl.lit(1).alias("value"))
+    )
+    sf.write_csv(out / "subfamily_x_protein_sparse.tsv", separator="\t")
 
-    strict = seg[seg["family_mode"] == "strict"][["family_id", "protein_id"]].drop_duplicates().sort_values(["family_id", "protein_id"])
-    strict["value"] = 1
-    strict.to_csv(out / "family_strict_x_protein_sparse.tsv", sep="\t", index=False)
+    strict = (
+        seg.filter(pl.col("family_mode") == "strict")
+        .select(["family_id", "protein_id"]).unique()
+        .sort(["family_id", "protein_id"])
+        .with_columns(pl.lit(1).alias("value"))
+    )
+    strict.write_csv(out / "family_strict_x_protein_sparse.tsv", separator="\t")
 
-    func = seg[seg["family_mode"] == "functional"][["family_id", "protein_id"]].drop_duplicates().sort_values(["family_id", "protein_id"])
-    func["value"] = 1
-    func.to_csv(out / "family_functional_x_protein_sparse.tsv", sep="\t", index=False)
+    func = (
+        seg.filter(pl.col("family_mode") == "functional")
+        .select(["family_id", "protein_id"]).unique()
+        .sort(["family_id", "protein_id"])
+        .with_columns(pl.lit(1).alias("value"))
+    )
+    func.write_csv(out / "family_functional_x_protein_sparse.tsv", separator="\t")
 
     thr = int(config["outputs"]["write_dense_threshold"])
     _write_dense_if_small(sf, ("subfamily_id", "protein_id"), out / "subfamily_x_protein_dense.tsv", thr)
@@ -1133,19 +1148,24 @@ def write_matrices(subfamily_map: str, protein_family_segments: str, outdir: str
         from scipy.io import mmwrite
         from scipy.sparse import coo_matrix
 
-        proteins = sorted(sf["protein_id"].unique())
+        proteins = sorted(sf["protein_id"].unique().to_list())
         pc = {p: i for i, p in enumerate(proteins)}
 
-        def dump(prefix: str, frame: pd.DataFrame, row_name: str):
-            rows = sorted(frame[row_name].unique())
+        def dump(prefix: str, frame: pl.DataFrame, row_name: str):
+            rows = sorted(frame[row_name].unique().to_list())
             rc = {r: i for i, r in enumerate(rows)}
-            mat = coo_matrix((np.ones(len(frame)), ([rc[r] for r in frame[row_name]], [pc[p] for p in frame["protein_id"]])), shape=(len(rows), len(proteins)))
+            mat = coo_matrix(
+                (np.ones(len(frame)),
+                 ([rc[r] for r in frame[row_name].to_list()],
+                  [pc[p] for p in frame["protein_id"].to_list()])),
+                shape=(len(rows), len(proteins)),
+            )
             mmwrite(out / f"{prefix}.mtx", mat)
             (out / f"{prefix}_rows.txt").write_text("\n".join(rows) + "\n")
             (out / f"{prefix}_cols.txt").write_text("\n".join(proteins) + "\n")
 
         dump("subfamily_x_protein", sf, "subfamily_id")
-        if len(strict):
+        if len(strict) > 0:
             dump("family_strict_x_protein", strict, "family_id")
-        if len(func):
+        if len(func) > 0:
             dump("family_functional_x_protein", func, "family_id")

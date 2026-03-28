@@ -116,7 +116,7 @@ def git_commit() -> str | None:
 
 def collect_lib_versions() -> dict[str, str]:
     libs = {}
-    for pkg in ["numpy", "pandas", "torch", "fair-esm", "igraph", "leidenalg", "scikit-learn"]:
+    for pkg in ["numpy", "polars", "torch", "fair-esm", "igraph", "leidenalg", "scikit-learn"]:
         try:
             libs[pkg] = importlib_metadata.version(pkg)
         except importlib_metadata.PackageNotFoundError:
@@ -142,3 +142,19 @@ def write_manifest(
     }
     Path(manifest_path).parent.mkdir(parents=True, exist_ok=True)
     Path(manifest_path).write_text(json.dumps(payload, indent=2))
+
+
+def add_step_log_handler(logger: logging.Logger, step_log_dir: str | Path, step_name: str) -> logging.FileHandler:
+    """Add an additional file handler so a step also writes its log to its own output directory.
+
+    Returns the handler so the caller can remove it later if needed.
+    """
+    Path(step_log_dir).mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(Path(step_log_dir) / f"{step_name}.log")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)-7s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(fh)
+    return fh

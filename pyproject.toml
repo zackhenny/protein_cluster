@@ -12,7 +12,7 @@ authors = [{name = "plm_cluster"}]
 dependencies = [
   "PyYAML>=6.0",
   "numpy>=1.24",
-  "pandas>=2.0",
+  "polars>=1.0",
   "scikit-learn>=1.2",
   "python-igraph>=0.11",
   "leidenalg>=0.10",
@@ -22,7 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 embed = ["torch>=2.1", "fair-esm>=2.0"]
 faiss = ["faiss-cpu>=1.7"]
-test = ["pytest>=7.4"]
+test = ["pytest>=7.4", "pandas>=2.0"]
 
 [project.scripts]
 plm_cluster = "plm_cluster.cli:main"
