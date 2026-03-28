@@ -545,13 +545,14 @@ def hmm_hmm_edges(
 
         if not (ffdata.exists() and ffindex.exists()):
             logger.info("Building HH-suite ffindex DB from %d profiles", len(hhm))
-            # Pass file list via stdin to avoid ARG_MAX limits for large datasets.
-            # sorted() ensures a consistent, reproducible entry order in the DB.
-            # The -s flag sorts the ffindex, which is required by hhsearch for
-            # efficient binary-search lookups.
+            # Pass file list via stdin (-f /dev/stdin) to avoid ARG_MAX limits
+            # for large datasets.  sorted() ensures a consistent, reproducible
+            # entry order in the DB.  The -s flag sorts the ffindex, which is
+            # required by hhsearch for efficient binary-search lookups.
             file_list_str = "\n".join(sorted(hhm.values())) + "\n"
             run_cmd(
-                [db_tools["ffindex_build"], "-s", str(ffdata), str(ffindex)],
+                [db_tools["ffindex_build"], "-s", "-f", "/dev/stdin",
+                 str(ffdata), str(ffindex)],
                 logger,
                 stdin=file_list_str,
             )

@@ -22,6 +22,13 @@ plm_cluster mmseqs-cluster \
   --proteins_fasta proteins.faa \
   --outdir results/01_mmseqs \
   --config my_config.yaml
+
+# Resume: skips the step entirely if output files already exist
+plm_cluster mmseqs-cluster \
+  --proteins_fasta proteins.faa \
+  --outdir results/01_mmseqs \
+  --config my_config.yaml \
+  --resume
 ```
 
 ## 2. Build subfamily profiles
@@ -31,6 +38,14 @@ plm_cluster build-profiles \
   --subfamily_map results/01_mmseqs/subfamily_map.tsv \
   --outdir results/02_profiles \
   --config my_config.yaml
+
+# Resume: rebuilds only missing .hhm profiles; skips already-built ones
+plm_cluster build-profiles \
+  --proteins_fasta proteins.faa \
+  --subfamily_map results/01_mmseqs/subfamily_map.tsv \
+  --outdir results/02_profiles \
+  --config my_config.yaml \
+  --resume
 ```
 
 ## 3. Embeddings + KNN candidates
@@ -41,12 +56,29 @@ plm_cluster embed \
   --outdir results/04_embeddings \
   --config my_config.yaml
 
+# Resume: skips the step if embeddings.npy already exists
+plm_cluster embed \
+  --reps_fasta results/01_mmseqs/subfamily_reps.faa \
+  --weights_path /path/to/esm2.pt \
+  --outdir results/04_embeddings \
+  --config my_config.yaml \
+  --resume
+
 plm_cluster knn \
   --embeddings results/04_embeddings/embeddings.npy \
   --ids results/04_embeddings/ids.txt \
   --lengths results/04_embeddings/lengths.tsv \
   --out_tsv results/04_embeddings/embedding_knn_edges.tsv \
   --config my_config.yaml
+
+# Resume: skips the step if the output TSV already exists
+plm_cluster knn \
+  --embeddings results/04_embeddings/embeddings.npy \
+  --ids results/04_embeddings/ids.txt \
+  --lengths results/04_embeddings/lengths.tsv \
+  --out_tsv results/04_embeddings/embedding_knn_edges.tsv \
+  --config my_config.yaml \
+  --resume
 ```
 
 ## 4. Candidate-gated HMM-HMM edges
@@ -62,7 +94,9 @@ plm_cluster hmm-hmm-edges \
 
 Add `--resume` to pick up where the stage left off.  Every processed pair is
 appended to an NDJSON progress log in real time; on resume, all pairs that
-already have a `"status": "ok"` entry in that log are skipped.
+already have a `"status": "ok"` entry in that log are skipped.  This works for
+both `pairwise` and `db-search` modes.  If the ffindex DB was not built before
+the interruption, it will be built automatically on resume.
 
 **Default progress file locations:**
 
@@ -152,6 +186,15 @@ plm_cluster merge-graph \
   --embedding_edges results/04_embeddings/embedding_knn_edges.tsv \
   --outdir results/06_family_clustering \
   --config my_config.yaml
+
+# Resume: skips the step if merged graph files already exist
+plm_cluster merge-graph \
+  --hmm_core results/03_hmm_hmm_edges/hmm_hmm_edges_core.tsv \
+  --hmm_relaxed results/03_hmm_hmm_edges/hmm_hmm_edges_relaxed.tsv \
+  --embedding_edges results/04_embeddings/embedding_knn_edges.tsv \
+  --outdir results/06_family_clustering \
+  --config my_config.yaml \
+  --resume
 ```
 
 ## 6. Cluster families
@@ -162,6 +205,15 @@ plm_cluster cluster-families \
   --subfamily_map results/01_mmseqs/subfamily_map.tsv \
   --outdir results/06_family_clustering \
   --config my_config.yaml
+
+# Resume: skips the step if family assignment files already exist
+plm_cluster cluster-families \
+  --merged_edges_strict results/06_family_clustering/merged_edges_strict.tsv \
+  --merged_edges_functional results/06_family_clustering/merged_edges_functional.tsv \
+  --subfamily_map results/01_mmseqs/subfamily_map.tsv \
+  --outdir results/06_family_clustering \
+  --config my_config.yaml \
+  --resume
 ```
 
 ## 7. Protein mapping and architectures
@@ -173,6 +225,16 @@ plm_cluster map-proteins-to-families \
   --subfamily_map results/01_mmseqs/subfamily_map.tsv \
   --outdir results/05_domain_hits \
   --config my_config.yaml
+
+# Resume: skips the step if protein mapping outputs already exist
+plm_cluster map-proteins-to-families \
+  --proteins_fasta proteins.faa \
+  --subfamily_to_family_strict results/06_family_clustering/subfamily_to_family_strict.tsv \
+  --subfamily_to_family_functional results/06_family_clustering/subfamily_to_family_functional.tsv \
+  --subfamily_map results/01_mmseqs/subfamily_map.tsv \
+  --outdir results/05_domain_hits \
+  --config my_config.yaml \
+  --resume
 ```
 
 ## 8. Membership matrices
@@ -182,6 +244,14 @@ plm_cluster write-matrices \
   --protein_family_segments results/05_domain_hits/protein_family_segments.tsv \
   --outdir results/07_membership_matrices \
   --config my_config.yaml
+
+# Resume: skips the step if matrix output files already exist
+plm_cluster write-matrices \
+  --subfamily_map results/01_mmseqs/subfamily_map.tsv \
+  --protein_family_segments results/05_domain_hits/protein_family_segments.tsv \
+  --outdir results/07_membership_matrices \
+  --config my_config.yaml \
+  --resume
 ```
 
 ## Major tuning options
@@ -217,8 +287,17 @@ hash, and checksums of the input files — useful for reproducibility.
 
 ### Resume support by stage
 
-| Stage | `--resume` supported | Progress file |
-|-------|---------------------|---------------|
-| `hmm-hmm-edges` | ✅ Yes | `results/03_hmm_hmm_edges/hmm_hmm_progress[.shard_N].ndjson` |
-| `run-all` | ✅ Yes (delegates to `hmm-hmm-edges`) | same as above |
-| All other stages | — | (runs are fast or atomic; rerunning is safe) |
+| Stage | `--resume` supported | Behaviour |
+|-------|---------------------|-----------|
+| `mmseqs-cluster` | ✅ Yes | Skips step entirely if output files already exist |
+| `build-profiles` | ✅ Yes | Rebuilds only missing `.hhm` profiles |
+| `embed` | ✅ Yes | Skips step if `embeddings.npy` already exists |
+| `knn` | ✅ Yes | Skips step if output KNN TSV already exists |
+| `hmm-hmm-edges` | ✅ Yes (fine-grained) | Skips completed pairs via NDJSON log; builds ffindex DB if not yet built |
+| `merge-hmm-shards` | ✅ Yes | Skips step if merged output already exists |
+| `merge-graph` | ✅ Yes | Skips step if merged graph files already exist |
+| `cluster-families` | ✅ Yes | Skips step if family assignment files already exist |
+| `map-proteins-to-families` | ✅ Yes | Skips step if protein mapping outputs already exist |
+| `write-matrices` | ✅ Yes | Skips step if matrix output files already exist |
+| `qc-plots` | ✅ Yes | Skips step if output directory already has plots |
+| `run-all` | ✅ Yes | Passes `--resume` to every stage above |
