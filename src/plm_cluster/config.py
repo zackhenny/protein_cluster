@@ -14,6 +14,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "hhmake_path": "",
         "hhsearch_path": "",
         "hhalign_path": "",
+        "ffindex_build_path": "",
         "mafft_path": "",
         "mcl_path": "",
     },
@@ -96,6 +97,7 @@ _RANGE_CHECKS: list[tuple[str, str, float, float]] = [
 _VALID_EMBED_DEVICES = {"cpu", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3"}
 _VALID_EDGE_POLICIES = {"strict", "union", "gated", "downweight_embeddings"}
 _VALID_LONG_SEQ_POLICIES = {"truncate", "skip", "full"}
+_VALID_HMM_MODES = {"pairwise", "db-search"}
 
 
 def validate_config(cfg: dict[str, Any]) -> list[str]:
@@ -122,6 +124,10 @@ def validate_config(cfg: dict[str, Any]) -> list[str]:
     lsp = cfg.get("embed", {}).get("long_seq_policy", "")
     if lsp and lsp not in _VALID_LONG_SEQ_POLICIES:
         errors.append(f"embed.long_seq_policy='{lsp}' not in {_VALID_LONG_SEQ_POLICIES}")
+
+    hmm_mode = cfg.get("hmm_hmm", {}).get("mode", "")
+    if hmm_mode and hmm_mode not in _VALID_HMM_MODES:
+        errors.append(f"hmm_hmm.mode='{hmm_mode}' not in {_VALID_HMM_MODES}")
 
     return errors
 

@@ -7,7 +7,7 @@ dependencies:
   - python=3.11
   - pip
   - mmseqs2
-  - hhsuite
+  - hhsuite                        # provides hhmake, hhalign, hhsearch, ffindex_build
   - mafft
   - mcl
   - numpy
@@ -31,6 +31,9 @@ dependencies:
 # Or manually:
 #   conda activate plm_cluster
 #   python -m pip install --no-build-isolation --no-user .
+#
+# The hhsuite package provides all HH-suite binaries needed for both
+# pairwise (hhalign) and db-search (hhsearch + ffindex_build) modes.
 
 variables:
   PYTHONNOUSERSITE: "1"

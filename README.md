@@ -25,7 +25,7 @@ Input proteins  ──►  MMseqs2 subfamilies  ──►  HMM profiles  ──�
 | 2 | MAFFT + HH-suite | Build MSAs and profile HMMs per subfamily |
 | 3 | ESM-2 (PyTorch) | Generate mean-pooled embeddings for subfamily reps |
 | 4 | FAISS / sklearn | Find K-nearest embedding neighbors as candidate pairs |
-| 5 | hhalign | Profile-profile alignments on candidate pairs → edge sets |
+| 5 | hhalign / hhsearch | Profile-profile alignments on candidate pairs → edge sets |
 | 6 | Leiden | Cluster strict and functional family graphs |
 | 7 | MMseqs2 | Map full-length proteins to families (fusion-aware segments) |
 | 8 | pandas / scipy | Write sparse/dense membership matrices |
@@ -77,6 +77,7 @@ Key tuning knobs:
 | Parameter | Effect |
 |-----------|--------|
 | `mmseqs.min_seq_id` | Subfamily granularity |
+| `hmm_hmm.mode` | `pairwise` (hhalign per pair) or `db-search` (hhsearch against ffindex DB) |
 | `hmm_hmm.min_prob_core` | Strict family sensitivity |
 | `graph.leiden_resolution_*` | Family size (lower → larger families) |
 | `embed.device` | CPU or GPU for embeddings |
@@ -212,7 +213,8 @@ detailed resume and sharding guidance.
 
 **External tools** (must be on `$PATH` or set in config):
 - `mmseqs` (MMseqs2)
-- `hhmake`, `hhalign` (HH-suite)
+- `hhmake`, `hhalign` (HH-suite — pairwise mode)
+- `hhsearch`, `ffindex_build` (HH-suite — db-search mode)
 - `mafft`
 
 **Python** (≥ 3.10):

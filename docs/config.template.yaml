@@ -15,8 +15,9 @@ seed: 42                          # Global random seed for reproducibility
 tools:
   mmseqs_path: ""                 # Path to mmseqs binary
   hhmake_path: ""                 # Path to hhmake (HH-suite)
-  hhsearch_path: ""               # Path to hhsearch (optional)
-  hhalign_path: ""                # Path to hhalign (HH-suite)
+  hhsearch_path: ""               # Path to hhsearch (HH-suite, for db-search mode)
+  hhalign_path: ""                # Path to hhalign (HH-suite, for pairwise mode)
+  ffindex_build_path: ""          # Path to ffindex_build (HH-suite, for db-search mode)
   mafft_path: ""                  # Path to mafft aligner
   mcl_path: ""                    # Path to mcl (only if --method mcl)
 
