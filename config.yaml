@@ -8,6 +8,7 @@ tools:
   hhmake_path: ""
   hhsearch_path: ""
   hhalign_path: ""
+  ffindex_build_path: ""
   mafft_path: ""
   mcl_path: ""
 
@@ -27,7 +28,8 @@ profiles:
   max_members_per_subfamily: 256
 
 hmm_hmm:
-  # Step 3 — HMM-HMM profile-profile edges via hhalign
+  # Step 3 — HMM-HMM profile-profile edges via hhalign or hhsearch
+  mode: pairwise                    # "pairwise" (hhalign per pair) or "db-search" (hhsearch against ffindex DB)
   topN: 200
   mincov_core: 0.70
   min_prob_core: 90

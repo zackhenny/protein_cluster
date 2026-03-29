@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
 import re
+import tempfile
 import threading
 import time
 from collections import defaultdict
@@ -52,13 +54,20 @@ def _parse_hhr_metrics(path: str | Path) -> dict[str, float]:
 
 
 def _parse_hhr_all_hits(path: str | Path) -> list[dict]:
-    """Parse all hits from an hhsearch .hhr file."""
+    """Parse all hits from an hhsearch .hhr file.
+
+    Target IDs are normalised: directory prefixes and ``.hhm`` suffixes are
+    stripped so that the returned ``target_id`` matches the subfamily ID used
+    elsewhere in the pipeline (e.g. ``subfam_000001``).
+    """
     lines = Path(path).read_text(errors="ignore").splitlines()
     hits: list[dict] = []
     i = 0
     while i < len(lines):
         if lines[i].startswith(">") and i > 0 and re.match(r"^No \d+\s*$", lines[i - 1]):
             target_id = lines[i][1:].strip().split()[0]
+            # Strip directory prefix (ffindex may store full paths)
+            target_id = os.path.basename(target_id)
             if target_id.endswith(".hhm"):
                 target_id = target_id[:-4]
             m: dict = {"prob": 0.0, "evalue": 1.0, "pident": np.nan, "aln_len": 0}
@@ -130,6 +139,79 @@ def _append_hmm_progress(path: Path, rec: dict, lock: threading.Lock) -> None:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(line)
             fh.flush()
+
+
+def _build_hhsuite_db(
+    db_dir: Path,
+    db_prefix: Path,
+    hhm_paths: dict[str, str],
+    a3m_paths: dict[str, str],
+    ffindex_build_bin: str,
+    logger,
+) -> None:
+    """Build HH-suite ffindex databases (``_hhm`` and ``_a3m``) for hhsearch.
+
+    HH-suite 3.x ``hhsearch -d <prefix>`` resolves database files as::
+
+        <prefix>_hhm.ffdata  /  <prefix>_hhm.ffindex
+        <prefix>_a3m.ffdata  /  <prefix>_a3m.ffindex
+
+    Both the ``_hhm`` and ``_a3m`` databases must exist for hhsearch to run.
+    This helper writes the file lists to temporary files (avoiding platform
+    issues with ``/dev/stdin``) and calls ``ffindex_build`` for each suffix.
+    """
+    db_dir.mkdir(parents=True, exist_ok=True)
+    ffdata_hhm = db_dir / "profiles_db_hhm.ffdata"
+    ffindex_hhm = db_dir / "profiles_db_hhm.ffindex"
+    ffdata_a3m = db_dir / "profiles_db_a3m.ffdata"
+    ffindex_a3m = db_dir / "profiles_db_a3m.ffindex"
+
+    # Build _hhm database
+    if not (ffdata_hhm.exists() and ffindex_hhm.exists()):
+        logger.info("Building HH-suite _hhm ffindex DB from %d profiles", len(hhm_paths))
+        hhm_list = sorted(hhm_paths.values())
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", dir=str(db_dir), delete=False,
+        ) as fh:
+            fh.write("\n".join(hhm_list) + "\n")
+            hhm_list_file = fh.name
+        try:
+            run_cmd(
+                [ffindex_build_bin, "-s", "-f", hhm_list_file,
+                 str(ffdata_hhm), str(ffindex_hhm)],
+                logger,
+            )
+        finally:
+            Path(hhm_list_file).unlink(missing_ok=True)
+    else:
+        logger.info("HH-suite _hhm DB already exists at %s, reusing.", str(db_prefix))
+
+    # Build _a3m database
+    if not (ffdata_a3m.exists() and ffindex_a3m.exists()):
+        valid_a3m = {k: v for k, v in a3m_paths.items() if v and Path(v).exists()}
+        if valid_a3m:
+            logger.info("Building HH-suite _a3m ffindex DB from %d MSAs", len(valid_a3m))
+            a3m_list = sorted(valid_a3m.values())
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", dir=str(db_dir), delete=False,
+            ) as fh:
+                fh.write("\n".join(a3m_list) + "\n")
+                a3m_list_file = fh.name
+            try:
+                run_cmd(
+                    [ffindex_build_bin, "-s", "-f", a3m_list_file,
+                     str(ffdata_a3m), str(ffindex_a3m)],
+                    logger,
+                )
+            finally:
+                Path(a3m_list_file).unlink(missing_ok=True)
+        else:
+            # Create empty placeholder files so hhsearch does not fail
+            logger.info("No .a3m files available; creating empty _a3m database placeholders.")
+            ffdata_a3m.write_bytes(b"")
+            ffindex_a3m.write_text("")
+    else:
+        logger.info("HH-suite _a3m DB already exists at %s, reusing.", str(db_prefix))
 
 
 def _filter_raw_to_core_relaxed(raw: pl.DataFrame, hc: dict, out: Path) -> None:
@@ -508,25 +590,25 @@ def hmm_hmm_edges(
         tools = {**db_tools}
 
         # HH-suite 3.x hhsearch expects the profile database files to carry the
-        # "_hhm" suffix: profiles_db_hhm.ffdata / profiles_db_hhm.ffindex.
+        # "_hhm" and "_a3m" suffixes: profiles_db_hhm.ffdata / profiles_db_hhm.ffindex
+        # and profiles_db_a3m.ffdata / profiles_db_a3m.ffindex.
         # Passing -d profiles_db to hhsearch resolves these files automatically.
         db_dir = out / "hhsearch_db"
-        db_dir.mkdir(parents=True, exist_ok=True)
         db_prefix = db_dir / "profiles_db"
-        ffdata = db_dir / "profiles_db_hhm.ffdata"
-        ffindex = db_dir / "profiles_db_hhm.ffindex"
 
-        if not (ffdata.exists() and ffindex.exists()):
-            logger.info("Building HH-suite ffindex DB from %d profiles", len(hhm))
-            file_list_str = "\n".join(sorted(hhm.values())) + "\n"
-            run_cmd(
-                [db_tools["ffindex_build"], "-s", "-f", "/dev/stdin",
-                 str(ffdata), str(ffindex)],
-                logger,
-                stdin=file_list_str,
-            )
-        else:
-            logger.info("HH-suite DB already exists at %s, reusing.", str(db_prefix))
+        # Read a3m (MSA) paths from the profile index for _a3m database.
+        a3m_col = "msa_path" if "msa_path" in idx.columns else None
+        a3m_paths: dict[str, str] = {}
+        if a3m_col:
+            a3m_paths = dict(zip(
+                idx["subfamily_id"].to_list(),
+                idx[a3m_col].to_list(),
+            ))
+
+        _build_hhsuite_db(
+            db_dir, db_prefix, hhm, a3m_paths,
+            db_tools["ffindex_build"], logger,
+        )
 
         query_to_targets: dict[str, set[str]] = defaultdict(set)
         for q, t in pending_cands:
@@ -555,6 +637,9 @@ def hmm_hmm_edges(
                 for hit in hits:
                     t = hit["target_id"]
                     if t == q:
+                        continue
+                    # Ensure target is a known subfamily
+                    if t not in hhm:
                         continue
                     canon = tuple(sorted((q, t)))
                     if canon in processed:
@@ -653,12 +738,12 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
 
     embs = []
     total_batches = (len(seqs) + batch_size - 1) // batch_size
-    logger.info(f"Processing {len(seqs)} sequences in {total_batches} batches of size {batch_size}")
+    logger.info("Processing %d sequences in %d batches of size %d", len(seqs), total_batches, batch_size)
 
     for i in range(0, len(seqs), batch_size):
         batch = seqs[i:i + batch_size]
         batch_num = i // batch_size + 1
-        logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} sequences)")
+        logger.info("Processing batch %d/%d (%d sequences)", batch_num, total_batches, len(batch))
         labels, strs, toks = batch_converter(batch)
         toks = toks.to(device)
         with torch.no_grad():

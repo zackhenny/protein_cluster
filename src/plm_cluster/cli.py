@@ -152,13 +152,22 @@ def main() -> None:
     manifest_tools: dict[str, str] = {}
     try:
         manifest_tools.update(require_executables(["mmseqs"], cfg["tools"]))
-        manifest_tools.update(require_executables(["hhmake", "hhalign"], cfg["tools"]))
+        manifest_tools.update(require_executables(["hhmake"], cfg["tools"]))
+        # Check hhalign or hhsearch+ffindex_build depending on HMM-HMM mode
+        hmm_mode = cfg.get("hmm_hmm", {}).get("mode", "pairwise")
+        if hmm_mode == "db-search":
+            manifest_tools.update(require_executables(["hhsearch", "ffindex_build"], cfg["tools"]))
+        else:
+            manifest_tools.update(require_executables(["hhalign"], cfg["tools"]))
     except Exception as exc:
         logger.info("Runtime tool check deferred: %s", exc)
     else:
         logger.info("mmseqs version: %s", executable_version(manifest_tools["mmseqs"]))
-        logger.info("hhalign version: %s", executable_version(manifest_tools["hhalign"]))
-        logger.info("hhmake version: %s", executable_version(manifest_tools["hhmake"]))
+        if "hhalign" in manifest_tools:
+            logger.info("hhalign version: %s", executable_version(manifest_tools["hhalign"]))
+        if "hhsearch" in manifest_tools:
+            logger.info("hhsearch version: %s", executable_version(manifest_tools["hhsearch"]))
+        logger.info("hhmake version: %s", executable_version(manifest_tools.get("hhmake", "hhmake")))
 
     # For single-step commands also write a log into the step's own output directory
     # so all outputs for a given step are co-located.

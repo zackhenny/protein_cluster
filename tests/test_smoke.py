@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from plm_cluster.config import load_config
 from plm_cluster.pipeline import (
@@ -142,15 +143,21 @@ def _make_db_search_fixtures(tmp_path: Path):
     profile_dir.mkdir(parents=True)
     ids = ["subfam_000000", "subfam_000001"]
     hhm_paths = {}
+    a3m_paths = {}
     for sid in ids:
         p = profile_dir / f"{sid}.hhm"
         p.write_text(f"HHsearch 3.3\nNAME {sid}\nLENG 8\n")
         hhm_paths[sid] = str(p)
+        a = profile_dir / f"{sid}.a3m"
+        a.write_text(f">{sid}\nMKTAYIAK\n")
+        a3m_paths[sid] = str(a)
 
     idx_path = tmp_path / "subfamily_profile_index.tsv"
-    pd.DataFrame({"subfamily_id": ids, "hhm_path": [hhm_paths[s] for s in ids]}).to_csv(
-        idx_path, sep="\t", index=False
-    )
+    pd.DataFrame({
+        "subfamily_id": ids,
+        "hhm_path": [hhm_paths[s] for s in ids],
+        "msa_path": [a3m_paths[s] for s in ids],
+    }).to_csv(idx_path, sep="\t", index=False)
 
     emb_dir = tmp_path / "embeddings"
     emb_dir.mkdir(parents=True)
@@ -176,6 +183,8 @@ def test_hmm_hmm_edges_db_search_mode(tmp_path: Path, monkeypatch):
     profile_index, candidate_edges = _make_db_search_fixtures(tmp_path)
     outdir = str(tmp_path / "out")
 
+    ffindex_calls: list[str] = []
+
     def fake_require(tools, config_paths=None):
         return {t: t for t in tools}
 
@@ -186,6 +195,7 @@ def test_hmm_hmm_edges_db_search_mode(tmp_path: Path, monkeypatch):
             ffindex = next(c for c in cmd if c.endswith(".ffindex"))
             Path(ffdata).write_text("dummy_ffdata")
             Path(ffindex).write_text("dummy_ffindex")
+            ffindex_calls.append(ffdata)
         elif cmd[0] == "hhsearch":
             out_path = Path(cmd[cmd.index("-o") + 1])
             # Write a minimal .hhr output with one hit
@@ -211,6 +221,12 @@ def test_hmm_hmm_edges_db_search_mode(tmp_path: Path, monkeypatch):
     assert (out / "hmm_hmm_edges_core.tsv").exists()
     assert (out / "hmm_hmm_edges_relaxed.tsv").exists()
     assert (out / "hmm_hmm_progress.ndjson").exists()
+
+    # Both _hhm and _a3m databases should have been built
+    assert len(ffindex_calls) == 2, f"Expected 2 ffindex_build calls (_hhm + _a3m), got {len(ffindex_calls)}"
+    suffixes = sorted(Path(p).name for p in ffindex_calls)
+    assert "profiles_db_a3m.ffdata" in suffixes, "Missing _a3m ffindex database"
+    assert "profiles_db_hhm.ffdata" in suffixes, "Missing _hhm ffindex database"
 
     # Verify progress log has valid NDJSON entries
     import json as _json
@@ -414,3 +430,40 @@ def test_resume_skips_completed_steps(tmp_path: Path, monkeypatch):
     (wm_out / "subfamily_x_protein_sparse.tsv").write_text("sentinel_matrix\n")
     write_matrices("smap.tsv", "segs.tsv", str(wm_out), cfg, logger=logger, resume=True)
     assert "sentinel_matrix" in (wm_out / "subfamily_x_protein_sparse.tsv").read_text()
+
+
+def test_parse_hhr_all_hits_strips_path_and_suffix(tmp_path: Path):
+    """_parse_hhr_all_hits correctly strips directory prefix and .hhm suffix from target IDs."""
+    from plm_cluster.pipeline import _parse_hhr_all_hits
+
+    hhr = tmp_path / "test.hhr"
+    # Simulate hhsearch output with a full-path entry name
+    hhr.write_text(
+        "Query some_query\n\n"
+        "No 1\n>/absolute/path/to/subfam_000001.hhm description text\n"
+        "Probab=95.0 E-value=1e-10 Score=150.0 Aligned_cols=8 Identities=70%\n\n"
+        "No 2\n>subfam_000002 plain id\n"
+        "Probab=85.0 E-value=1e-5 Score=100.0 Aligned_cols=6 Identities=60%\n"
+    )
+    hits = _parse_hhr_all_hits(hhr)
+    assert len(hits) == 2
+    assert hits[0]["target_id"] == "subfam_000001"
+    assert hits[1]["target_id"] == "subfam_000002"
+    assert hits[0]["prob"] == 95.0
+    assert hits[1]["aln_len"] == 6
+
+
+def test_config_validates_hmm_mode(tmp_path: Path):
+    """Config validation rejects invalid hmm_hmm.mode values."""
+    cfg_yaml = tmp_path / "bad_mode.yaml"
+    cfg_yaml.write_text("hmm_hmm:\n  mode: invalid-mode\n")
+    with pytest.raises(ValueError, match="hmm_hmm.mode"):
+        load_config(str(cfg_yaml))
+
+
+def test_config_accepts_db_search_mode(tmp_path: Path):
+    """Config validation accepts db-search as a valid hmm_hmm.mode."""
+    cfg_yaml = tmp_path / "db_search.yaml"
+    cfg_yaml.write_text("hmm_hmm:\n  mode: db-search\n")
+    cfg = load_config(str(cfg_yaml))
+    assert cfg["hmm_hmm"]["mode"] == "db-search"
