@@ -39,7 +39,12 @@ Why profiles? Profile-profile comparison is much more sensitive than pairwise se
 
 ## 3) Candidate-gated HMM-HMM edges
 
-Naive all-vs-all profile comparisons are expensive for 10k-40k subfamilies. The pipeline therefore uses candidate pairs (from embedding KNN by default), then runs `hhalign` on those pairs only.
+Naive all-vs-all profile comparisons are expensive for 10k-40k subfamilies. The pipeline therefore uses candidate pairs (from embedding KNN by default), then runs profile-profile alignments on those pairs only.
+
+Two execution modes are available:
+
+- **Pairwise** (`hmm_hmm.mode: pairwise`, default): Runs one `hhalign` invocation per candidate pair using a thread pool.  Simple and robust.
+- **DB-search** (`hmm_hmm.mode: db-search`): Builds an HH-suite ffindex database (both `_hhm` and `_a3m` databases are built for compatibility) from all profiles and runs one `hhsearch` invocation per unique query subfamily.  Faster for dense candidate sets because hhsearch processes all targets in one pass per query.  Requires `hhsearch` and `ffindex_build` to be installed.
 
 Raw edges include alignment statistics (`prob`, `evalue`, `aln_len`, `qcov`, `tcov`).
 

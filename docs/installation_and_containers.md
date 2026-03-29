@@ -7,9 +7,11 @@ This document covers local installation, conda setup, and container builds.
 ### External binaries (required at runtime)
 - `mmseqs`
 - `hhmake`
-- `hhalign` (or `hhsearch` if you adapt the HMM edge stage)
+- `hhalign` (for `pairwise` HMM-HMM mode, the default)
+- `mafft`
 
 ### Optional binaries
+- `hhsearch` and `ffindex_build` (for `db-search` HMM-HMM mode)
 - `mcl` (if you request MCL mode)
 
 ### Python requirements
