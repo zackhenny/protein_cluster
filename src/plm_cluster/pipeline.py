@@ -147,24 +147,29 @@ def _build_hhsuite_db(
     hhm_paths: dict[str, str],
     a3m_paths: dict[str, str],
     ffindex_build_bin: str,
+    cstranslate_bin: str,
     logger,
 ) -> None:
-    """Build HH-suite ffindex databases (``_hhm`` and ``_a3m``) for hhsearch.
+    """Build HH-suite ffindex databases (``_hhm``, ``_a3m``, ``_cs219``) for hhsearch.
 
     HH-suite 3.x ``hhsearch -d <prefix>`` resolves database files as::
 
-        <prefix>_hhm.ffdata  /  <prefix>_hhm.ffindex
-        <prefix>_a3m.ffdata  /  <prefix>_a3m.ffindex
+        <prefix>_hhm.ffdata    /  <prefix>_hhm.ffindex
+        <prefix>_a3m.ffdata    /  <prefix>_a3m.ffindex
+        <prefix>_cs219.ffdata  /  <prefix>_cs219.ffindex
 
-    Both the ``_hhm`` and ``_a3m`` databases must exist for hhsearch to run.
+    All three databases must exist for hhsearch to run without error.
     This helper writes the file lists to temporary files (avoiding platform
-    issues with ``/dev/stdin``) and calls ``ffindex_build`` for each suffix.
+    issues with ``/dev/stdin``) and calls ``ffindex_build`` for ``_hhm`` and
+    ``_a3m``, then ``cstranslate`` to produce the ``_cs219`` database.
     """
     db_dir.mkdir(parents=True, exist_ok=True)
-    ffdata_hhm = db_dir / "profiles_db_hhm.ffdata"
-    ffindex_hhm = db_dir / "profiles_db_hhm.ffindex"
-    ffdata_a3m = db_dir / "profiles_db_a3m.ffdata"
-    ffindex_a3m = db_dir / "profiles_db_a3m.ffindex"
+    ffdata_hhm = Path(str(db_prefix) + "_hhm.ffdata")
+    ffindex_hhm = Path(str(db_prefix) + "_hhm.ffindex")
+    ffdata_a3m = Path(str(db_prefix) + "_a3m.ffdata")
+    ffindex_a3m = Path(str(db_prefix) + "_a3m.ffindex")
+    ffdata_cs219 = Path(str(db_prefix) + "_cs219.ffdata")
+    ffindex_cs219 = Path(str(db_prefix) + "_cs219.ffindex")
 
     # Build _hhm database
     if not (ffdata_hhm.exists() and ffindex_hhm.exists()):
@@ -206,12 +211,26 @@ def _build_hhsuite_db(
             finally:
                 Path(a3m_list_file).unlink(missing_ok=True)
         else:
-            # Create empty placeholder files so hhsearch does not fail
-            logger.info("No .a3m files available; creating empty _a3m database placeholders.")
+            logger.info("No .a3m files available; _a3m database will be empty.")
             ffdata_a3m.write_bytes(b"")
             ffindex_a3m.write_text("")
     else:
         logger.info("HH-suite _a3m DB already exists at %s, reusing.", str(db_prefix))
+
+    # Build _cs219 database from the _a3m database using cstranslate
+    if not (ffdata_cs219.exists() and ffindex_cs219.exists()):
+        logger.info("Building HH-suite _cs219 ffindex DB from _a3m DB at %s", str(db_prefix))
+        run_cmd(
+            [cstranslate_bin,
+             "-i", str(db_prefix) + "_a3m",
+             "-o", str(db_prefix) + "_cs219",
+             "-x", "0.3", "-c", "4",
+             "-I", "a3m",
+             "-b"],
+            logger,
+        )
+    else:
+        logger.info("HH-suite _cs219 DB already exists at %s, reusing.", str(db_prefix))
 
 
 def _filter_raw_to_core_relaxed(raw: pl.DataFrame, hc: dict, out: Path) -> None:
@@ -577,7 +596,7 @@ def hmm_hmm_edges(
     # ------------------------------------------------------------------
     else:
         try:
-            db_tools = require_executables(["hhsearch", "ffindex_build"], config["tools"])
+            db_tools = require_executables(["hhsearch", "ffindex_build", "cstranslate"], config["tools"])
         except RuntimeError as exc:
             logger.warning(
                 "db-search mode requested but tools unavailable (%s); falling back to pairwise hhalign.", exc
@@ -607,7 +626,7 @@ def hmm_hmm_edges(
 
         _build_hhsuite_db(
             db_dir, db_prefix, hhm, a3m_paths,
-            db_tools["ffindex_build"], logger,
+            db_tools["ffindex_build"], db_tools["cstranslate"], logger,
         )
 
         query_to_targets: dict[str, set[str]] = defaultdict(set)
