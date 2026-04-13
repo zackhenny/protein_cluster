@@ -521,7 +521,7 @@ def _run_mmseqs_profile_search(
                         past_header = True
                     elif past_header:
                         # Remove lowercase insertions and gap characters
-                        seq += re.sub(r"[a-z.\-]", "", line)
+                        seq += re.sub(r"[a-z.-]", "", line)
                 if seq:
                     rep_records.append(FastaRecord(subfam, seq))
         if not rep_records:

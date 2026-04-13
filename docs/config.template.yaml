@@ -50,8 +50,6 @@ profiles:
 # Profile-profile alignments detect remote homology between subfamilies.
 # Two edge tiers are produced: strict ("core") and relaxed ("functional").
 hmm_hmm:
-  # Profile-profile alignments detect remote homology between subfamilies.
-  # Two edge tiers are produced: strict ("core") and relaxed ("functional").
   # Three modes are available:
   #   pairwise       – one hhalign per candidate pair (thread-parallel, default)
   #   db-search      – build HH-suite ffindex DB + one parallel hhsearch per query

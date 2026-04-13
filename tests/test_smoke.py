@@ -544,9 +544,9 @@ def test_hmm_hmm_edges_mmseqs_profile_mode(tmp_path: Path, monkeypatch):
         "search must precede convertalis"
 
     # Verify progress log has valid NDJSON entries
-    import json as _json
+    import json
     progress_lines = [
-        _json.loads(l)
+        json.loads(l)
         for l in (out / "hmm_hmm_progress.ndjson").read_text().splitlines()
         if l.strip()
     ]
