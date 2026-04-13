@@ -15,6 +15,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "hhsearch_path": "",
         "hhalign_path": "",
         "ffindex_build_path": "",
+        "cstranslate_path": "",
         "mafft_path": "",
         "mcl_path": "",
     },
@@ -97,7 +98,7 @@ _RANGE_CHECKS: list[tuple[str, str, float, float]] = [
 _VALID_EMBED_DEVICES = {"cpu", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3"}
 _VALID_EDGE_POLICIES = {"strict", "union", "gated", "downweight_embeddings"}
 _VALID_LONG_SEQ_POLICIES = {"truncate", "skip", "full"}
-_VALID_HMM_MODES = {"pairwise", "db-search"}
+_VALID_HMM_MODES = {"pairwise", "db-search", "mmseqs-profile"}
 
 
 def validate_config(cfg: dict[str, Any]) -> list[str]:

@@ -71,8 +71,9 @@ def main() -> None:
     add_common(p)
     p.add_argument("--profile_index", required=True)
     p.add_argument("--candidate_edges", default=None)
-    p.add_argument("--mode", default=None, choices=["pairwise", "db-search"],
-                   help="Execution mode: 'pairwise' (default) or 'db-search' (hhsearch DB search)")
+    p.add_argument("--mode", default=None, choices=["pairwise", "db-search", "mmseqs-profile"],
+                   help="Execution mode: 'pairwise' (default), 'db-search' (hhsearch DB search), "
+                        "or 'mmseqs-profile' (MMseqs2 profile-profile search, fastest for large datasets)")
     p.add_argument("--resume", action="store_true",
                    help="Skip already-completed pairs using the NDJSON progress log")
     p.add_argument("--shard-id", type=int, default=0, dest="shard_id",
@@ -137,7 +138,7 @@ def main() -> None:
     p.add_argument("--resume", action="store_true",
                    help="Resume long-running stages where supported (hmm-hmm-edges)")
     p.add_argument("--hmm-mode", default=None, dest="hmm_mode",
-                   choices=["pairwise", "db-search"],
+                   choices=["pairwise", "db-search", "mmseqs-profile"],
                    help="HMM-HMM execution mode for run-all (overrides config)")
     p.add_argument("--shard-id", type=int, default=0, dest="shard_id",
                    help="Shard index for the HMM-HMM step in run-all")

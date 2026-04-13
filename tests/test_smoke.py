@@ -467,3 +467,149 @@ def test_config_accepts_db_search_mode(tmp_path: Path):
     cfg_yaml.write_text("hmm_hmm:\n  mode: db-search\n")
     cfg = load_config(str(cfg_yaml))
     assert cfg["hmm_hmm"]["mode"] == "db-search"
+
+
+def test_config_accepts_mmseqs_profile_mode(tmp_path: Path):
+    """Config validation accepts mmseqs-profile as a valid hmm_hmm.mode."""
+    cfg_yaml = tmp_path / "mmseqs_profile.yaml"
+    cfg_yaml.write_text("hmm_hmm:\n  mode: mmseqs-profile\n")
+    cfg = load_config(str(cfg_yaml))
+    assert cfg["hmm_hmm"]["mode"] == "mmseqs-profile"
+
+
+def test_hmm_hmm_edges_mmseqs_profile_mode(tmp_path: Path, monkeypatch):
+    """mmseqs-profile mode calls convertmsa/msa2profile/search/convertalis and
+    produces the same output files as pairwise mode."""
+    cfg = load_config(None)
+    profile_index, candidate_edges = _make_db_search_fixtures(tmp_path)
+    outdir = str(tmp_path / "out")
+
+    mmseqs_calls: list[str] = []
+
+    def fake_require(tools, config_paths=None):
+        return {t: t for t in tools}
+
+    def fake_run_mm(cmd, logger, cwd=None, stdin=None):
+        mmseqs_calls.append(cmd[1] if len(cmd) > 1 else cmd[0])
+        if cmd[1] == "convertmsa":
+            # Create the msa_db files that msa2profile expects
+            db = Path(cmd[3])
+            db.parent.mkdir(parents=True, exist_ok=True)
+            db.with_suffix(".lookup").write_text("")
+        elif cmd[1] == "msa2profile":
+            db = Path(cmd[3])
+            db.parent.mkdir(parents=True, exist_ok=True)
+            db.with_suffix(".lookup").write_text("")
+        elif cmd[1] == "search":
+            # Create the result_db file expected by convertalis
+            res = Path(cmd[4])
+            res.parent.mkdir(parents=True, exist_ok=True)
+            res.with_suffix(".index").write_text("")
+        elif cmd[1] == "convertalis":
+            # Write a minimal two-column result: subfam_000000 → subfam_000001
+            out_file = Path(cmd[5])
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.write_text(
+                "subfam_000000\tsubfam_000001\t95.0\t8\t1\t8\t1\t8\t1e-20\t200\t8\t8\n"
+            )
+        return ""
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", fake_require)
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", fake_run_mm)
+
+    class DummyLogger:
+        def info(self, *a, **kw): pass
+        def warning(self, *a, **kw): pass
+        def error(self, *a, **kw): pass
+
+    hmm_hmm_edges(profile_index, outdir, cfg, DummyLogger(), candidate_edges,
+                  mode="mmseqs-profile")
+
+    out = Path(outdir)
+    assert (out / "hmm_hmm_edges_raw.tsv").exists(), "raw TSV must be written"
+    assert (out / "hmm_hmm_edges_core.tsv").exists(), "core TSV must be written"
+    assert (out / "hmm_hmm_edges_relaxed.tsv").exists(), "relaxed TSV must be written"
+    assert (out / "hmm_hmm_progress.ndjson").exists(), "progress log must be written"
+
+    # Verify all four MMseqs2 sub-commands were called in the correct order
+    assert "convertmsa" in mmseqs_calls, "convertmsa must be called"
+    assert "msa2profile" in mmseqs_calls, "msa2profile must be called"
+    assert "search" in mmseqs_calls, "search must be called"
+    assert "convertalis" in mmseqs_calls, "convertalis must be called"
+    assert mmseqs_calls.index("convertmsa") < mmseqs_calls.index("msa2profile"), \
+        "convertmsa must precede msa2profile"
+    assert mmseqs_calls.index("msa2profile") < mmseqs_calls.index("search"), \
+        "msa2profile must precede search"
+    assert mmseqs_calls.index("search") < mmseqs_calls.index("convertalis"), \
+        "search must precede convertalis"
+
+    # Verify progress log has valid NDJSON entries
+    import json as _json
+    progress_lines = [
+        _json.loads(l)
+        for l in (out / "hmm_hmm_progress.ndjson").read_text().splitlines()
+        if l.strip()
+    ]
+    assert all("q" in r and "t" in r and "status" in r for r in progress_lines)
+
+
+def test_db_search_keeps_best_direction(tmp_path: Path, monkeypatch):
+    """db-search mode should keep the best-scoring result when the same pair
+    is found from both A→B and B→A hhsearch directions."""
+    cfg = load_config(None)
+    profile_index, candidate_edges = _make_db_search_fixtures(tmp_path)
+    outdir = str(tmp_path / "out")
+
+    call_count: dict[str, int] = {}
+
+    def fake_require(tools, config_paths=None):
+        return {t: t for t in tools}
+
+    def fake_run_dir(cmd, logger, cwd=None, stdin=None):
+        if cmd[0] == "ffindex_build":
+            ffdata = next(c for c in cmd if c.endswith(".ffdata"))
+            ffindex = next(c for c in cmd if c.endswith(".ffindex"))
+            Path(ffdata).write_text("dummy")
+            Path(ffindex).write_text("dummy")
+        elif cmd[0] == "hhsearch":
+            out_path = Path(cmd[cmd.index("-o") + 1])
+            query_path = cmd[cmd.index("-i") + 1]
+            if "subfam_000000" in query_path:
+                # A→B direction: lower probability
+                other = "subfam_000001"
+                out_path.write_text(
+                    f"No 1\n>{other} description\n"
+                    f"Probab=85.0 E-value=1e-10 Score=150.0 Aligned_cols=8 Identities=70%\n"
+                )
+                call_count["subfam_000000"] = call_count.get("subfam_000000", 0) + 1
+            else:
+                # B→A direction: higher probability — should win
+                other = "subfam_000000"
+                out_path.write_text(
+                    f"No 1\n>{other} description\n"
+                    f"Probab=98.0 E-value=1e-20 Score=200.0 Aligned_cols=8 Identities=75%\n"
+                )
+                call_count["subfam_000001"] = call_count.get("subfam_000001", 0) + 1
+        return ""
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", fake_require)
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", fake_run_dir)
+
+    class DummyLogger:
+        def info(self, *a, **kw): pass
+        def warning(self, *a, **kw): pass
+        def error(self, *a, **kw): pass
+
+    hmm_hmm_edges(profile_index, outdir, cfg, DummyLogger(), candidate_edges, mode="db-search")
+
+    out = Path(outdir)
+    assert (out / "hmm_hmm_edges_raw.tsv").exists()
+
+    import polars as _pl
+    raw = _pl.read_csv(out / "hmm_hmm_edges_raw.tsv", separator="\t", null_values=["NA"])
+    # Only one canonical pair (subfam_000000, subfam_000001) should exist
+    assert len(raw) == 1, f"Expected 1 raw edge, got {len(raw)}"
+    # The best result (prob=98.0 from B→A) should be kept
+    assert raw["prob"][0] == pytest.approx(98.0), \
+        f"Expected best prob=98.0 from reverse direction, got {raw['prob'][0]}"
+
