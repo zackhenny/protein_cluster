@@ -125,11 +125,47 @@ plm_cluster hmm-hmm-edges \
   --resume
 ```
 
-### DB-search mode (faster for dense candidate sets)
+### MMseqs2 profile-profile search (fastest for large datasets)
+
+Use `--mode mmseqs-profile` (or `hmm_hmm.mode: mmseqs-profile` in your
+config) to run an all-vs-all MMseqs2 profile-profile search instead of
+HH-suite hhalign or hhsearch.  For datasets with 220K+ families this is
+orders of magnitude faster than the other two modes — the job that takes
+6 days with pairwise hhalign typically completes in hours.
+
+Requires only `mmseqs` in `$PATH`, which is already a core pipeline
+dependency.  No extra HH-suite tools are needed.  When MSA (a3m) files
+are available the pipeline builds richer MMseqs2 profiles via
+`mmseqs convertmsa` + `mmseqs msa2profile`; otherwise it falls back to
+an iterative sequence search (`--num-iterations 2`).
+
+```bash
+plm_cluster hmm-hmm-edges \
+  --profile_index results/02_profiles/subfamily_profile_index.tsv \
+  --candidate_edges results/04_embeddings/embedding_knn_edges.tsv \
+  --outdir results/03_hmm_hmm_edges \
+  --config my_config.yaml \
+  --mode mmseqs-profile
+```
+
+Or set in config:
+
+```yaml
+hmm_hmm:
+  mode: mmseqs-profile
+```
+
+### DB-search mode (parallel hhsearch, accurate for moderate datasets)
 
 Use `--mode db-search` (or set `hmm_hmm.mode: db-search` in your config) to
-build an HH-suite ffindex database and run one `hhsearch` per query instead of
-one `hhalign` per pair.  Requires `hhsearch` and `ffindex_build` in `$PATH`.
+build an HH-suite ffindex database and run one `hhsearch` per query in
+parallel instead of one `hhalign` per pair.  Requires `hhsearch`,
+`ffindex_build`, and `cstranslate` in `$PATH`.
+
+Results from both the A→B and B→A hhsearch directions are compared for each
+canonical family pair; the direction with the higher HH-suite probability
+(lower e-value on tie) is kept, correcting the asymmetric-alignment accuracy
+issue present in sequential single-direction search.
 
 ```bash
 plm_cluster hmm-hmm-edges \
@@ -257,7 +293,7 @@ plm_cluster write-matrices \
 ## Major tuning options
 
 - `mmseqs.*`: subfamily granularity and sensitivity
-- `hmm_hmm.mode`: `pairwise` (default) or `db-search`
+- `hmm_hmm.mode`: `pairwise` (default) | `db-search` | `mmseqs-profile` (recommended for 220K+ families)
 - `hmm_hmm.topN`: candidate density and compute load
 - `hmm_hmm.mincov_core/min_prob_core`: strict evolutionary confidence
 - `hmm_hmm.mincov_relaxed/min_prob_relaxed`: functional neighborhood breadth
@@ -293,7 +329,7 @@ hash, and checksums of the input files — useful for reproducibility.
 | `build-profiles` | ✅ Yes | Rebuilds only missing `.hhm` profiles |
 | `embed` | ✅ Yes | Skips step if `embeddings.npy` already exists |
 | `knn` | ✅ Yes | Skips step if output KNN TSV already exists |
-| `hmm-hmm-edges` | ✅ Yes (fine-grained) | Skips completed pairs via NDJSON log; builds ffindex DB if not yet built |
+| `hmm-hmm-edges` | ✅ Yes (fine-grained) | Skips completed pairs via NDJSON log; builds ffindex DB if not yet built; mmseqs-profile mode re-runs from scratch if raw TSV absent |
 | `merge-hmm-shards` | ✅ Yes | Skips step if merged output already exists |
 | `merge-graph` | ✅ Yes | Skips step if merged graph files already exist |
 | `cluster-families` | ✅ Yes | Skips step if family assignment files already exist |

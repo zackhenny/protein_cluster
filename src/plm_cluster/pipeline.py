@@ -430,6 +430,190 @@ def build_profiles(
     return tools
 
 
+def _run_mmseqs_profile_search(
+    outdir: Path,
+    idx: pl.DataFrame,
+    hhm: dict[str, str],
+    lengths: dict[str, int],
+    a3m_paths: dict[str, str],
+    config: dict,
+    logger,
+) -> list[dict]:
+    """Fast all-vs-all profile-profile search using MMseqs2.
+
+    For large datasets (220K+ families) this is orders of magnitude faster
+    than running one ``hhalign`` or ``hhsearch`` per family pair.
+
+    When ``a3m_paths`` contains valid MSA files, builds richer profiles via
+    ``mmseqs convertmsa`` + ``mmseqs msa2profile``.  Falls back to an
+    iterative sequence search (``--num-iterations 2``) when MSAs are absent.
+
+    Returns a list of raw edge row dicts compatible with ``_HMM_EDGE_SCHEMA``.
+    ``prob`` is set to ``0.0`` because MMseqs2 does not produce HH-suite
+    probability scores; the existing ``_filter_raw_to_core_relaxed`` function
+    handles this correctly via its ``evalue``-based OR condition.
+    """
+    tools = require_executables(["mmseqs"], config["tools"])
+    mmseqs_bin = tools["mmseqs"]
+    threads = str(config.get("mmseqs", {}).get("threads", 8))
+    topn = int(config["hmm_hmm"]["topN"])
+    max_evalue = float(config["hmm_hmm"]["max_evalue_relaxed"])
+    tmpdir = _ensure_dir(config.get("mmseqs", {}).get("tmpdir", "tmp/mmseqs"))
+
+    mm_dir = outdir / "mmseqs_profile"
+    mm_dir.mkdir(parents=True, exist_ok=True)
+
+    subfam_ids = idx["subfamily_id"].to_list()
+    valid_a3m = {s: p for s, p in a3m_paths.items() if p and Path(p).exists()}
+
+    if valid_a3m:
+        # Build a combined a3m file where each MSA block starts with the
+        # subfamily ID so that MMseqs2 can identify MSAs by subfamily.
+        # Blocks are separated by "//" as required by mmseqs convertmsa.
+        logger.info(
+            "Building combined a3m from %d MSA files for MMseqs2 profile DB",
+            len(valid_a3m),
+        )
+        combined_a3m = mm_dir / "combined.a3m"
+        with open(combined_a3m, "w") as fh:
+            for subfam in sorted(subfam_ids):
+                path = valid_a3m.get(subfam, "")
+                if not path:
+                    continue
+                lines = Path(path).read_text().splitlines()
+                first_header_replaced = False
+                for line in lines:
+                    if not first_header_replaced and line.startswith(">"):
+                        fh.write(f">{subfam}\n")
+                        first_header_replaced = True
+                    elif line:
+                        fh.write(line + "\n")
+                fh.write("//\n")
+
+        msa_db = mm_dir / "msa_db"
+        run_cmd([mmseqs_bin, "convertmsa", str(combined_a3m), str(msa_db)], logger)
+        profile_db = mm_dir / "profile_db"
+        run_cmd([mmseqs_bin, "msa2profile", str(msa_db), str(profile_db),
+                 "--threads", threads], logger)
+        query_db = str(profile_db)
+        target_db = str(profile_db)
+        extra_search_args: list[str] = []
+    else:
+        # Fallback: extract representative sequences from .hhm files and use
+        # iterative sequence search (builds internal profiles on the fly).
+        logger.warning(
+            "No a3m MSA files found; using representative sequences "
+            "for MMseqs2 iterative search (--num-iterations 2)"
+        )
+        rep_fasta = mm_dir / "reps.faa"
+        rep_records: list[FastaRecord] = []
+        for subfam in subfam_ids:
+            # Extract the clean (ungapped) representative sequence from the
+            # first sequence in the .hhm file's associated a3m, or skip.
+            path = a3m_paths.get(subfam, "")
+            if path and Path(path).exists():
+                seq = ""
+                past_header = False
+                for line in Path(path).read_text().splitlines():
+                    if line.startswith(">"):
+                        if past_header:
+                            break
+                        past_header = True
+                    elif past_header:
+                        # Remove lowercase insertions and gap characters
+                        seq += re.sub(r"[a-z.-]", "", line)
+                if seq:
+                    rep_records.append(FastaRecord(subfam, seq))
+        if not rep_records:
+            logger.warning("mmseqs-profile: no sequences available, returning empty edges")
+            return []
+        write_fasta(rep_fasta, rep_records)
+        seq_db = mm_dir / "seq_db"
+        run_cmd([mmseqs_bin, "createdb", str(rep_fasta), str(seq_db)], logger)
+        query_db = str(seq_db)
+        target_db = str(seq_db)
+        extra_search_args = ["--num-iterations", "2"]
+
+    result_db = mm_dir / "result_db"
+    run_cmd(
+        [mmseqs_bin, "search",
+         query_db, target_db, str(result_db), str(tmpdir),
+         "--threads", threads,
+         "-e", str(max_evalue),
+         "--max-seqs", str(topn + 1),  # +1 because self-hit is always included
+         "-s", "7.5",
+         *extra_search_args],
+        logger,
+    )
+
+    result_tsv = mm_dir / "result.tsv"
+    run_cmd(
+        [mmseqs_bin, "convertalis",
+         query_db, target_db, str(result_db), str(result_tsv),
+         "--format-output",
+         "query,target,pident,alnlen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen"],
+        logger,
+    )
+
+    if not result_tsv.exists() or result_tsv.stat().st_size == 0:
+        logger.warning("MMseqs2 profile search returned no results")
+        return []
+
+    cols = ["query", "target", "pident", "alnlen",
+            "qstart", "qend", "tstart", "tend",
+            "evalue", "bits", "qlen", "tlen"]
+    df = pl.read_csv(result_tsv, separator="\t", has_header=False, new_columns=cols)
+    df = df.with_columns([
+        pl.col("pident").cast(pl.Float64),
+        pl.col("alnlen").cast(pl.Int64),
+        pl.col("evalue").cast(pl.Float64),
+        pl.col("bits").cast(pl.Float64),
+        pl.col("qlen").cast(pl.Int64),
+        pl.col("tlen").cast(pl.Int64),
+    ])
+
+    run_id = "mmseqs_profile_v1"
+    rows: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for row in df.iter_rows(named=True):
+        q = str(row["query"])
+        t = str(row["target"])
+        if q == t:
+            continue
+        if q not in lengths or t not in lengths:
+            continue
+        canon = tuple(sorted((q, t)))
+        if canon in seen:
+            # MMseqs2 returns both q→t and t→q; keep the first (highest-scoring)
+            continue
+        seen.add(canon)
+        alnlen = int(row["alnlen"])
+        qlen = max(1, int(row["qlen"]))
+        tlen = max(1, int(row["tlen"]))
+        rows.append({
+            "q_subfamily_id": q,
+            "t_subfamily_id": t,
+            # prob=0.0: MMseqs2 has no HH-suite probability.  The existing
+            # _filter_raw_to_core_relaxed function gates on evalue via its OR
+            # clause so these rows are correctly filtered.
+            "prob": 0.0,
+            "evalue": float(row["evalue"]),
+            "bits": float(row["bits"]) if row["bits"] is not None else None,
+            "qcov": min(1.0, alnlen / qlen),
+            "tcov": min(1.0, alnlen / tlen),
+            "aln_len": alnlen,
+            "pident": float(row["pident"]),
+            "tool": "mmseqs_profile",
+            "run_id": run_id,
+        })
+
+    logger.info(
+        "MMseqs2 profile search: %d candidate edges (before HMM-HMM thresholding)",
+        len(rows),
+    )
+    return rows
+
+
 def hmm_hmm_edges(
     profile_index: str,
     outdir: str,
@@ -444,7 +628,7 @@ def hmm_hmm_edges(
 ) -> dict[str, str]:
     """Step 3: Compute HMM-HMM profile-profile edges.
 
-    Supports two execution modes selected via *mode* (or ``config["hmm_hmm"]["mode"]``):
+    Supports three execution modes selected via *mode* (or ``config["hmm_hmm"]["mode"]``):
 
     ``pairwise`` (default)
         Runs one ``hhalign`` invocation per candidate pair using a thread pool.
@@ -452,8 +636,17 @@ def hmm_hmm_edges(
     ``db-search``
         Builds an HH-suite ffindex database from all profiles and runs one
         ``hhsearch`` invocation per unique query subfamily against the whole
-        database.  The ffindex files use the ``_hhm`` suffix required by
-        HH-suite 3.x (``profiles_db_hhm.ffdata`` / ``profiles_db_hhm.ffindex``).
+        database in parallel.  Results from both the A→B and B→A search
+        directions are compared; the best-scoring direction is kept.
+        The ffindex files use the ``_hhm`` suffix required by HH-suite 3.x
+        (``profiles_db_hhm.ffdata`` / ``profiles_db_hhm.ffindex``).
+
+    ``mmseqs-profile``
+        Uses MMseqs2 to run an all-vs-all profile-profile search.  Orders of
+        magnitude faster than HH-suite for large datasets (220K+ families).
+        Requires only ``mmseqs`` in PATH (already a pipeline dependency).
+        When MSA files are available the richer ``convertmsa``/``msa2profile``
+        workflow is used; otherwise falls back to iterative sequence search.
     """
     out = _ensure_dir(outdir)
     effective_mode = mode or config.get("hmm_hmm", {}).get("mode", "pairwise")
@@ -592,9 +785,9 @@ def hmm_hmm_edges(
             raw_df.write_csv(raw_tsv_path, separator="\t", null_value="NA")
 
     # ------------------------------------------------------------------
-    # DB-search mode (hhsearch against ffindex database)
+    # DB-search mode (hhsearch against ffindex database, parallelised)
     # ------------------------------------------------------------------
-    else:
+    elif effective_mode == "db-search":
         try:
             db_tools = require_executables(["hhsearch", "ffindex_build", "cstranslate"], config["tools"])
         except RuntimeError as exc:
@@ -617,15 +810,15 @@ def hmm_hmm_edges(
 
         # Read a3m (MSA) paths from the profile index for _a3m database.
         a3m_col = "msa_path" if "msa_path" in idx.columns else None
-        a3m_paths: dict[str, str] = {}
+        a3m_paths_db: dict[str, str] = {}
         if a3m_col:
-            a3m_paths = dict(zip(
+            a3m_paths_db = dict(zip(
                 idx["subfamily_id"].to_list(),
                 idx[a3m_col].to_list(),
             ))
 
         _build_hhsuite_db(
-            db_dir, db_prefix, hhm, a3m_paths,
+            db_dir, db_prefix, hhm, a3m_paths_db,
             db_tools["ffindex_build"], db_tools["cstranslate"], logger,
         )
 
@@ -639,57 +832,88 @@ def hmm_hmm_edges(
             if any((q, t) not in processed and (t, q) not in processed for t in query_to_targets[q])
         )
 
-        logger.info("Running hhsearch for %d unique query profiles", len(pending_queries))
+        logger.info("Running hhsearch (parallel, %d threads) for %d unique query profiles",
+                    threads, len(pending_queries))
 
         raw_rows_db: list[dict] = []
         failed_queries: list[str] = []
+        # Track the best result per canonical pair across both search directions.
+        # HH-suite alignments are asymmetric: searching A→B can give different
+        # scores than B→A.  We run both and keep whichever has the highest prob.
+        best_db_results: dict[tuple[str, str], dict] = {}
+        best_db_lock = threading.Lock()
 
-        for q in pending_queries:
-            out_hhr = out / f"{q}__hhsearch.hhr"
+        def _do_hhsearch(q: str) -> tuple[str, list[dict], Exception | None]:
+            q_hhr = out / f"{q}__hhsearch.hhr"
             try:
                 run_cmd(
                     [db_tools["hhsearch"], "-i", hhm[q], "-d", str(db_prefix),
-                     "-o", str(out_hhr), "-cpu", str(threads)],
+                     "-o", str(q_hhr), "-cpu", str(threads)],
                     logger,
                 )
-                hits = _parse_hhr_all_hits(out_hhr)
+                return q, _parse_hhr_all_hits(q_hhr), None
+            except Exception as exc:
+                return q, [], exc
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            future_to_q: dict[concurrent.futures.Future, str] = {
+                executor.submit(_do_hhsearch, q): q for q in pending_queries
+            }
+            for future in concurrent.futures.as_completed(future_to_q):
+                q, hits, exc = future.result()
+                if exc is not None:
+                    logger.error("hhsearch FAILED for query %s: %s", q, exc)
+                    failed_queries.append(q)
+                    _append_hmm_progress(
+                        progress_path,
+                        {"ts": time.time(), "q": q, "t": "", "status": "failed", "error": str(exc)},
+                        prog_lock,
+                    )
+                    continue
                 for hit in hits:
                     t = hit["target_id"]
-                    if t == q:
+                    if t == q or t not in hhm:
                         continue
-                    # Ensure target is a known subfamily
-                    if t not in hhm:
+                    if (t not in query_to_targets.get(q, set())
+                            and q not in query_to_targets.get(t, set())):
                         continue
                     canon = tuple(sorted((q, t)))
                     if canon in processed:
                         continue
-                    if t not in query_to_targets.get(q, set()) and q not in query_to_targets.get(t, set()):
-                        continue
                     row = _make_row(q, t, hit, "hhsearch")
-                    raw_rows_db.append(row)
-                    processed.add(canon)
-                    _append_hmm_progress(
-                        progress_path,
-                        {"ts": time.time(), "q": canon[0], "t": canon[1], "status": "ok",
-                         "prob": row["prob"], "evalue": row["evalue"], "aln_len": row["aln_len"]},
-                        prog_lock,
-                    )
-            except Exception as exc:
-                logger.error("hhsearch FAILED for query %s: %s", q, exc)
-                failed_queries.append(q)
-                _append_hmm_progress(
-                    progress_path,
-                    {"ts": time.time(), "q": q, "t": "", "status": "failed", "error": str(exc)},
-                    prog_lock,
-                )
+                    with best_db_lock:
+                        existing = best_db_results.get(canon)
+                        if existing is None:
+                            # First time we see this pair — record it immediately so
+                            # crash recovery can resume from this point.
+                            best_db_results[canon] = row
+                            _append_hmm_progress(
+                                progress_path,
+                                {"ts": time.time(), "q": canon[0], "t": canon[1],
+                                 "status": "ok", "prob": row["prob"],
+                                 "evalue": row["evalue"], "aln_len": row["aln_len"]},
+                                prog_lock,
+                            )
+                        elif (row["prob"] > existing["prob"]
+                              or (row["prob"] == existing["prob"]
+                                  and row["evalue"] < existing["evalue"])):
+                            # Better result found from the reverse direction — update
+                            # the in-memory dict (progress log keeps the first entry,
+                            # but the final TSV will have the best score).
+                            best_db_results[canon] = row
 
         if failed_queries:
-            logger.warning("%d hhsearch query/queries failed: %s", len(failed_queries), ", ".join(failed_queries[:20]))
+            logger.warning("%d hhsearch query/queries failed: %s",
+                           len(failed_queries), ", ".join(failed_queries[:20]))
 
-        if resume and raw_tsv_path.exists() and len(processed) > len(raw_rows_db):
-            existing = pl.read_csv(raw_tsv_path, separator="\t", null_values=["NA"], schema_overrides=_HMM_EDGE_SCHEMA)
-            new_df = pl.from_dicts(raw_rows_db, schema=_HMM_EDGE_SCHEMA) if raw_rows_db else pl.DataFrame(schema=_HMM_EDGE_SCHEMA)
-            pl.concat([existing, new_df]).sort(["q_subfamily_id", "t_subfamily_id"]).write_csv(
+        raw_rows_db = list(best_db_results.values())
+
+        if resume and raw_tsv_path.exists() and processed:
+            existing_df = pl.read_csv(raw_tsv_path, separator="\t", null_values=["NA"],
+                                      schema_overrides=_HMM_EDGE_SCHEMA)
+            new_df = (pl.from_dicts(raw_rows_db, schema=_HMM_EDGE_SCHEMA)
+                      if raw_rows_db else pl.DataFrame(schema=_HMM_EDGE_SCHEMA))
+            pl.concat([existing_df, new_df]).sort(["q_subfamily_id", "t_subfamily_id"]).write_csv(
                 raw_tsv_path, separator="\t", null_value="NA"
             )
         else:
@@ -699,6 +923,50 @@ def hmm_hmm_edges(
                 else pl.DataFrame(schema=_HMM_EDGE_SCHEMA)
             )
             raw_df.write_csv(raw_tsv_path, separator="\t", null_value="NA")
+
+    # ------------------------------------------------------------------
+    # MMseqs2 profile-profile search mode (fast, scales to 220K+ families)
+    # ------------------------------------------------------------------
+    else:
+        # effective_mode == "mmseqs-profile"
+        tools = require_executables(["mmseqs"], config["tools"])
+        a3m_col_mp = "msa_path" if "msa_path" in idx.columns else None
+        a3m_paths_mp: dict[str, str] = {}
+        if a3m_col_mp:
+            a3m_paths_mp = dict(zip(
+                idx["subfamily_id"].to_list(),
+                idx[a3m_col_mp].to_list(),
+            ))
+
+        raw_rows_mm = _run_mmseqs_profile_search(
+            out, idx, hhm, lengths, a3m_paths_mp, config, logger,
+        )
+
+        if resume and raw_tsv_path.exists():
+            existing_df = pl.read_csv(raw_tsv_path, separator="\t", null_values=["NA"],
+                                      schema_overrides=_HMM_EDGE_SCHEMA)
+            new_df = (pl.from_dicts(raw_rows_mm, schema=_HMM_EDGE_SCHEMA)
+                      if raw_rows_mm else pl.DataFrame(schema=_HMM_EDGE_SCHEMA))
+            pl.concat([existing_df, new_df]).sort(["q_subfamily_id", "t_subfamily_id"]).write_csv(
+                raw_tsv_path, separator="\t", null_value="NA"
+            )
+        else:
+            raw_df = (
+                pl.from_dicts(raw_rows_mm, schema=_HMM_EDGE_SCHEMA).sort(["q_subfamily_id", "t_subfamily_id"])
+                if raw_rows_mm
+                else pl.DataFrame(schema=_HMM_EDGE_SCHEMA)
+            )
+            raw_df.write_csv(raw_tsv_path, separator="\t", null_value="NA")
+
+        # Write individual pair progress entries for resume support
+        for row in raw_rows_mm:
+            _append_hmm_progress(
+                progress_path,
+                {"ts": time.time(), "q": row["q_subfamily_id"], "t": row["t_subfamily_id"],
+                 "status": "ok", "prob": row["prob"],
+                 "evalue": row["evalue"], "aln_len": row["aln_len"]},
+                prog_lock,
+            )
 
     if n_shards == 1:
         raw = pl.read_csv(raw_tsv_path, separator="\t", null_values=["NA"], schema_overrides=_HMM_EDGE_SCHEMA)

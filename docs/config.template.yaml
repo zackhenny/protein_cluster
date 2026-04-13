@@ -18,6 +18,7 @@ tools:
   hhsearch_path: ""               # Path to hhsearch (HH-suite, for db-search mode)
   hhalign_path: ""                # Path to hhalign (HH-suite, for pairwise mode)
   ffindex_build_path: ""          # Path to ffindex_build (HH-suite, for db-search mode)
+  cstranslate_path: ""            # Path to cstranslate (HH-suite, for db-search mode)
   mafft_path: ""                  # Path to mafft aligner
   mcl_path: ""                    # Path to mcl (only if --method mcl)
 
@@ -49,8 +50,12 @@ profiles:
 # Profile-profile alignments detect remote homology between subfamilies.
 # Two edge tiers are produced: strict ("core") and relaxed ("functional").
 hmm_hmm:
-  mode: pairwise                  # "pairwise" (hhalign per pair, default) or
-                                  # "db-search" (build ffindex DB + hhsearch per query)
+  # Three modes are available:
+  #   pairwise       – one hhalign per candidate pair (thread-parallel, default)
+  #   db-search      – build HH-suite ffindex DB + one parallel hhsearch per query
+  #   mmseqs-profile – MMseqs2 profile-profile all-vs-all; fastest for large
+  #                    datasets (220K+ families), requires only mmseqs in PATH.
+  mode: pairwise                  # "pairwise" | "db-search" | "mmseqs-profile"
   topN: 200                       # Max candidate neighbors per subfamily from KNN
   # --- Core (strict) edge thresholds ---
   mincov_core: 0.70               # Min bidirectional alignment coverage [0-1]
