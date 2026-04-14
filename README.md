@@ -10,8 +10,8 @@ families.
 ```
 Input proteins  ──►  MMseqs2 subfamilies  ──►  HMM profiles  ──►  HMM-HMM edges
                                                      │
-                               ESM-2 embeddings  ──►  KNN candidates  ──►  Graph merge
-                                                                              │
+                               ESM-2 embeddings  ──►  KNN / rKCNN candidates  ──►  Graph merge
+                                                                                      │
                                                               Leiden clustering ──►  Family assignments
                                                                                          │
                                                                     Fusion-safe mapping ──►  Matrices & QC
@@ -24,7 +24,7 @@ Input proteins  ──►  MMseqs2 subfamilies  ──►  HMM profiles  ──�
 | 1 | MMseqs2 | Cluster proteins into subfamilies by sequence identity |
 | 2 | MAFFT + HH-suite | Build MSAs and profile HMMs per subfamily |
 | 3 | ESM-2 (PyTorch) | Generate mean-pooled embeddings for subfamily reps |
-| 4 | FAISS / sklearn | Find K-nearest embedding neighbors as candidate pairs |
+| 4 | FAISS / sklearn | Find K-nearest embedding neighbors (KNN or rKCNN mode) |
 | 5 | hhalign / hhsearch | Profile-profile alignments on candidate pairs → edge sets |
 | 6 | Leiden | Cluster strict and functional family graphs |
 | 7 | MMseqs2 | Map full-length proteins to families (fusion-aware segments) |
@@ -78,6 +78,7 @@ Key tuning knobs:
 |-----------|--------|
 | `mmseqs.min_seq_id` | Subfamily granularity |
 | `hmm_hmm.mode` | `pairwise` (hhalign per pair) or `db-search` (hhsearch against ffindex DB) |
+| `knn.mode` | `knn` (cosine KNN) or `rkcnn` (Random K-Conditional Nearest Neighbor) |
 | `hmm_hmm.min_prob_core` | Strict family sensitivity |
 | `graph.leiden_resolution_*` | Family size (lower → larger families) |
 | `embed.device` | CPU or GPU for embeddings |
@@ -245,6 +246,7 @@ results/
 | Document | Contents |
 |----------|----------|
 | [Algorithm background](docs/algorithm_background.md) | Scientific rationale and method details |
+| [rKCNN implementation plan](docs/rkcnn_implementation_plan.md) | rKCNN integration design and data flow |
 | [CLI workflow](docs/cli_workflow_and_options.md) | Step-by-step and `run-all` usage |
 | [Config reference](docs/config.template.yaml) | All parameters with inline comments |
 | [Output schemas](docs/output_schemas.md) | File formats and column descriptions |

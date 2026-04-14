@@ -70,6 +70,31 @@ Embeddings are computed on subfamily representatives (not all proteins) for scal
 
 These vectors supply high-recall candidate neighbors and optional functional graph edges.
 
+## 4b) rKCNN candidate generation (optional)
+
+When `knn.mode: rkcnn` is set, the pipeline uses **Random K-Conditional Nearest Neighbor (rKCNN)** instead of standard cosine KNN for candidate generation.
+
+**Why rKCNN for protein embeddings?**
+
+ESM-2 embeddings are high-dimensional (1280-D for the 650M parameter model). Standard KNN with cosine similarity treats all dimensions equally, but many dimensions may carry noise that degrades neighbor quality — especially for remote homologs. rKCNN addresses this through:
+
+1. **Random subspace sampling**: Multiple random subsets of embedding dimensions are drawn (e.g., 50 subspaces of 640 dimensions each)
+2. **Conditional kNN per subspace**: A k-nearest-neighbor classifier is trained on each subspace using MMseqs2 subfamily IDs as class labels
+3. **Separation scoring**: Each subspace is scored by its between-class / within-class variance ratio — subspaces where classes are well-separated get higher weight
+4. **Weighted ensemble**: Predictions from high-quality subspaces are aggregated by weighted probability averaging
+
+**Key properties:**
+- Operates on full-dimensional ESM-2 embeddings without PCA or dimensionality reduction
+- Embeddings are L2-normalized before fitting
+- MMseqs2 subfamily IDs (from Step 1) serve as ground-truth class labels
+- Output format is identical to standard KNN, so downstream steps are unaffected
+
+**Cascading strategy for scalability:**
+
+With tens of thousands of subfamilies, computing conditional neighbors against all classes is expensive. The "cascading" approach (configured via `knn.rkcnn_cascade_topn`) uses fast FAISS vector search to first retrieve the top-N closest subfamily centroids for each query, then runs rKCNN only over those N candidate classes. This reduces the computational bottleneck from O(all_classes) to O(N) per query.
+
+**Reference:** [PeerJ Computer Science (2025) — Random k Conditional Nearest Neighbor](https://peerj.com/articles/cs-2497/)
+
 ## 5) Graph merge and clustering
 
 Two graph modes are produced:

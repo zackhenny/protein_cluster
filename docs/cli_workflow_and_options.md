@@ -64,11 +64,23 @@ plm_cluster embed \
   --config my_config.yaml \
   --resume
 
+# Standard KNN mode (default)
 plm_cluster knn \
   --embeddings results/04_embeddings/embeddings.npy \
   --ids results/04_embeddings/ids.txt \
   --lengths results/04_embeddings/lengths.tsv \
   --out_tsv results/04_embeddings/embedding_knn_edges.tsv \
+  --config my_config.yaml
+
+# rKCNN mode — supervised ensemble using MMseqs2 subfamily labels
+# Requires --subfamily_map to provide class labels for each embedding
+plm_cluster knn \
+  --embeddings results/04_embeddings/embeddings.npy \
+  --ids results/04_embeddings/ids.txt \
+  --lengths results/04_embeddings/lengths.tsv \
+  --subfamily_map results/01_mmseqs/subfamily_map.tsv \
+  --out_tsv results/04_embeddings/embedding_knn_edges.tsv \
+  --mode rkcnn \
   --config my_config.yaml
 
 # Resume: skips the step if the output TSV already exists
@@ -80,6 +92,24 @@ plm_cluster knn \
   --config my_config.yaml \
   --resume
 ```
+
+### rKCNN mode details
+
+rKCNN (Random K-Conditional Nearest Neighbor) uses random feature subspaces
+and MMseqs2 subfamily labels to find discriminative neighbors in
+high-dimensional ESM-2 embedding space.  Key config parameters:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `knn.mode` | `knn` | `"knn"` or `"rkcnn"` |
+| `knn.rkcnn_n_subspaces` | 50 | Random feature subspaces to sample |
+| `knn.rkcnn_subspace_fraction` | 0.5 | Fraction of dimensions per subspace |
+| `knn.rkcnn_n_neighbors` | 5 | k for inner kCNN classifiers |
+| `knn.rkcnn_cascade_topn` | 500 | FAISS pre-filter (0 = use all classes) |
+| `knn.rkcnn_weighting` | `separation` | `"separation"` or `"uniform"` |
+
+The cascading strategy (`rkcnn_cascade_topn > 0`) is recommended for datasets
+with more than 10,000 subfamilies to avoid computational bottlenecks.
 
 ## 4. Candidate-gated HMM-HMM edges
 ```bash
@@ -300,6 +330,8 @@ plm_cluster write-matrices \
 - `graph.edge_weight_policy`: strict/union/gated/downweight_embeddings
 - `graph.leiden_resolution_strict` and `graph.leiden_resolution_functional`
 - `knn.k` and `knn.min_cosine`
+- `knn.mode`: `knn` (default) | `rkcnn` (Random K-Conditional Nearest Neighbor)
+- `knn.rkcnn_cascade_topn`: FAISS pre-filter for rKCNN scalability
 - `outputs.write_dense_threshold`
 
 ## Backward-compatible command aliases
