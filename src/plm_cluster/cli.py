@@ -64,6 +64,10 @@ def main() -> None:
     p.add_argument("--ids", required=True)
     p.add_argument("--lengths", required=True)
     p.add_argument("--out_tsv", default="results/04_embeddings/embedding_knn_edges.tsv")
+    p.add_argument("--subfamily_map", default=None,
+                   help="Path to subfamily_map.tsv (required when knn.mode=rkcnn)")
+    p.add_argument("--mode", default=None, choices=["knn", "rkcnn"],
+                   help="Candidate generation mode: 'knn' (default) or 'rkcnn'")
     p.add_argument("--resume", action="store_true",
                    help="Skip this step if the output TSV already exists")
 
@@ -187,7 +191,11 @@ def main() -> None:
     elif cmd == "embed":
         embed(args.reps_fasta, args.outdir, cfg, args.weights_path, logger, resume=args.resume)
     elif cmd == "knn":
-        knn(args.embeddings, args.ids, args.lengths, args.out_tsv, cfg, logger=logger, resume=args.resume)
+        # Override knn.mode from CLI if provided
+        if getattr(args, "mode", None):
+            cfg["knn"]["mode"] = args.mode
+        knn(args.embeddings, args.ids, args.lengths, args.out_tsv, cfg, logger=logger,
+            resume=args.resume, subfamily_map=getattr(args, "subfamily_map", None))
     elif cmd == "hmm-hmm-edges":
         manifest_tools.update(hmm_hmm_edges(
             args.profile_index, args.outdir, cfg, logger, args.candidate_edges,
@@ -275,7 +283,8 @@ def main() -> None:
             str(root / "04_embeddings/embedding_knn_edges.tsv"),
             cfg,
             step_log_dir=root / "04_embeddings", step_log_name="knn",
-            logger=logger, resume=resume)
+            logger=logger, resume=resume,
+            subfamily_map=str(root / "01_mmseqs/subfamily_map.tsv"))
 
         _timed_step("Step 5/9: Computing HMM-HMM edges",
             hmm_hmm_edges, str(root / "02_profiles/subfamily_profile_index.tsv"),
