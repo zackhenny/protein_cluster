@@ -56,11 +56,38 @@ embed:
   device: cpu
 
 knn:
-  # Step 5 — K-nearest neighbor edges from embeddings
+  # Step 5 — Candidate neighbor generation from embeddings
+  # mode: "knn"    — Standard FAISS/sklearn cosine KNN (default, fast)
+  #        "rkcnn" — Random K-Conditional Nearest Neighbor (supervised ensemble;
+  #                  uses MMseqs2 subfamily labels + random subspaces to find
+  #                  discriminative neighbors in high-dimensional embedding space).
+  #                  See docs/rkcnn_implementation_plan.md for algorithm details.
+  #                  Paper: https://peerj.com/articles/cs-2497/
+  mode: knn
   k: 100
   min_cosine: 0.35
   min_len_ratio: 0.5
   max_len_ratio: 2.0
+  # --- GPU acceleration ---
+  # Set device to "cuda" to use FAISS-GPU for the KNN index and (when mode=rkcnn)
+  # for the cascading pre-filter and rKCNN distance computations.
+  # Requires the faiss-gpu package (pip install faiss-gpu, or conda install
+  # faiss-gpu from conda-forge).  Falls back to CPU FAISS / sklearn if
+  # faiss-gpu is not installed or device is "cpu".
+  device: cpu                    # "cpu" | "cuda" | "cuda:0" etc.
+  # --- rKCNN-specific parameters (only used when mode: rkcnn) ---
+  # rKCNN operates on full-dimensional ESM-2 embeddings (no PCA/dimensionality
+  # reduction) and uses random feature subspaces to defeat the curse of
+  # dimensionality.  Embeddings are L2-normalized before fitting.
+  rkcnn_n_subspaces: 50        # Number of random feature subspaces to sample
+  rkcnn_subspace_fraction: 0.5 # Fraction of embedding dimensions per subspace (0.01–1.0)
+  rkcnn_n_neighbors: 5         # k for the inner kCNN classifiers in each subspace
+  rkcnn_score_threshold: 0.0   # Min separation score to retain a subspace (0 = keep all)
+  rkcnn_weighting: separation  # Subspace aggregation: "separation" (weighted by score) | "uniform"
+  rkcnn_cascade_topn: 500      # FAISS pre-filter: retrieve top-N candidate classes per query
+                                # before running rKCNN.  Set to 0 to disable cascading and use
+                                # all classes (accurate but slow for >10K subfamilies).
+  rkcnn_random_state: 42       # Random seed for reproducible subspace sampling
 
 graph:
   # Step 6 — Graph merge and Leiden clustering. Policy: strict|union|gated|downweight_embeddings
