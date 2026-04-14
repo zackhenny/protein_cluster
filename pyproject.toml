@@ -22,6 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 embed = ["torch>=2.1", "fair-esm>=2.0"]
 faiss = ["faiss-cpu>=1.7"]
+faiss-gpu = ["faiss-gpu>=1.7"]
 test = ["pytest>=7.4", "pandas>=2.0"]
 
 [project.scripts]

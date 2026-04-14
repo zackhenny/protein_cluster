@@ -21,6 +21,26 @@ This document covers local installation, conda setup, and container builds.
 - scikit-learn (FAISS optional)
 - python-igraph + leidenalg
 
+### GPU support
+
+Two pipeline stages benefit from GPU acceleration:
+
+1. **Embedding** (`plm_cluster embed`): Set `embed.device: cuda` in your config.
+   Requires PyTorch with CUDA support (installed via conda's `pytorch` channel or
+   `pip install torch` with the appropriate CUDA index).
+
+2. **KNN / rKCNN** (`plm_cluster knn`): Set `knn.device: cuda` in your config.
+   Requires the `faiss-gpu` package:
+   ```bash
+   # conda (recommended for HPC)
+   conda install -c conda-forge faiss-gpu
+   # pip
+   pip install faiss-gpu
+   ```
+   If `faiss-gpu` is not available, the pipeline falls back to CPU FAISS or sklearn.
+   When `knn.mode: rkcnn`, PyTorch CUDA is also used for batch distance
+   computations in random subspaces.
+
 ## Conda installation
 
 ```bash

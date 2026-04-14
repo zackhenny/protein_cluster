@@ -111,6 +111,25 @@ high-dimensional ESM-2 embedding space.  Key config parameters:
 The cascading strategy (`rkcnn_cascade_topn > 0`) is recommended for datasets
 with more than 10,000 subfamilies to avoid computational bottlenecks.
 
+### GPU acceleration for KNN / rKCNN
+
+Set `knn.device: cuda` in your config to use FAISS-GPU for the neighbor
+search index.  This accelerates both standard KNN and the rKCNN cascading
+pre-filter.  Requires the `faiss-gpu` package.
+
+```yaml
+# GPU-accelerated config for both embedding and KNN
+embed:
+  device: cuda          # ESM-2 forward pass on GPU
+knn:
+  device: cuda          # FAISS-GPU for neighbor search
+  mode: rkcnn           # or "knn" for standard KNN
+```
+
+The pipeline auto-detects whether `faiss-gpu` is available.  If `knn.device`
+is set to `"cuda"` but `faiss-gpu` is not installed, it falls back to CPU
+FAISS or sklearn with a warning.
+
 ## 4. Candidate-gated HMM-HMM edges
 ```bash
 plm_cluster hmm-hmm-edges \

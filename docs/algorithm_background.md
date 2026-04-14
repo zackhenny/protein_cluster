@@ -67,6 +67,7 @@ Embeddings are computed on subfamily representatives (not all proteins) for scal
 - pooling: residue mean pooling
 - long sequences: configurable policy (truncate by default)
 - offline: explicit local weights path required
+- **GPU acceleration**: Set `embed.device: cuda` to run the ESM-2 forward pass on GPU, which provides a significant speedup for large datasets (thousands of subfamily representatives)
 
 These vectors supply high-recall candidate neighbors and optional functional graph edges.
 
@@ -94,6 +95,24 @@ ESM-2 embeddings are high-dimensional (1280-D for the 650M parameter model). Sta
 With tens of thousands of subfamilies, computing conditional neighbors against all classes is expensive. The "cascading" approach (configured via `knn.rkcnn_cascade_topn`) uses fast FAISS vector search to first retrieve the top-N closest subfamily centroids for each query, then runs rKCNN only over those N candidate classes. This reduces the computational bottleneck from O(all_classes) to O(N) per query.
 
 **Reference:** [PeerJ Computer Science (2025) — Random k Conditional Nearest Neighbor](https://peerj.com/articles/cs-2497/)
+
+### GPU acceleration for KNN / rKCNN
+
+Both the standard KNN and rKCNN modes support GPU acceleration via `knn.device: cuda`:
+
+| Component | CPU path | GPU path |
+|-----------|----------|----------|
+| KNN index (standard mode) | `faiss.IndexFlatIP` (CPU) or `sklearn.NearestNeighbors` | `faiss.GpuIndexFlatIP` — all-pairs inner product on GPU |
+| Cascading FAISS pre-filter (rKCNN) | `faiss.IndexFlatIP` (CPU) | `faiss.GpuIndexFlatIP` — top-N centroid retrieval on GPU |
+| rKCNN subspace distance computation | `sklearn.KNeighborsClassifier` (CPU) | PyTorch `torch.cdist` on GPU tensors for batch pairwise distances |
+| rKCNN separation scoring | numpy (CPU) | PyTorch variance ops on GPU tensors |
+
+**When to use GPU for KNN/rKCNN:**
+- Datasets with >5,000 subfamily representatives benefit significantly from GPU FAISS
+- The cascading FAISS pre-filter in rKCNN mode is particularly GPU-friendly (batch inner product)
+- For the rKCNN subspace fitting, GPU acceleration is most beneficial when `rkcnn_n_subspaces` is large (≥50) and there are many candidate classes
+
+**Requirements:** Install `faiss-gpu` instead of (or alongside) `faiss-cpu`. PyTorch with CUDA support is also needed for rKCNN GPU distance computations (this is the same PyTorch required for ESM-2 embeddings).
 
 ## 5) Graph merge and clustering
 

@@ -48,7 +48,9 @@ plm_cluster run-all \
 
 > **CPU or GPU?**  Set `embed.device` in your config to `"cpu"` or `"cuda"`.
 > CPU is the default and works everywhere; GPU accelerates embedding on large
-> datasets.
+> datasets.  For the KNN/rKCNN step, set `knn.device: "cuda"` to use
+> FAISS-GPU for neighbor search (requires `faiss-gpu`; see
+> [Installation](docs/installation_and_containers.md)).
 
 ## Key concepts
 
@@ -82,6 +84,7 @@ Key tuning knobs:
 | `hmm_hmm.min_prob_core` | Strict family sensitivity |
 | `graph.leiden_resolution_*` | Family size (lower → larger families) |
 | `embed.device` | CPU or GPU for embeddings |
+| `knn.device` | CPU or GPU for KNN/rKCNN neighbor search (requires faiss-gpu) |
 | `mapping.min_prob` / `min_segment_len` | Filter noisy/short hits |
 
 See [`docs/config.template.yaml`](docs/config.template.yaml) for the full list.
@@ -223,7 +226,7 @@ detailed resume and sharding guidance.
 - numpy, scipy, pandas, scikit-learn
 - python-igraph + leidenalg (for Leiden clustering)
 - matplotlib (for QC plots, optional)
-- FAISS (optional, falls back to sklearn)
+- FAISS (optional, falls back to sklearn; install `faiss-gpu` for GPU KNN)
 
 ## Output layout
 
