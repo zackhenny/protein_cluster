@@ -273,7 +273,13 @@ def _build_faiss_index(X_f32: np.ndarray, device: str = "cpu"):
     if device.startswith("cuda"):
         gpu_id = 0
         if ":" in device:
-            gpu_id = int(device.split(":")[1])
+            try:
+                gpu_id = int(device.split(":")[1])
+            except (ValueError, IndexError):
+                raise ValueError(
+                    f"Invalid CUDA device specification: '{device}'. "
+                    "Expected format: 'cuda' or 'cuda:N' where N is an integer."
+                )
         try:
             res = faiss.StandardGpuResources()
             index_cpu = faiss.IndexFlatIP(dim)
@@ -381,15 +387,16 @@ def rkcnn_candidate_edges(
             X_cand = X[cand_idx_arr]
             y_cand = labels[cand_idx_arr]
 
-            # Need at least 2 unique classes for meaningful rKCNN
+            # Need at least 2 unique classes and 2 candidates for rKCNN
             unique_classes = np.unique(y_cand)
-            if len(unique_classes) < 2:
-                # Fall back to cosine similarity ordering
-                for j_idx in cand_idx:
+            if len(unique_classes) < 2 or len(cand_idx) < 2:
+                # Fall back to cosine similarity ordering (vectorized)
+                cosines = X[i] @ X[cand_idx_arr].T
+                for idx_pos, j_idx in enumerate(cand_idx):
                     t = ids[j_idx]
                     if t == q:
                         continue
-                    cosine = float(np.dot(X[i], X[j_idx]))
+                    cosine = float(cosines[idx_pos])
                     qlen = int(lens.get(q, 0))
                     tlen = int(lens.get(t, 0))
                     ratio = qlen / max(1, tlen)

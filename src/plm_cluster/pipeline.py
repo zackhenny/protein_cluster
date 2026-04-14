@@ -1102,8 +1102,13 @@ def knn(
     if mode == "rkcnn":
         from .rkcnn import rkcnn_candidate_edges
 
-        # Build integer labels from subfamily IDs — each embedding IS a
-        # subfamily representative, so its own ID is its label.
+        # Build integer labels from subfamily IDs.  Each embedding row is a
+        # subfamily representative — its own ID becomes its class label.
+        # In this "one-sample-per-class" regime rKCNN still works: it finds
+        # which *other* subfamilies are most similar by evaluating conditional
+        # proximity across random subspaces.  The separation score measures
+        # how well each subspace distinguishes the overall class structure,
+        # not individual classes.
         id_to_int = {sid: i for i, sid in enumerate(sorted(set(ids)))}
         labels = np.array([id_to_int[sid] for sid in ids])
 

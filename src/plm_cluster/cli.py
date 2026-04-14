@@ -65,7 +65,8 @@ def main() -> None:
     p.add_argument("--lengths", required=True)
     p.add_argument("--out_tsv", default="results/04_embeddings/embedding_knn_edges.tsv")
     p.add_argument("--subfamily_map", default=None,
-                   help="Path to subfamily_map.tsv (required when knn.mode=rkcnn)")
+                   help="Path to subfamily_map.tsv (optional; reserved for future "
+                        "multi-member class labels in rkcnn mode)")
     p.add_argument("--mode", default=None, choices=["knn", "rkcnn"],
                    help="Candidate generation mode: 'knn' (default) or 'rkcnn'")
     p.add_argument("--resume", action="store_true",
