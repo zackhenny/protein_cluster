@@ -1064,7 +1064,8 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
 
 def knn(
     embeddings_npy: str, ids_txt: str, lengths_tsv: str, out_tsv: str,
-    config: dict, logger=None, resume: bool = False
+    config: dict, logger=None, resume: bool = False,
+    subfamily_map: str | None = None,
 ) -> None:
     """Step 5: Find K-nearest neighbors in embedding space."""
     if resume and Path(out_tsv).exists():
@@ -1076,34 +1077,73 @@ def knn(
     _lens_df = pl.read_csv(lengths_tsv, separator="\t")
     lens = dict(zip(_lens_df["subfamily_id"].to_list(), _lens_df["rep_length_aa"].to_list()))
     X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
-    k = max(1, min(int(config["knn"]["k"]), len(ids) - 1))
 
-    try:
-        import faiss  # type: ignore
-        index = faiss.IndexFlatIP(X.shape[1])
-        index.add(X.astype(np.float32))
-        sims, nbrs = index.search(X.astype(np.float32), k + 1)
-    except Exception:
-        from sklearn.neighbors import NearestNeighbors
-        nn = NearestNeighbors(n_neighbors=k + 1, metric="cosine")
-        nn.fit(X)
-        d, nbrs = nn.kneighbors(X)
-        sims = 1.0 - d
+    mode = str(config["knn"].get("mode", "knn"))
+    device = str(config["knn"].get("device", "cpu"))
 
-    rows = []
-    for i, q in enumerate(ids):
-        for j, nidx in enumerate(nbrs[i][1:]):
-            t = ids[nidx]
-            cosine = float(sims[i][j + 1])
-            qlen = int(lens[q])
-            tlen = int(lens[t])
-            ratio = qlen / max(1, tlen)
-            pass_lr = int(float(config["knn"]["min_len_ratio"]) <= ratio <= float(config["knn"]["max_len_ratio"]))
-            if cosine >= float(config["knn"]["min_cosine"]) and pass_lr:
-                rows.append({
-                    "q_subfamily_id": q, "t_subfamily_id": t, "cosine": cosine,
-                    "q_len": qlen, "t_len": tlen, "len_ratio": ratio, "pass_len_ratio": pass_lr,
-                })
+    if logger:
+        _has_faiss_gpu = False
+        _has_torch_cuda = False
+        try:
+            import faiss  # type: ignore
+            _has_faiss_gpu = hasattr(faiss, "StandardGpuResources")
+        except Exception:
+            pass
+        try:
+            import torch
+            _has_torch_cuda = torch.cuda.is_available()
+        except Exception:
+            pass
+        logger.info("KNN mode: %s, device: %s (FAISS-GPU: %s, PyTorch CUDA: %s)",
+                     mode, device,
+                     "available" if _has_faiss_gpu else "not available",
+                     "available" if _has_torch_cuda else "not available")
+
+    if mode == "rkcnn":
+        from .rkcnn import rkcnn_candidate_edges
+
+        # Build integer labels from subfamily IDs.  Each embedding row is a
+        # subfamily representative — its own ID becomes its class label.
+        # In this "one-sample-per-class" regime rKCNN still works: it finds
+        # which *other* subfamilies are most similar by evaluating conditional
+        # proximity across random subspaces.  The separation score measures
+        # how well each subspace distinguishes the overall class structure,
+        # not individual classes.
+        id_to_int = {sid: i for i, sid in enumerate(sorted(set(ids)))}
+        labels = np.array([id_to_int[sid] for sid in ids])
+
+        rows = rkcnn_candidate_edges(X, ids, lens, labels, config, logger_=logger)
+    else:
+        # Standard KNN mode
+        k = max(1, min(int(config["knn"]["k"]), len(ids) - 1))
+        try:
+            from .rkcnn import _build_faiss_index
+            index = _build_faiss_index(X.astype(np.float32), device)
+            sims, nbrs = index.search(X.astype(np.float32), k + 1)
+        except Exception:
+            if device.startswith("cuda") and logger:
+                logger.warning("FAISS-GPU not available; falling back to CPU.")
+            from sklearn.neighbors import NearestNeighbors
+            nn = NearestNeighbors(n_neighbors=k + 1, metric="cosine")
+            nn.fit(X)
+            d, nbrs = nn.kneighbors(X)
+            sims = 1.0 - d
+
+        rows = []
+        for i, q in enumerate(ids):
+            for j, nidx in enumerate(nbrs[i][1:]):
+                t = ids[nidx]
+                cosine = float(sims[i][j + 1])
+                qlen = int(lens[q])
+                tlen = int(lens[t])
+                ratio = qlen / max(1, tlen)
+                pass_lr = int(float(config["knn"]["min_len_ratio"]) <= ratio <= float(config["knn"]["max_len_ratio"]))
+                if cosine >= float(config["knn"]["min_cosine"]) and pass_lr:
+                    rows.append({
+                        "q_subfamily_id": q, "t_subfamily_id": t, "cosine": cosine,
+                        "q_len": qlen, "t_len": tlen, "len_ratio": ratio, "pass_len_ratio": pass_lr,
+                    })
+
     Path(out_tsv).parent.mkdir(parents=True, exist_ok=True)
     if rows:
         pl.from_dicts(rows).sort(["q_subfamily_id", "t_subfamily_id"]).write_csv(out_tsv, separator="\t")
