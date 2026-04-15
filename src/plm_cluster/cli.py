@@ -235,7 +235,8 @@ def main() -> None:
         write_matrices(args.subfamily_map, args.protein_family_segments, args.outdir, cfg,
                        logger=logger, resume=args.resume)
     elif cmd == "qc-plots":
-        generate_qc_plots(args.results_root, logger)
+        add_step_log_handler(logger, Path(args.results_root) / "qc_plots", cmd)
+        generate_qc_plots(args.results_root, logger, resume=args.resume)
     elif cmd == "run-all":
         import time as _time
         root = Path(args.results_root)
@@ -346,7 +347,9 @@ def main() -> None:
         )
 
         _timed_step("Step 9/9: Generating QC plots",
-            generate_qc_plots, args.results_root, logger)
+            generate_qc_plots, args.results_root, logger,
+            step_log_dir=root / "qc_plots", step_log_name="qc-plots",
+            resume=resume)
 
         logger.info("Pipeline completed successfully")
 

@@ -131,7 +131,7 @@ def plot_fusion_fraction(results_root: str, ax: Any) -> None:
 # Summary dashboard
 # ---------------------------------------------------------------------------
 
-def generate_qc_plots(results_root: str, logger=None) -> Path | None:
+def generate_qc_plots(results_root: str, logger=None, resume: bool = False) -> Path | None:
     """Generate a multi-panel QC summary figure.
 
     Parameters
@@ -140,12 +140,21 @@ def generate_qc_plots(results_root: str, logger=None) -> Path | None:
         Path to the pipeline results directory (e.g. ``results/``).
     logger : logging.Logger, optional
         Logger for status messages.
+    resume : bool, optional
+        If True and the summary figure already exists, skip generation.
 
     Returns
     -------
     Path or None
         Path to the saved summary figure, or None if matplotlib is unavailable.
     """
+    out = Path(results_root) / "qc_plots"
+    summary_path = out / "pipeline_summary.png"
+    if resume and summary_path.exists():
+        if logger:
+            logger.info("Resume: QC plots already exist at %s, skipping.", str(out))
+        return summary_path
+
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -155,7 +164,6 @@ def generate_qc_plots(results_root: str, logger=None) -> Path | None:
             logger.warning("matplotlib not installed — skipping QC plots")
         return None
 
-    out = Path(results_root) / "qc_plots"
     out.mkdir(parents=True, exist_ok=True)
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
@@ -169,7 +177,6 @@ def generate_qc_plots(results_root: str, logger=None) -> Path | None:
     plot_fusion_fraction(results_root, axes[1, 2])
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    summary_path = out / "pipeline_summary.png"
     fig.savefig(summary_path, dpi=150)
     plt.close(fig)
 
