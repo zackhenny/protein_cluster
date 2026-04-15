@@ -2,11 +2,12 @@ import logging
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from plm_cluster.config import load_config
-from plm_cluster.pipeline import _build_hhsuite_db, merge_graph, write_matrices
+from plm_cluster.pipeline import _build_hhsuite_db, embed, merge_graph, write_matrices
 
 
 def test_load_config_rejects_json(tmp_path: Path):
@@ -174,3 +175,143 @@ def test_build_hhsuite_db_skips_existing_cs219(tmp_path: Path):
 
     # No commands should have been run because all files already exist
     assert commands_run == []
+
+
+# ---------------------------------------------------------------------------
+# embed() edge-case tests (no real ESM/torch required — calls are mocked)
+# ---------------------------------------------------------------------------
+
+def _make_fake_esm_torch(embed_dim: int = 4):
+    """Return fake (esm, torch) module objects suitable for sys.modules injection."""
+    import types
+    import unittest.mock as um
+
+    # ---- torch ----
+    torch_mod = types.ModuleType("torch")
+
+    class _FakeDevice:
+        def __init__(self, s):
+            self.type = s.split(":")[0]
+        def __str__(self):
+            return self.type
+
+    class _NoGrad:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    torch_mod.device = _FakeDevice
+    torch_mod.no_grad = lambda: _NoGrad()
+    torch_mod.load = um.MagicMock(return_value={})
+    torch_mod.cuda = types.SimpleNamespace(is_available=lambda: False, empty_cache=lambda: None)
+
+    class _FakeTensor:
+        def __init__(self, arr):
+            self._d = np.asarray(arr, dtype=np.float32)
+            self.shape = self._d.shape
+        def to(self, device): return self
+        def __getitem__(self, idx): return _FakeTensor(self._d[idx])
+        def mean(self, dim): return _FakeTensor(self._d.mean(axis=dim))
+        def cpu(self): return self
+        def numpy(self): return self._d
+
+    class _FakeModel:
+        num_layers = 1
+        def eval(self): return self
+        def to(self, device): return self
+        def __call__(self, toks, repr_layers, return_contacts):
+            batch_sz = toks.shape[0]
+            return {"representations": {1: _FakeTensor(
+                np.random.rand(batch_sz, 20, embed_dim).astype(np.float32)
+            )}}
+
+    class _FakeAlphabet:
+        def get_batch_converter(self):
+            def _conv(batch):
+                labels = [b[0] for b in batch]
+                strs_ = [b[1] for b in batch]
+                max_l = max(len(s) for s in strs_) if strs_ else 0
+                toks = _FakeTensor(np.zeros((len(batch), max_l + 2)))
+                return labels, strs_, toks
+            return _conv
+
+    # ---- esm ----
+    esm_mod = types.ModuleType("esm")
+    esm_mod.pretrained = types.SimpleNamespace(
+        load_model_and_alphabet_local=lambda p: (_FakeModel(), _FakeAlphabet())
+    )
+
+    # functools.partial(torch_mod.load, weights_only=False) must be callable
+    torch_mod.load = um.MagicMock(return_value={})
+
+    return esm_mod, torch_mod
+
+
+def _run_embed(tmp_path, fasta_text, cfg_overrides=None, weights="fake.pt"):
+    """Write fasta to tmp_path, run embed() with mocked ESM/torch."""
+    import sys, unittest.mock as um
+
+    fasta = tmp_path / "reps.faa"
+    fasta.write_text(fasta_text)
+    weights_file = tmp_path / weights
+    weights_file.write_text("dummy")
+
+    cfg = load_config(None)
+    if cfg_overrides:
+        for section, key, val in cfg_overrides:
+            cfg[section][key] = val
+
+    esm_mod, torch_mod = _make_fake_esm_torch()
+    log = logging.getLogger("test_embed")
+
+    with um.patch.dict(sys.modules, {"esm": esm_mod, "torch": torch_mod}):
+        embed(str(fasta), str(tmp_path / "out"), cfg, str(weights_file), log)
+
+    return tmp_path / "out"
+
+
+def test_embed_skips_empty_sequences(tmp_path: Path):
+    """Sequences that become empty after stripping stop codons are skipped."""
+    fasta_text = ">empty_seq\n*\n>normal_seq\nMKTAYIAK\n"
+    out = _run_embed(tmp_path, fasta_text)
+
+    ids = [x for x in (out / "ids.txt").read_text().splitlines() if x]
+    assert "normal_seq" in ids
+    assert "empty_seq" not in ids
+    mat = np.load(out / "embeddings.npy")
+    assert mat.shape[0] == 1
+
+
+def test_embed_skip_policy_excludes_long_seqs(tmp_path: Path):
+    """long_seq_policy='skip' must exclude sequences longer than max_len."""
+    short = "MKTAYIAK"    # 8 AA
+    long_seq = "A" * 20  # 20 AA > max_len=10
+    fasta_text = f">short_seq\n{short}\n>long_seq\n{long_seq}\n"
+
+    out = _run_embed(
+        tmp_path, fasta_text,
+        cfg_overrides=[("embed", "long_seq_policy", "skip"), ("embed", "max_len", 10)],
+    )
+
+    ids = [x for x in (out / "ids.txt").read_text().splitlines() if x]
+    assert "short_seq" in ids
+    assert "long_seq" not in ids
+    mat = np.load(out / "embeddings.npy")
+    assert mat.shape[0] == 1
+
+
+def test_embed_empty_fasta_raises(tmp_path: Path):
+    """embed() must raise RuntimeError when the FASTA has no embeddable sequences."""
+    import sys, unittest.mock as um
+    fasta_text = ">only_stop\n*\n"
+    fasta = tmp_path / "reps.faa"
+    fasta.write_text(fasta_text)
+    weights_file = tmp_path / "fake.pt"
+    weights_file.write_text("dummy")
+
+    cfg = load_config(None)
+    log = logging.getLogger("test_embed")
+    esm_mod, torch_mod = _make_fake_esm_torch()
+
+    with um.patch.dict(sys.modules, {"esm": esm_mod, "torch": torch_mod}):
+        with pytest.raises(RuntimeError, match="No sequences remain to embed"):
+            embed(str(fasta), str(tmp_path / "out"), cfg, str(weights_file), log)
