@@ -1015,13 +1015,30 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
     policy = config["embed"]["long_seq_policy"]
     batch_size = int(config["embed"]["batch_size"])
     seqs = []
-    lengths = []
+    embedded_recs = []
+    n_skipped_long = 0
+    n_skipped_empty = 0
     for r in recs:
-        lengths.append(len(r.seq))
-        seq = r.seq
-        if len(seq) > max_len and policy == "truncate":
-            seq = seq[:max_len]
+        if len(r.seq) == 0:
+            logger.warning("Skipping %s: sequence is empty after stripping stop codons.", r.id)
+            n_skipped_empty += 1
+            continue
+        if len(r.seq) > max_len and policy == "skip":
+            n_skipped_long += 1
+            continue
+        seq = r.seq[:max_len] if len(r.seq) > max_len and policy == "truncate" else r.seq
         seqs.append((r.id, seq))
+        embedded_recs.append(r)
+
+    if n_skipped_long:
+        logger.warning("Skipped %d sequences longer than max_len=%d (long_seq_policy='skip').",
+                       n_skipped_long, max_len)
+    if not seqs:
+        raise RuntimeError(
+            f"No sequences remain to embed after filtering "
+            f"(total={len(recs)}, skipped_empty={n_skipped_empty}, skipped_long={n_skipped_long}). "
+            "Check your FASTA file and long_seq_policy / max_len settings."
+        )
 
     embs = []
     total_batches = (len(seqs) + batch_size - 1) // batch_size
@@ -1045,10 +1062,11 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
 
     mat = np.vstack(embs).astype(np.float32)
     np.save(out / "embeddings.npy", mat)
-    (out / "ids.txt").write_text("\n".join([r.id for r in recs]) + "\n")
-    pl.DataFrame({"subfamily_id": [r.id for r in recs], "rep_length_aa": lengths}).write_csv(
-        out / "lengths.tsv", separator="\t"
-    )
+    (out / "ids.txt").write_text("\n".join([r.id for r in embedded_recs]) + "\n")
+    pl.DataFrame({
+        "subfamily_id": [r.id for r in embedded_recs],
+        "rep_length_aa": [len(r.seq) for r in embedded_recs],
+    }).write_csv(out / "lengths.tsv", separator="\t")
     (out / "metadata.json").write_text(
         json.dumps({
             "model_name": config["embed"]["esm_model_name"],
@@ -1056,7 +1074,7 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
             "pooling": config["embed"]["pooling"],
             "long_seq_policy": policy,
             "max_len": max_len,
-            "n_subfamilies": len(recs),
+            "n_subfamilies": len(embedded_recs),
             "dim": int(mat.shape[1]),
         }, indent=2)
     )
