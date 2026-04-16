@@ -181,14 +181,13 @@ _VALID_OF_SUBCLUSTER_MODES = {"linclust", "cluster", "auto"}
 
 
 def validate_config(cfg: dict[str, Any]) -> list[str]:
-    """Return a list of human-readable validation errors (empty = OK)."""
-    errors: list[str] = []
+    """Return a list of human-readable validation errors (empty = OK).
 
-    # Backward-compat: accept legacy mapping.min_prob but normalise it so that
-    # range checks below operate on min_pident.
-    mapping_sec = cfg.get("mapping", {})
-    if "min_prob" in mapping_sec and "min_pident" not in mapping_sec:
-        cfg.setdefault("mapping", {})["min_pident"] = mapping_sec["min_prob"]
+    Note: ``mapping.min_prob`` → ``mapping.min_pident`` normalization is
+    performed by :func:`load_config` before this function is called.  This
+    function only validates values that are already in their canonical form.
+    """
+    errors: list[str] = []
 
     for section, key, lo, hi in _RANGE_CHECKS:
         val = cfg.get(section, {}).get(key)

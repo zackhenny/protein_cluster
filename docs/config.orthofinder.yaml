@@ -45,14 +45,13 @@ tools:
 #   subfamily_id → strict_family_id   via  06_family_clustering/subfamily_to_family_strict.tsv
 #   subfamily_id → functional_family  via  06_family_clustering/subfamily_to_family_functional.tsv
 #
-# Recommended SQL join skeleton:
-#   SELECT p.protein_id, sf.subfamily_id, og.og_id,
+# Recommended SQL join skeleton (using SQLite / DuckDB syntax):
+#   SELECT sm.protein_id, sm.subfamily_id, og.og_id,
 #          sf_s.family_id AS strict_family, sf_f.family_id AS functional_family
-#   FROM   subfamily_map          sf
-#   JOIN   og_subfamily_map       og  USING (subfamily_id)
-#   LEFT JOIN subfamily_to_family_strict     sf_s USING (subfamily_id)
+#   FROM   subfamily_map                   sm
+#   JOIN   og_subfamily_map                og   USING (subfamily_id)
+#   LEFT JOIN subfamily_to_family_strict   sf_s USING (subfamily_id)
 #   LEFT JOIN subfamily_to_family_functional sf_f USING (subfamily_id)
-#   WHERE  sf.protein_id = p.protein_id
 orthofinder:
   # subcluster_mode controls which MMseqs2 algorithm runs within each HOG/OG.
   #

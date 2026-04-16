@@ -349,7 +349,7 @@ def _write_faa_file(path: Path, entries: dict[str, str]) -> None:
             fh.write(f">{pid}\n{seq}\n")
 
 
-def _make_fake_run_record(og_dir_path, recorded_cmds):
+def _make_fake_run_record(_og_dir_path, recorded_cmds):
     """Return a fake run_cmd that records all commands issued."""
     def fake_run(cmd, logger, cwd=None):
         recorded_cmds.append(list(cmd))
