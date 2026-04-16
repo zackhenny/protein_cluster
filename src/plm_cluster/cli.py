@@ -180,16 +180,26 @@ def main() -> None:
     cfg = load_config(args.config)
     logger = setup_logging(Path(args.results_root) / "logs", cmd)
 
+    # Determine effective HMM mode BEFORE tool preflight checks so that
+    # mmseqs-profile mode is not incorrectly required to have hhalign, and
+    # db-search mode correctly requires hhsearch+ffindex_build+cstranslate.
+    _cli_hmm_mode = getattr(args, "hmm_mode", None)
+    effective_hmm_mode = _cli_hmm_mode or cfg.get("hmm_hmm", {}).get("mode", "pairwise")
+    # Propagate CLI override into the config so downstream pipeline steps see it.
+    if _cli_hmm_mode:
+        cfg["hmm_hmm"]["mode"] = _cli_hmm_mode
+
     manifest_tools: dict[str, str] = {}
     try:
         manifest_tools.update(require_executables(["mmseqs"], cfg["tools"]))
         manifest_tools.update(require_executables(["hhmake"], cfg["tools"]))
-        # Check hhalign or hhsearch+ffindex_build depending on HMM-HMM mode
-        hmm_mode = cfg.get("hmm_hmm", {}).get("mode", "pairwise")
-        if hmm_mode == "db-search":
-            manifest_tools.update(require_executables(["hhsearch", "ffindex_build"], cfg["tools"]))
-        else:
+        # Check tools required by the *effective* HMM mode.
+        # mmseqs-profile only needs mmseqs (already checked above).
+        if effective_hmm_mode == "db-search":
+            manifest_tools.update(require_executables(["hhsearch", "ffindex_build", "cstranslate"], cfg["tools"]))
+        elif effective_hmm_mode == "pairwise":
             manifest_tools.update(require_executables(["hhalign"], cfg["tools"]))
+        # mmseqs-profile: no additional tool requirement beyond mmseqs
     except Exception as exc:
         logger.info("Runtime tool check deferred: %s", exc)
     else:

@@ -79,15 +79,23 @@ Key tuning knobs:
 | Parameter | Effect |
 |-----------|--------|
 | `mmseqs.min_seq_id` | Subfamily granularity |
-| `hmm_hmm.mode` | `pairwise` (hhalign per pair) or `db-search` (hhsearch against ffindex DB) |
+| `hmm_hmm.mode` | `pairwise` (hhalign per pair) or `db-search` (hhsearch against ffindex DB) or `mmseqs-profile` (fast all-vs-all) |
 | `knn.mode` | `knn` (cosine KNN) or `rkcnn` (Random K-Conditional Nearest Neighbor) |
 | `hmm_hmm.min_prob_core` | Strict family sensitivity |
 | `graph.leiden_resolution_*` | Family size (lower → larger families) |
 | `embed.device` | CPU or GPU for embeddings |
 | `knn.device` | CPU or GPU for KNN/rKCNN neighbor search (requires faiss-gpu) |
-| `mapping.min_prob` / `min_segment_len` | Filter noisy/short hits |
+| `mapping.min_pident` / `min_segment_len` | Filter noisy/short hits (legacy key `min_prob` still accepted) |
+| `profiles.parallel_workers` | Concurrent MAFFT+hhmake jobs (separate from per-tool thread count) |
+| `hmm_hmm.parallel_workers` | Concurrent hhalign/hhsearch jobs (separate from per-tool thread count) |
 
 See [`docs/config.template.yaml`](docs/config.template.yaml) for the full list.
+
+> **HPC note (CPU oversubscription):** `mmseqs.threads` controls the thread
+> count passed to each tool invocation, while `profiles.parallel_workers` and
+> `hmm_hmm.parallel_workers` control how many jobs run concurrently.  Set
+> `parallel_workers × threads ≤ CPU cores in your allocation` to avoid
+> oversubscription.
 
 ## CLI commands
 
@@ -133,6 +141,7 @@ output as its starting point.  Instead of running global MMseqs2 clustering
 | Lower sequence-identity threshold | Within-HOG proteins diverge across species; the default `subcluster_min_seq_id: 0.4` is intentionally lower than the global `mmseqs.min_seq_id: 0.6` |
 | Cross-HOG edges preserved | HMM-HMM edges (Step 5) still compare across all HOGs, revealing domain sharing, convergent evolution, and fusion events |
 | Biological provenance | `og_subfamily_map.tsv` maps every subfamily back to its source OG for downstream phylogenetic and functional analyses |
+| Singleton preservation | Subfamilies with no retained graph edges are preserved as singleton families — no subfamily is dropped |
 
 ### Quick start
 
@@ -144,8 +153,9 @@ orthofinder -f proteomes/ -t 16
 plm_cluster run-all-orthofinder \
   --og_dir OrthoFinder/Results_*/Phylogenetic_Hierarchical_Orthogroups/N0/ \
   --weights_path /path/to/esm2_t33_650M_UR50D.pt \
-  --config config.yaml \
-  --results_root results
+  --config docs/config.orthofinder.yaml \
+  --results_root results \
+  --resume
 ```
 
 Or use OG sequences instead of HOGs:
@@ -182,10 +192,41 @@ results/01_mmseqs/
 
 | Key | Default | Description |
 |-----|---------|-------------|
+| `subcluster_mode` | `linclust` | `linclust` \| `cluster` \| `auto` — controls which MMseqs2 algorithm runs within each HOG |
+| `auto_linclust_min_size` | `1000` | HOG size at or above which `auto` mode switches to `linclust` |
 | `subcluster_min_seq_id` | `0.4` | Min sequence identity within an OG for subclustering |
 | `subcluster_coverage` | `0.8` | Min alignment coverage for within-OG subclustering |
 | `subcluster_cov_mode` | `1` | MMseqs2 coverage mode (0=query, 1=target, 2=bidirectional) |
+| `subcluster_alignment_mode` | `3` | MMseqs2 `--alignment-mode` (3 = full alignment; required for cluster-reassign) |
+| `subcluster_cluster_reassign` | `false` | Pass `--cluster-reassign` to mmseqs cluster (silently ignored for linclust) |
 | `min_og_size_for_subclustering` | `2` | OGs smaller than this skip MMseqs2; each protein becomes a singleton subfamily |
+| `subcluster_threads` | `4` | CPU threads per individual MMseqs2 OG invocation |
+| `parallel_og_workers` | `4` | OGs processed concurrently (`total CPU ≈ parallel_og_workers × subcluster_threads`) |
+
+**Subclustering modes:**
+
+| Mode | When to use |
+|------|-------------|
+| `linclust` *(default)* | Large datasets; O(n) runtime, minimal memory |
+| `cluster` | Small/divergent HOGs; O(n²) but better recall; supports `--cluster-reassign` |
+| `auto` | Hybrid: uses `cluster` for HOGs below `auto_linclust_min_size`, `linclust` for larger ones; logs the choice per HOG |
+
+**`--cluster-reassign`** improves cluster membership by reassigning border-zone
+members to their nearest cluster center.  Set `subcluster_cluster_reassign: true`
+to enable it; it is only applied when the effective algorithm is `cluster`
+(silently ignored for `linclust`).
+
+**Provenance chain** — every output contains keys to reconstruct the full join:
+
+```
+protein_id  →  subfamily_id       via  01_mmseqs/subfamily_map.tsv
+subfamily_id → og_id              via  01_mmseqs/og_subfamily_map.tsv
+subfamily_id → strict_family_id   via  06_family_clustering/subfamily_to_family_strict.tsv
+subfamily_id → functional_family  via  06_family_clustering/subfamily_to_family_functional.tsv
+```
+
+A dedicated OrthoFinder config template is at
+[`docs/config.orthofinder.yaml`](docs/config.orthofinder.yaml).
 
 ## Resuming interrupted runs and progress logging
 
@@ -196,8 +237,9 @@ their work will skip redundant computation.
 | Stage | `--resume` behaviour |
 |-------|----------------------|
 | `mmseqs-cluster` | Skips the step entirely if its output files already exist |
+| `orthofinder-cluster` | Skips the step entirely if output files already exist |
 | `build-profiles` | Skips already-built per-subfamily `.hhm` profiles; rebuilds only the missing ones |
-| `embed` | Skips the step entirely if `embeddings.npy` already exists |
+| `embed` | Skips entirely if `embeddings.npy` already exists; if `embed.checkpoint_dir` is set, reloads per-batch checkpoints and resumes from the last completed batch *(OOM / timeout recovery)* |
 | `knn` | Skips the step entirely if the output KNN TSV already exists |
 | `hmm-hmm-edges` | Skips already-completed pairs; reads an NDJSON progress log in real time |
 | `merge-hmm-shards` | Skips the step if the merged output already exists |
@@ -206,47 +248,28 @@ their work will skip redundant computation.
 | `map-proteins-to-families` | Skips the step if protein mapping outputs already exist |
 | `write-matrices` | Skips the step if matrix output files already exist |
 | `qc-plots` | Skips the step if the QC output directory already contains plots |
-| `run-all` | Passes `--resume` to every supported stage above |
+| `run-all` / `run-all-orthofinder` | Passes `--resume` to every supported stage above |
+
+### Embedding resumability (OOM / timeout recovery)
+
+Large embedding runs on GPU can be interrupted by out-of-memory errors or
+SLURM time limits.  Enable batch-level checkpointing in your config:
+
+```yaml
+embed:
+  checkpoint_dir: "tmp/embed_checkpoints"   # any writable directory
+```
+
+Each completed batch is saved as `embed_batch_NNNNNN.npy`.  Re-run with
+`--resume` to reload completed batches and continue from the interruption
+point.  Checkpoint files are removed once the final `embeddings.npy` is
+written.
 
 ```bash
-# Resume any individual stage — just add --resume
-plm_cluster mmseqs-cluster       --proteins_fasta proteins.faa --resume
-plm_cluster build-profiles       --proteins_fasta proteins.faa \
-                                  --subfamily_map results/01_mmseqs/subfamily_map.tsv --resume
-plm_cluster embed                --reps_fasta results/01_mmseqs/subfamily_reps.faa \
-                                  --weights_path /path/to/esm2.pt --resume
-plm_cluster knn                  --embeddings results/04_embeddings/embeddings.npy \
-                                  --ids results/04_embeddings/ids.txt \
-                                  --lengths results/04_embeddings/lengths.tsv \
-                                  --out_tsv results/04_embeddings/embedding_knn_edges.tsv --resume
-plm_cluster hmm-hmm-edges        --profile_index results/02_profiles/subfamily_profile_index.tsv \
-                                  --candidate_edges results/04_embeddings/embedding_knn_edges.tsv \
-                                  --outdir results/03_hmm_hmm_edges --resume
-plm_cluster merge-hmm-shards     --outdir results/03_hmm_hmm_edges --resume
-plm_cluster merge-graph          --hmm_core results/03_hmm_hmm_edges/hmm_hmm_edges_core.tsv \
-                                  --hmm_relaxed results/03_hmm_hmm_edges/hmm_hmm_edges_relaxed.tsv \
-                                  --embedding_edges results/04_embeddings/embedding_knn_edges.tsv \
-                                  --outdir results/06_family_clustering --resume
-plm_cluster cluster-families     --merged_edges_strict results/06_family_clustering/merged_edges_strict.tsv \
-                                  --merged_edges_functional results/06_family_clustering/merged_edges_functional.tsv \
-                                  --subfamily_map results/01_mmseqs/subfamily_map.tsv \
-                                  --outdir results/06_family_clustering --resume
-plm_cluster map-proteins-to-families \
-                                  --proteins_fasta proteins.faa \
-                                  --subfamily_to_family_strict results/06_family_clustering/subfamily_to_family_strict.tsv \
-                                  --subfamily_to_family_functional results/06_family_clustering/subfamily_to_family_functional.tsv \
-                                  --subfamily_map results/01_mmseqs/subfamily_map.tsv \
-                                  --outdir results/05_domain_hits --resume
-plm_cluster write-matrices       --subfamily_map results/01_mmseqs/subfamily_map.tsv \
-                                  --protein_family_segments results/05_domain_hits/protein_family_segments.tsv \
-                                  --outdir results/07_membership_matrices --resume
-
-# Or resume the entire pipeline end-to-end
-plm_cluster run-all \
-  --proteins_fasta proteins.faa \
+plm_cluster embed \
+  --reps_fasta results/01_mmseqs/subfamily_reps.faa \
   --weights_path /path/to/esm2.pt \
-  --config docs/config.template.yaml \
-  --results_root results \
+  --outdir results/04_embeddings \
   --resume
 ```
 
@@ -290,7 +313,7 @@ detailed resume and sharding guidance.
 **External tools** (must be on `$PATH` or set in config):
 - `mmseqs` (MMseqs2)
 - `hhmake`, `hhalign` (HH-suite — pairwise mode)
-- `hhsearch`, `ffindex_build` (HH-suite — db-search mode)
+- `hhsearch`, `ffindex_build`, `cstranslate` (HH-suite — db-search mode)
 - `mafft`
 
 **Python** (≥ 3.10):
@@ -304,7 +327,7 @@ detailed resume and sharding guidance.
 
 ```
 results/
-  01_mmseqs/           # Subfamily clustering
+  01_mmseqs/           # Subfamily clustering (+ og_subfamily_map.tsv in OrthoFinder mode)
   02_profiles/         # MSAs and HMM profiles
   03_hmm_hmm_edges/    # Profile-profile edge tables
   04_embeddings/       # Embedding vectors and KNN edges
@@ -324,6 +347,7 @@ results/
 | [rKCNN implementation plan](docs/rkcnn_implementation_plan.md) | rKCNN integration design and data flow |
 | [CLI workflow](docs/cli_workflow_and_options.md) | Step-by-step and `run-all` usage |
 | [Config reference](docs/config.template.yaml) | All parameters with inline comments |
+| [OrthoFinder config](docs/config.orthofinder.yaml) | OrthoFinder-specific config template with detailed comments |
 | [Output schemas](docs/output_schemas.md) | File formats and column descriptions |
 | [Installation](docs/installation_and_containers.md) | Conda, containers, and HPC tips |
 

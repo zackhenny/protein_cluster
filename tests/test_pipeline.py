@@ -177,9 +177,384 @@ def test_build_hhsuite_db_skips_existing_cs219(tmp_path: Path):
     assert commands_run == []
 
 
+
 # ---------------------------------------------------------------------------
-# embed() edge-case tests (no real ESM/torch required — calls are mocked)
+# cluster_families(): singleton subfamily preservation
 # ---------------------------------------------------------------------------
+
+def _write_edges(path: Path, rows):
+    """Write a minimal edges TSV."""
+    import pandas as pd
+    pd.DataFrame(rows).to_csv(path, sep="\t", index=False)
+
+
+def test_cluster_families_singleton_preservation(tmp_path: Path):
+    """Subfamilies with no graph edges must appear in both output TSVs as singletons."""
+    from plm_cluster.pipeline import cluster_families
+
+    # Three subfamilies: s1-s2 are connected, s3 has no edges at all
+    _write_edges(tmp_path / "strict.tsv", [
+        {"qid": "s1", "tid": "s2", "weight": 0.9, "source": "hmm_core"},
+    ])
+    _write_edges(tmp_path / "func.tsv", [
+        {"qid": "s1", "tid": "s2", "weight": 0.8, "source": "hmm_core"},
+    ])
+
+    smap_path = tmp_path / "subfamily_map.tsv"
+    pd.DataFrame([
+        {"protein_id": "p1", "subfamily_id": "s1", "is_rep": 1},
+        {"protein_id": "p2", "subfamily_id": "s2", "is_rep": 1},
+        {"protein_id": "p3", "subfamily_id": "s3", "is_rep": 1},
+    ]).to_csv(smap_path, sep="\t", index=False)
+
+    out_dir = tmp_path / "out"
+    cfg = load_config(None)
+
+    cluster_families(
+        str(tmp_path / "strict.tsv"),
+        str(tmp_path / "func.tsv"),
+        str(smap_path),
+        str(out_dir),
+        cfg,
+        logger=logging.getLogger("test"),
+    )
+
+    strict = pd.read_csv(out_dir / "subfamily_to_family_strict.tsv", sep="\t")
+    func = pd.read_csv(out_dir / "subfamily_to_family_functional.tsv", sep="\t")
+
+    for df, name in [(strict, "strict"), (func, "functional")]:
+        assigned = set(df["subfamily_id"].tolist())
+        assert "s3" in assigned, f"s3 missing from {name} output (no graph edges)"
+        assert "s1" in assigned, f"s1 missing from {name} output"
+        assert "s2" in assigned, f"s2 missing from {name} output"
+
+
+def test_cluster_families_singleton_gets_unique_family_id(tmp_path: Path):
+    """Each edge-less subfamily must receive a distinct singleton family ID."""
+    from plm_cluster.pipeline import cluster_families
+
+    # s1 and s2 are connected; s3 and s4 are isolated
+    _write_edges(tmp_path / "strict.tsv", [
+        {"qid": "s1", "tid": "s2", "weight": 0.9, "source": "hmm_core"},
+    ])
+    _write_edges(tmp_path / "func.tsv", [
+        {"qid": "s1", "tid": "s2", "weight": 0.8, "source": "hmm_core"},
+    ])
+
+    smap_path = tmp_path / "subfamily_map.tsv"
+    pd.DataFrame([
+        {"protein_id": "p1", "subfamily_id": "s1", "is_rep": 1},
+        {"protein_id": "p2", "subfamily_id": "s2", "is_rep": 1},
+        {"protein_id": "p3", "subfamily_id": "s3", "is_rep": 1},
+        {"protein_id": "p4", "subfamily_id": "s4", "is_rep": 1},
+    ]).to_csv(smap_path, sep="\t", index=False)
+
+    out_dir = tmp_path / "out"
+    cfg = load_config(None)
+    cluster_families(
+        str(tmp_path / "strict.tsv"),
+        str(tmp_path / "func.tsv"),
+        str(smap_path),
+        str(out_dir),
+        cfg,
+        logger=logging.getLogger("test"),
+    )
+
+    strict = pd.read_csv(out_dir / "subfamily_to_family_strict.tsv", sep="\t")
+    # The two isolated subfamilies (s3, s4) must have DIFFERENT family IDs
+    s3_fam = strict.loc[strict["subfamily_id"] == "s3", "family_id"].iloc[0]
+    s4_fam = strict.loc[strict["subfamily_id"] == "s4", "family_id"].iloc[0]
+    assert s3_fam != s4_fam, "s3 and s4 should have different singleton family IDs"
+
+
+def test_cluster_families_all_isolated_subfamilies(tmp_path: Path):
+    """When ALL subfamilies are edge-less (empty graphs), every subfamily still appears."""
+    from plm_cluster.pipeline import cluster_families
+
+    # Empty edge graphs
+    _write_edges(tmp_path / "strict.tsv", [
+        {"qid": "dummy", "tid": "dummy", "weight": 0.5, "source": "x"},
+    ])
+    _write_edges(tmp_path / "func.tsv", [
+        {"qid": "dummy", "tid": "dummy", "weight": 0.5, "source": "x"},
+    ])
+
+    # All proteins in their own isolated subfamilies (none in graphs above)
+    smap_path = tmp_path / "subfamily_map.tsv"
+    pd.DataFrame([
+        {"protein_id": "p1", "subfamily_id": "A", "is_rep": 1},
+        {"protein_id": "p2", "subfamily_id": "B", "is_rep": 1},
+        {"protein_id": "p3", "subfamily_id": "C", "is_rep": 1},
+    ]).to_csv(smap_path, sep="\t", index=False)
+
+    out_dir = tmp_path / "out"
+    cfg = load_config(None)
+    cluster_families(
+        str(tmp_path / "strict.tsv"),
+        str(tmp_path / "func.tsv"),
+        str(smap_path),
+        str(out_dir),
+        cfg,
+        logger=logging.getLogger("test"),
+    )
+
+    strict = pd.read_csv(out_dir / "subfamily_to_family_strict.tsv", sep="\t")
+    assigned = set(strict["subfamily_id"].tolist())
+    assert assigned >= {"A", "B", "C"}, f"Not all subfamilies assigned: {assigned}"
+
+
+# ---------------------------------------------------------------------------
+# mapping.min_prob backward-compatibility
+# ---------------------------------------------------------------------------
+
+def test_load_config_min_prob_deprecated_alias(tmp_path: Path):
+    """loading a config with mapping.min_prob emits a DeprecationWarning and maps to min_pident."""
+    import warnings
+
+    cfg_yaml = tmp_path / "cfg.yaml"
+    cfg_yaml.write_text("mapping:\n  min_prob: 50.0\n")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_config(str(cfg_yaml))
+
+    dep_warns = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+    assert dep_warns, "Expected a DeprecationWarning for mapping.min_prob"
+    assert cfg["mapping"]["min_pident"] == 50.0
+
+
+def test_load_config_min_pident_canonical(tmp_path: Path):
+    """mapping.min_pident is accepted without any warning."""
+    import warnings
+
+    cfg_yaml = tmp_path / "cfg.yaml"
+    cfg_yaml.write_text("mapping:\n  min_pident: 30.0\n")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_config(str(cfg_yaml))
+
+    dep_warns = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+    assert not dep_warns, "No DeprecationWarning expected for min_pident"
+    assert cfg["mapping"]["min_pident"] == 30.0
+
+
+# ---------------------------------------------------------------------------
+# OrthoFinder subcluster mode selection (cluster | linclust | auto)
+# ---------------------------------------------------------------------------
+
+def _write_faa_file(path: Path, entries: dict[str, str]) -> None:
+    with path.open("w") as fh:
+        for pid, seq in entries.items():
+            fh.write(f">{pid}\n{seq}\n")
+
+
+def _make_fake_run_record(og_dir_path, recorded_cmds):
+    """Return a fake run_cmd that records all commands issued."""
+    def fake_run(cmd, logger, cwd=None):
+        recorded_cmds.append(list(cmd))
+        if cmd[0] == "mmseqs" and cmd[1] == "createtsv":
+            tsv_path = Path(cmd[-1])
+            fa_path = Path(cmd[2]).parent / "og.faa"
+            lines = fa_path.read_text().splitlines()
+            proteins = [l[1:].split()[0] for l in lines if l.startswith(">")]
+            with tsv_path.open("w") as fh:
+                for pid in proteins:
+                    fh.write(f"{pid}\t{pid}\n")
+        elif cmd[0] == "mmseqs" and cmd[1] == "result2flat":
+            out_faa = Path(cmd[-1])
+            fa_path = Path(cmd[2]).parent / "og.faa"
+            out_faa.write_text(fa_path.read_text())
+        return ""
+    return fake_run
+
+
+def test_orthofinder_linclust_mode(tmp_path, monkeypatch):
+    """subcluster_mode='linclust' must call 'mmseqs linclust', never 'mmseqs cluster'."""
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    _write_faa_file(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK", "p2": "MKTAYIAG"})
+
+    cfg = load_config(None)
+    cfg["orthofinder"]["subcluster_mode"] = "linclust"
+
+    cmds: list[list] = []
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", lambda t, c=None: {k: k for k in t})
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", _make_fake_run_record(og_dir, cmds))
+
+    from plm_cluster.pipeline import orthofinder_cluster
+    orthofinder_cluster(str(og_dir), str(tmp_path / "out"), cfg, logging.getLogger("test"))
+
+    algo_calls = [c[1] for c in cmds if c[0] == "mmseqs" and len(c) > 1]
+    assert "linclust" in algo_calls
+    assert "cluster" not in algo_calls
+
+
+def test_orthofinder_cluster_mode(tmp_path, monkeypatch):
+    """subcluster_mode='cluster' must call 'mmseqs cluster', never 'mmseqs linclust'."""
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    _write_faa_file(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK", "p2": "MKTAYIAG"})
+
+    cfg = load_config(None)
+    cfg["orthofinder"]["subcluster_mode"] = "cluster"
+
+    cmds: list[list] = []
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", lambda t, c=None: {k: k for k in t})
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", _make_fake_run_record(og_dir, cmds))
+
+    from plm_cluster.pipeline import orthofinder_cluster
+    orthofinder_cluster(str(og_dir), str(tmp_path / "out"), cfg, logging.getLogger("test"))
+
+    algo_calls = [c[1] for c in cmds if c[0] == "mmseqs" and len(c) > 1]
+    assert "cluster" in algo_calls
+    assert "linclust" not in algo_calls
+
+
+def test_orthofinder_auto_mode_small_og_uses_cluster(tmp_path, monkeypatch):
+    """auto mode with a small OG (below threshold) must use mmseqs cluster."""
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    # 3 members, threshold = 1000 → should use "cluster"
+    _write_faa_file(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK", "p2": "MKTAYIAG", "p3": "GAVLILKK"})
+
+    cfg = load_config(None)
+    cfg["orthofinder"]["subcluster_mode"] = "auto"
+    cfg["orthofinder"]["auto_linclust_min_size"] = 1000
+
+    cmds: list[list] = []
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", lambda t, c=None: {k: k for k in t})
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", _make_fake_run_record(og_dir, cmds))
+
+    from plm_cluster.pipeline import orthofinder_cluster
+    orthofinder_cluster(str(og_dir), str(tmp_path / "out"), cfg, logging.getLogger("test"))
+
+    algo_calls = [c[1] for c in cmds if c[0] == "mmseqs" and len(c) > 1]
+    assert "cluster" in algo_calls
+    assert "linclust" not in algo_calls
+
+
+def test_orthofinder_auto_mode_large_og_uses_linclust(tmp_path, monkeypatch):
+    """auto mode with a large OG (at or above threshold) must use mmseqs linclust."""
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    # 3 members, threshold = 2 → should use "linclust"
+    _write_faa_file(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK", "p2": "MKTAYIAG", "p3": "GAVLILKK"})
+
+    cfg = load_config(None)
+    cfg["orthofinder"]["subcluster_mode"] = "auto"
+    cfg["orthofinder"]["auto_linclust_min_size"] = 2  # threshold=2, OG has 3 → linclust
+
+    cmds: list[list] = []
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", lambda t, c=None: {k: k for k in t})
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", _make_fake_run_record(og_dir, cmds))
+
+    from plm_cluster.pipeline import orthofinder_cluster
+    orthofinder_cluster(str(og_dir), str(tmp_path / "out"), cfg, logging.getLogger("test"))
+
+    algo_calls = [c[1] for c in cmds if c[0] == "mmseqs" and len(c) > 1]
+    assert "linclust" in algo_calls
+    assert "cluster" not in algo_calls
+
+
+def test_orthofinder_cluster_reassign_passed(tmp_path, monkeypatch):
+    """subcluster_cluster_reassign=True must pass --cluster-reassign to mmseqs cluster."""
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    _write_faa_file(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK", "p2": "MKTAYIAG"})
+
+    cfg = load_config(None)
+    cfg["orthofinder"]["subcluster_mode"] = "cluster"
+    cfg["orthofinder"]["subcluster_cluster_reassign"] = True
+
+    cmds: list[list] = []
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", lambda t, c=None: {k: k for k in t})
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", _make_fake_run_record(og_dir, cmds))
+
+    from plm_cluster.pipeline import orthofinder_cluster
+    orthofinder_cluster(str(og_dir), str(tmp_path / "out"), cfg, logging.getLogger("test"))
+
+    cluster_cmds = [c for c in cmds if c[0] == "mmseqs" and len(c) > 1 and c[1] == "cluster"]
+    assert cluster_cmds, "Expected at least one 'mmseqs cluster' call"
+    assert any("--cluster-reassign" in c for c in cluster_cmds), \
+        "--cluster-reassign not found in cluster command"
+
+
+def test_orthofinder_cluster_reassign_not_passed_for_linclust(tmp_path, monkeypatch):
+    """subcluster_cluster_reassign must NOT be passed when mode is linclust."""
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    _write_faa_file(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK", "p2": "MKTAYIAG"})
+
+    cfg = load_config(None)
+    cfg["orthofinder"]["subcluster_mode"] = "linclust"
+    cfg["orthofinder"]["subcluster_cluster_reassign"] = True  # set but must be ignored
+
+    cmds: list[list] = []
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", lambda t, c=None: {k: k for k in t})
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", _make_fake_run_record(og_dir, cmds))
+
+    from plm_cluster.pipeline import orthofinder_cluster
+    orthofinder_cluster(str(og_dir), str(tmp_path / "out"), cfg, logging.getLogger("test"))
+
+    linclust_cmds = [c for c in cmds if c[0] == "mmseqs" and len(c) > 1 and c[1] == "linclust"]
+    assert linclust_cmds, "Expected at least one 'mmseqs linclust' call"
+    for cmd in linclust_cmds:
+        assert "--cluster-reassign" not in cmd, \
+            "--cluster-reassign should NOT appear in linclust command"
+
+
+# ---------------------------------------------------------------------------
+# CLI: --hmm-mode precedence over config
+# ---------------------------------------------------------------------------
+
+def test_config_orthofinder_subcluster_mode_validation():
+    """Invalid orthofinder.subcluster_mode should raise ValueError."""
+    from plm_cluster.config import load_config
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write("orthofinder:\n  subcluster_mode: invalid_mode\n")
+        tmp = f.name
+    try:
+        with pytest.raises(ValueError, match="subcluster_mode"):
+            load_config(tmp)
+    finally:
+        os.unlink(tmp)
+
+
+def test_config_new_orthofinder_keys_loaded(tmp_path: Path):
+    """New orthofinder config keys should round-trip through load_config."""
+    cfg_yaml = tmp_path / "cfg.yaml"
+    cfg_yaml.write_text(
+        "orthofinder:\n"
+        "  subcluster_mode: cluster\n"
+        "  auto_linclust_min_size: 500\n"
+        "  subcluster_alignment_mode: 3\n"
+        "  subcluster_cluster_reassign: true\n"
+        "  subcluster_threads: 2\n"
+        "  parallel_og_workers: 2\n"
+    )
+    cfg = load_config(str(cfg_yaml))
+    of = cfg["orthofinder"]
+    assert of["subcluster_mode"] == "cluster"
+    assert of["auto_linclust_min_size"] == 500
+    assert of["subcluster_alignment_mode"] == 3
+    assert of["subcluster_cluster_reassign"] is True
+    assert of["subcluster_threads"] == 2
+    assert of["parallel_og_workers"] == 2
+
+
+def test_config_parallel_workers_loaded(tmp_path: Path):
+    """profiles.parallel_workers and hmm_hmm.parallel_workers should load correctly."""
+    cfg_yaml = tmp_path / "cfg.yaml"
+    cfg_yaml.write_text(
+        "profiles:\n  parallel_workers: 16\n"
+        "hmm_hmm:\n  parallel_workers: 12\n"
+    )
+    cfg = load_config(str(cfg_yaml))
+    assert cfg["profiles"]["parallel_workers"] == 16
+    assert cfg["hmm_hmm"]["parallel_workers"] == 12
+
 
 def _make_fake_esm_torch(embed_dim: int = 4):
     """Return fake (esm, torch) module objects suitable for sys.modules injection."""
