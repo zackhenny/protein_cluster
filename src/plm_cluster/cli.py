@@ -503,7 +503,7 @@ def main() -> None:
         Path(args.results_root) / "manifests" / "run_manifest.json",
         {"command": cmd, **vars(args)},
         manifest_tools,
-        [getattr(args, "og_dir", getattr(args, "proteins_fasta", ""))],
+        [getattr(args, "og_dir", None) or getattr(args, "proteins_fasta", "")],
     )
 
 

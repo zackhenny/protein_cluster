@@ -23,6 +23,15 @@ def _ensure_dir(path: str | Path) -> Path:
     return p
 
 
+def _sanitize_id(name: str) -> str:
+    """Replace non-alphanumeric/underscore characters with underscores.
+
+    Used to produce safe subfamily/OG identifiers from OrthoFinder filenames
+    (e.g. ``N0.HOG0000001`` → ``N0_HOG0000001``).
+    """
+    return re.sub(r"[^A-Za-z0-9_]", "_", name)
+
+
 def _parse_hhm_len(path: str | Path) -> int:
     for line in Path(path).read_text(errors="ignore").splitlines():
         if line.startswith("LENG"):
@@ -405,7 +414,7 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
     for og_file in og_files:
         # Derive a clean OG identifier from the filename stem
         og_stem = og_file.stem  # e.g. "N0.HOG0000001" or "OG0000001"
-        og_id = re.sub(r"[^A-Za-z0-9_]", "_", og_stem)
+        og_id = _sanitize_id(og_stem)
 
         records = read_fasta(str(og_file))
         if not records:
@@ -463,8 +472,8 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
 
             for rep_pid, subfam_id in rep_to_sub.items():
                 og_subfamily_rows.append({"subfamily_id": subfam_id, "og_id": og_stem})
-                # Use sequence from original records in case result2flat output differs
-                seq = seqs.get(rep_pid) or rep_seqs.get(rep_pid, "")
+                # Prefer the original record; fall back to MMseqs2 result2flat output
+                seq = seqs[rep_pid] if rep_pid in seqs else rep_seqs.get(rep_pid, "")
                 rep_records.append(FastaRecord(subfam_id, seq))
 
             for row in raw.iter_rows(named=True):
