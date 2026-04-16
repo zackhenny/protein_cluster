@@ -112,3 +112,16 @@ outputs:
   # Step 8 — Output matrix options
   write_dense_threshold: 2000000
   write_matrix_market: true
+
+orthofinder:
+  # OrthoFinder integration — subclustering of HOG/OG FASTA files
+  # Used by: plm_cluster orthofinder-cluster  and  plm_cluster run-all-orthofinder
+  #
+  # Proteins within a HOG/OG are already orthologous, so subclustering at the
+  # standard 60% identity threshold (mmseqs.min_seq_id) would collapse many
+  # distinct paralog lineages.  These parameters control the finer-grained
+  # within-OG subclustering step.
+  subcluster_min_seq_id: 0.4    # Min seq identity within an OG (lower than global mmseqs.min_seq_id)
+  subcluster_coverage: 0.8      # Min alignment coverage for within-OG subclustering
+  subcluster_cov_mode: 1        # MMseqs2 coverage mode (0=query, 1=target, 2=bidirectional)
+  min_og_size_for_subclustering: 2  # OGs with fewer members skip MMseqs2; each protein → own subfamily

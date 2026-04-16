@@ -84,6 +84,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_overlap_aa": 30,
     },
     "outputs": {"write_dense_threshold": 2_000_000, "write_matrix_market": True},
+    "orthofinder": {
+        "subcluster_min_seq_id": 0.4,
+        "subcluster_coverage": 0.8,
+        "subcluster_cov_mode": 1,
+        "min_og_size_for_subclustering": 2,
+    },
 }
 
 
@@ -113,6 +119,10 @@ _RANGE_CHECKS: list[tuple[str, str, float, float]] = [
     ("mapping", "profile_cov_min", 0.0, 1.0),
     ("mapping", "min_prob", 0.0, 100.0),
     ("mapping", "max_overlap_aa", 0, 10_000),
+    ("orthofinder", "subcluster_min_seq_id", 0.0, 1.0),
+    ("orthofinder", "subcluster_coverage", 0.0, 1.0),
+    ("orthofinder", "subcluster_cov_mode", 0, 5),
+    ("orthofinder", "min_og_size_for_subclustering", 1, 1_000_000),
 ]
 
 _VALID_EMBED_DEVICES = {"cpu", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3"}

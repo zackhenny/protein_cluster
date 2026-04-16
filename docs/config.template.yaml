@@ -165,3 +165,30 @@ mapping:
 outputs:
   write_dense_threshold: 2000000  # Max cells before skipping dense matrix output
   write_matrix_market: true       # Also write Matrix Market (.mtx) format
+
+# ---------------------------------------------------------------------------
+# OrthoFinder integration — within-OG subclustering
+# ---------------------------------------------------------------------------
+# Used by:  plm_cluster orthofinder-cluster
+#           plm_cluster run-all-orthofinder
+#
+# Instead of Step 1 (MMseqs2 global clustering), proteins are pre-grouped by
+# their OrthoFinder HOG or OG membership and then subclustered within each
+# group.  This preserves orthology context while separating recent paralogs
+# (lineage-specific expansions) into distinct subfamilies.
+#
+# Point --og_dir at a directory of *.faa or *.fa files, e.g.:
+#   OrthoFinder/Results_*/Phylogenetic_Hierarchical_Orthogroups/N0/
+#   OrthoFinder/Results_*/Orthogroup_Sequences/
+#
+# HOG level choice:
+#   N0 (species-tree root) — broadest non-redundant set, closest to OGs.
+#   Leaf-level HOGs        — finer pre-grouping but can be very small.
+orthofinder:
+  subcluster_min_seq_id: 0.4    # Min seq identity within an OG [0-1]
+                                 # Lower than mmseqs.min_seq_id because within-HOG
+                                 # proteins are already orthologous; divergence is expected.
+  subcluster_coverage: 0.8      # Min alignment coverage for within-OG subclustering [0-1]
+  subcluster_cov_mode: 1        # MMseqs2 coverage mode (0=query, 1=target, 2=bidirectional)
+  min_og_size_for_subclustering: 2  # OGs with fewer members skip MMseqs2;
+                                     # each protein becomes its own singleton subfamily.

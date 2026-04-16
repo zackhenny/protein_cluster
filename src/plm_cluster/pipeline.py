@@ -23,6 +23,15 @@ def _ensure_dir(path: str | Path) -> Path:
     return p
 
 
+def _sanitize_id(name: str) -> str:
+    """Replace non-alphanumeric/underscore characters with underscores.
+
+    Used to produce safe subfamily/OG identifiers from OrthoFinder filenames
+    (e.g. ``N0.HOG0000001`` → ``N0_HOG0000001``).
+    """
+    return re.sub(r"[^A-Za-z0-9_]", "_", name)
+
+
 def _parse_hhm_len(path: str | Path) -> int:
     for line in Path(path).read_text(errors="ignore").splitlines():
         if line.startswith("LENG"):
@@ -341,6 +350,189 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger, resum
     stats.sort("subfamily_id").write_csv(out / "subfamily_stats.tsv", separator="\t")
     logger.info("MMseqs2 clustering complete: %d proteins -> %d subfamilies (median size: %.0f)",
                 len(raw), len(reps_sorted), float(stats["n_members"].median()))
+    return tools
+
+
+def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: bool = False) -> dict[str, str]:
+    """Step 1 (OrthoFinder mode): Subcluster each HOG/OG FASTA into subfamilies using MMseqs2.
+
+    Scans *og_dir* for ``*.faa`` and ``*.fa`` files produced by OrthoFinder
+    (HOGs or OGs).  Each file is subclustered independently so that subfamily
+    IDs are scoped to their parent orthogroup, preventing cross-OG collisions.
+    Singletons (OGs below *min_og_size_for_subclustering*) are passed through
+    directly without invoking MMseqs2.
+
+    Produces the same output schema as :func:`mmseqs_cluster` so that all
+    downstream steps (build_profiles, embed, …) work without modification.
+    Two additional files are written:
+
+    * ``proteins_combined.faa`` — all proteins from all OGs concatenated;
+      required by ``build_profiles`` and ``map_proteins_to_families``.
+    * ``og_subfamily_map.tsv``  — provenance table mapping each subfamily back
+      to its source OG identifier.
+    """
+    out = _ensure_dir(outdir)
+    if resume and (out / "subfamily_map.tsv").exists():
+        logger.info("Resume: orthofinder-cluster outputs already exist in %s, skipping.", str(out))
+        return require_executables(["mmseqs"], config["tools"])
+
+    tools = require_executables(["mmseqs"], config["tools"])
+    of_cfg = config.get("orthofinder", {})
+    min_seq_id = float(of_cfg.get("subcluster_min_seq_id", 0.4))
+    coverage = float(of_cfg.get("subcluster_coverage", 0.8))
+    cov_mode = int(of_cfg.get("subcluster_cov_mode", 1))
+    min_og_size = int(of_cfg.get("min_og_size_for_subclustering", 2))
+    threads = str(config.get("mmseqs", {}).get("threads", 8))
+    tmpdir = _ensure_dir(config.get("mmseqs", {}).get("tmpdir", "tmp/mmseqs"))
+
+    og_dir_path = Path(og_dir)
+    og_files = sorted(og_dir_path.glob("*.faa")) + sorted(og_dir_path.glob("*.fa"))
+    # Deduplicate in case a path matches both patterns (e.g. file named x.fa.faa)
+    seen: set[Path] = set()
+    unique_og_files: list[Path] = []
+    for f in og_files:
+        if f not in seen:
+            seen.add(f)
+            unique_og_files.append(f)
+    og_files = unique_og_files
+
+    if not og_files:
+        raise FileNotFoundError(
+            f"No *.faa or *.fa files found in '{og_dir}'. "
+            "Please point --og_dir at a directory of OrthoFinder HOG or OG FASTA files."
+        )
+
+    logger.info("OrthoFinder subclustering: found %d OG/HOG FASTA files in %s", len(og_files), og_dir)
+
+    all_rows: list[dict] = []
+    og_subfamily_rows: list[dict] = []
+    rep_records: list[FastaRecord] = []
+    combined_seqs: list[FastaRecord] = []
+
+    n_singletons = 0
+
+    for og_file in og_files:
+        # Derive a clean OG identifier from the filename stem
+        og_stem = og_file.stem  # e.g. "N0.HOG0000001" or "OG0000001"
+        og_id = _sanitize_id(og_stem)
+
+        records = read_fasta(str(og_file))
+        if not records:
+            logger.warning("OG file %s is empty, skipping.", str(og_file))
+            continue
+
+        # Accumulate all proteins for proteins_combined.faa
+        for rec in records:
+            combined_seqs.append(rec)
+
+        seqs = {r.id: r.seq for r in records}
+        sorted_protein_ids = sorted(seqs.keys())
+
+        if len(records) < min_og_size:
+            # Singleton / below-threshold path: each protein → its own subfamily
+            for i, pid in enumerate(sorted_protein_ids):
+                subfam_id = f"{og_id}_subfam_{i:06d}"
+                all_rows.append({"protein_id": pid, "subfamily_id": subfam_id, "is_rep": 1})
+                og_subfamily_rows.append({"subfamily_id": subfam_id, "og_id": og_stem})
+                rep_records.append(FastaRecord(subfam_id, seqs[pid]))
+            n_singletons += len(records)
+            continue
+
+        # Normal path: run MMseqs2 linclust on this OG
+        with tempfile.TemporaryDirectory(dir=str(tmpdir)) as og_tmp:
+            og_tmp_path = Path(og_tmp)
+            fa_path = og_tmp_path / "og.faa"
+            write_fasta(str(fa_path), records)
+
+            db = og_tmp_path / "proteinsDB"
+            clu = og_tmp_path / "clusterDB"
+            tsv = og_tmp_path / "clusters.tsv"
+            rep_db = og_tmp_path / "repDB"
+            rep_faa = og_tmp_path / "reps.faa"
+
+            run_cmd([tools["mmseqs"], "createdb", str(fa_path), str(db)], logger)
+            run_cmd([
+                tools["mmseqs"], "linclust", str(db), str(clu), str(og_tmp_path / "mmseqs_tmp"),
+                "--min-seq-id", str(min_seq_id),
+                "-c", str(coverage),
+                "--cov-mode", str(cov_mode),
+                "--threads", threads,
+            ], logger)
+            run_cmd([tools["mmseqs"], "createtsv", str(db), str(db), str(clu), str(tsv)], logger)
+            run_cmd([tools["mmseqs"], "result2repseq", str(db), str(clu), str(rep_db)], logger)
+            run_cmd([tools["mmseqs"], "result2flat", str(db), str(db), str(rep_db), str(rep_faa)], logger)
+
+            raw = pl.read_csv(str(tsv), separator="\t", has_header=False,
+                              new_columns=["rep_protein_id", "protein_id"])
+            reps_sorted = sorted(raw["rep_protein_id"].unique().to_list())
+            rep_to_sub = {r: f"{og_id}_subfam_{i:06d}" for i, r in enumerate(reps_sorted)}
+
+            # Read representative sequences from MMseqs2 output
+            rep_seqs = {r.id: r.seq for r in read_fasta(str(rep_faa))}
+
+            for rep_pid, subfam_id in rep_to_sub.items():
+                og_subfamily_rows.append({"subfamily_id": subfam_id, "og_id": og_stem})
+                # Prefer the original record; fall back to MMseqs2 result2flat output
+                seq = seqs[rep_pid] if rep_pid in seqs else rep_seqs.get(rep_pid, "")
+                rep_records.append(FastaRecord(subfam_id, seq))
+
+            for row in raw.iter_rows(named=True):
+                subfam_id = rep_to_sub[row["rep_protein_id"]]
+                is_rep = 1 if row["rep_protein_id"] == row["protein_id"] else 0
+                all_rows.append({
+                    "protein_id": row["protein_id"],
+                    "subfamily_id": subfam_id,
+                    "is_rep": is_rep,
+                })
+
+    if not all_rows:
+        raise RuntimeError("orthofinder_cluster: no proteins were processed. Check input FASTA files.")
+
+    # Write combined proteins FASTA (needed by build_profiles and map_proteins_to_families)
+    write_fasta(str(out / "proteins_combined.faa"), combined_seqs)
+
+    # Write OG provenance table
+    pl.DataFrame(og_subfamily_rows).sort(["og_id", "subfamily_id"]).write_csv(
+        str(out / "og_subfamily_map.tsv"), separator="\t"
+    )
+
+    # Write subfamily_map.tsv (same schema as mmseqs_cluster output)
+    mapping_df = pl.DataFrame(all_rows).sort(["subfamily_id", "protein_id"])
+    mapping_df.write_csv(str(out / "subfamily_map.tsv"), separator="\t")
+
+    # Write subfamily_reps.faa (sorted by subfamily_id for determinism)
+    rep_records_sorted = sorted(rep_records, key=lambda r: r.id)
+    write_fasta(str(out / "subfamily_reps.faa"), rep_records_sorted)
+
+    # Write subfamily_stats.tsv (same schema as mmseqs_cluster output)
+    stats = (
+        mapping_df
+        .group_by("subfamily_id")
+        .agg(pl.col("protein_id").len().alias("n_members"))
+    )
+    reps_df = (
+        mapping_df.filter(pl.col("is_rep") == 1)
+        .select(["subfamily_id", "protein_id"])
+        .rename({"protein_id": "rep_protein_id"})
+    )
+    stats = stats.join(reps_df, on="subfamily_id", how="left")
+    all_seqs = {r.id: r.seq for r in combined_seqs}
+    rep_ids_list = stats["rep_protein_id"].to_list()
+    stats = stats.with_columns(
+        pl.Series("rep_length_aa", [len(all_seqs.get(rid, "")) if rid else 0 for rid in rep_ids_list])
+    )
+    stats.sort("subfamily_id").write_csv(str(out / "subfamily_stats.tsv"), separator="\t")
+
+    n_subfamilies = len(rep_records_sorted)
+    n_proteins = len(all_rows)
+    n_ogs = len(og_files)
+    pct_singletons = 100.0 * n_singletons / n_proteins if n_proteins else 0.0
+    median_size = float(stats["n_members"].median()) if len(stats) > 0 else 0.0
+    logger.info(
+        "OrthoFinder subclustering complete: %d OGs → %d subfamilies from %d proteins "
+        "(median size: %.0f, %.1f%% singletons)",
+        n_ogs, n_subfamilies, n_proteins, median_size, pct_singletons,
+    )
     return tools
 
 

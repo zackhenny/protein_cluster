@@ -14,6 +14,7 @@ from .pipeline import (
     merge_graph,
     merge_hmm_shards,
     mmseqs_cluster,
+    orthofinder_cluster,
     write_matrices,
 )
 from .qc_plots import generate_qc_plots
@@ -149,6 +150,30 @@ def main() -> None:
                    help="Shard index for the HMM-HMM step in run-all")
     p.add_argument("--n-shards", type=int, default=1, dest="n_shards",
                    help="Total shards for the HMM-HMM step in run-all")
+
+    p = sub.add_parser("orthofinder-cluster")
+    add_common(p)
+    p.add_argument("--og_dir", required=True,
+                   help="Directory of OrthoFinder HOG or OG *.faa / *.fa files to subcluster")
+    p.add_argument("--outdir", default="results/01_mmseqs")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip this step if its output files already exist")
+
+    p = sub.add_parser("run-all-orthofinder")
+    add_common(p)
+    p.add_argument("--og_dir", required=True,
+                   help="Directory of OrthoFinder HOG or OG *.faa / *.fa files "
+                        "(e.g. OrthoFinder/Results_*/Phylogenetic_Hierarchical_Orthogroups/N0/)")
+    p.add_argument("--weights_path", required=True)
+    p.add_argument("--resume", action="store_true",
+                   help="Resume long-running stages where supported (hmm-hmm-edges)")
+    p.add_argument("--hmm-mode", default=None, dest="hmm_mode",
+                   choices=["pairwise", "db-search", "mmseqs-profile"],
+                   help="HMM-HMM execution mode (overrides config)")
+    p.add_argument("--shard-id", type=int, default=0, dest="shard_id",
+                   help="Shard index for the HMM-HMM step")
+    p.add_argument("--n-shards", type=int, default=1, dest="n_shards",
+                   help="Total shards for the HMM-HMM step")
 
     args = ap.parse_args()
     cmd = ALIASES.get(args.cmd, args.cmd)
@@ -353,11 +378,132 @@ def main() -> None:
 
         logger.info("Pipeline completed successfully")
 
+    elif cmd == "orthofinder-cluster":
+        manifest_tools.update(orthofinder_cluster(args.og_dir, args.outdir, cfg, logger,
+                                                   resume=args.resume))
+    elif cmd == "run-all-orthofinder":
+        import time as _time
+        root = Path(args.results_root)
+        resume = args.resume
+        logger.info("Starting run-all-orthofinder pipeline%s", " (resume mode)" if resume else "")
+
+        def _timed_step_of(label, func, *a, step_log_dir=None, step_log_name=None, **kw):
+            """Run a pipeline step, timing it and optionally logging to the step's output dir."""
+            logger.info("Starting %s", label)
+            t0 = _time.time()
+            step_fh = None
+            if step_log_dir and step_log_name:
+                step_fh = add_step_log_handler(logger, step_log_dir, step_log_name)
+            try:
+                result = func(*a, **kw)
+            finally:
+                elapsed = _time.time() - t0
+                logger.info("Completed %s in %.1fs", label, elapsed)
+                if step_fh is not None:
+                    logger.removeHandler(step_fh)
+                    step_fh.close()
+            if isinstance(result, dict):
+                manifest_tools.update(result)
+            return result
+
+        _timed_step_of("Step 1/9: OrthoFinder subclustering",
+            orthofinder_cluster, args.og_dir, str(root / "01_mmseqs"), cfg, logger,
+            step_log_dir=root / "01_mmseqs", step_log_name="orthofinder-cluster",
+            resume=resume)
+
+        proteins_combined = str(root / "01_mmseqs/proteins_combined.faa")
+
+        _timed_step_of("Step 2/9: Building profiles",
+            build_profiles, proteins_combined, str(root / "01_mmseqs/subfamily_map.tsv"),
+            str(root / "02_profiles"), cfg, logger,
+            step_log_dir=root / "02_profiles", step_log_name="build-profiles",
+            resume=resume)
+
+        _timed_step_of("Step 3/9: Embedding subfamily representatives",
+            embed, str(root / "01_mmseqs/subfamily_reps.faa"), str(root / "04_embeddings"),
+            cfg, args.weights_path, logger,
+            step_log_dir=root / "04_embeddings", step_log_name="embed",
+            resume=resume)
+
+        _timed_step_of("Step 4/9: Computing KNN edges",
+            knn, str(root / "04_embeddings/embeddings.npy"), str(root / "04_embeddings/ids.txt"),
+            str(root / "04_embeddings/lengths.tsv"),
+            str(root / "04_embeddings/embedding_knn_edges.tsv"),
+            cfg,
+            step_log_dir=root / "04_embeddings", step_log_name="knn",
+            logger=logger, resume=resume,
+            subfamily_map=str(root / "01_mmseqs/subfamily_map.tsv"))
+
+        _timed_step_of("Step 5/9: Computing HMM-HMM edges",
+            hmm_hmm_edges, str(root / "02_profiles/subfamily_profile_index.tsv"),
+            str(root / "03_hmm_hmm_edges"), cfg, logger,
+            str(root / "04_embeddings/embedding_knn_edges.tsv"),
+            step_log_dir=root / "03_hmm_hmm_edges", step_log_name="hmm-hmm-edges",
+            mode=getattr(args, "hmm_mode", None), resume=resume,
+            shard_id=getattr(args, "shard_id", 0), n_shards=getattr(args, "n_shards", 1))
+
+        _timed_step_of("Step 6/9: Merging graphs",
+            merge_graph,
+            str(root / "03_hmm_hmm_edges/hmm_hmm_edges_core.tsv"),
+            str(root / "04_embeddings/embedding_knn_edges.tsv"),
+            str(root / "06_family_clustering/merged_edges_strict.tsv"),
+            str(root / "06_family_clustering/merged_edges_functional.tsv"),
+            cfg,
+            str(root / "03_hmm_hmm_edges/hmm_hmm_edges_relaxed.tsv"),
+            step_log_dir=root / "06_family_clustering", step_log_name="merge-graph",
+            logger=logger,
+            resume=resume,
+        )
+
+        _timed_step_of("Step 7/9: Clustering families",
+            cluster_families,
+            str(root / "06_family_clustering/merged_edges_strict.tsv"),
+            str(root / "06_family_clustering/merged_edges_functional.tsv"),
+            str(root / "01_mmseqs/subfamily_map.tsv"),
+            str(root / "06_family_clustering"),
+            cfg,
+            "leiden",
+            step_log_dir=root / "06_family_clustering", step_log_name="cluster-families",
+            logger=logger,
+            resume=resume,
+        )
+
+        _timed_step_of("Step 8a/9: Mapping proteins to families",
+            map_proteins_to_families,
+            proteins_combined,
+            str(root / "06_family_clustering/subfamily_to_family_strict.tsv"),
+            str(root / "06_family_clustering/subfamily_to_family_functional.tsv"),
+            str(root / "01_mmseqs/subfamily_map.tsv"),
+            str(root / "05_domain_hits"),
+            cfg,
+            logger,
+            step_log_dir=root / "05_domain_hits", step_log_name="map-proteins-to-families",
+            resume=resume,
+        )
+
+        _timed_step_of("Step 8b/9: Writing matrices",
+            write_matrices,
+            str(root / "01_mmseqs/subfamily_map.tsv"),
+            str(root / "05_domain_hits/protein_family_segments.tsv"),
+            str(root / "07_membership_matrices"),
+            cfg,
+            step_log_dir=root / "07_membership_matrices", step_log_name="write-matrices",
+            logger=logger,
+            resume=resume,
+        )
+
+        _timed_step_of("Step 9/9: Generating QC plots",
+            generate_qc_plots, args.results_root, logger,
+            step_log_dir=root / "qc_plots", step_log_name="qc-plots",
+            resume=resume)
+
+        logger.info("Pipeline completed successfully")
+
     write_manifest(
         Path(args.results_root) / "manifests" / "run_manifest.json",
         {"command": cmd, **vars(args)},
         manifest_tools,
-        [getattr(args, "proteins_fasta", "")],
+        [getattr(args, "og_dir", None) or getattr(args, "proteins_fasta", "")],
     )
 
 
