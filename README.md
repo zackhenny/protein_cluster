@@ -92,17 +92,19 @@ See [`docs/config.template.yaml`](docs/config.template.yaml) for the full list.
 ## CLI commands
 
 ```
-plm_cluster mmseqs-cluster       # Step 1
-plm_cluster build-profiles       # Step 2
-plm_cluster embed                # Step 3
-plm_cluster knn                  # Step 4
-plm_cluster hmm-hmm-edges        # Step 5
-plm_cluster merge-graph          # Step 6
-plm_cluster cluster-families     # Step 7
+plm_cluster mmseqs-cluster            # Step 1 (standard)
+plm_cluster orthofinder-cluster       # Step 1 (OrthoFinder mode)
+plm_cluster build-profiles            # Step 2
+plm_cluster embed                     # Step 3
+plm_cluster knn                       # Step 4
+plm_cluster hmm-hmm-edges             # Step 5
+plm_cluster merge-graph               # Step 6
+plm_cluster cluster-families          # Step 7
 plm_cluster map-proteins-to-families  # Step 8
-plm_cluster write-matrices       # Step 9
-plm_cluster qc-plots             # Generate QC figures
-plm_cluster run-all              # Run everything end-to-end
+plm_cluster write-matrices            # Step 9
+plm_cluster qc-plots                  # Generate QC figures
+plm_cluster run-all                   # Run everything end-to-end (standard)
+plm_cluster run-all-orthofinder       # Run everything end-to-end (OrthoFinder mode)
 ```
 
 To see all options for a subcommand, use `--help`:
@@ -110,10 +112,80 @@ To see all options for a subcommand, use `--help`:
 ```bash
 plm_cluster hmm-hmm-edges --help
 plm_cluster run-all --help
+plm_cluster run-all-orthofinder --help
 ```
 
 Backward-compatible aliases: `cluster` → `cluster-families`,
 `map-proteins` → `map-proteins-to-families`.
+
+## OrthoFinder integration
+
+`plm_cluster` can use [OrthoFinder](https://github.com/OrthoFinder/OrthoFinder)
+output as its starting point.  Instead of running global MMseqs2 clustering
+(Step 1), proteins are pre-grouped by their HOG or OG membership and then
+**subclustered within each group**.  Steps 2–9 run unchanged.
+
+### Why integrate OrthoFinder?
+
+| Benefit | Details |
+|---------|---------|
+| Orthology-aware subfamilies | Proteins in the same HOG are already orthologous; subclustering separates recent paralogs (lineage-specific expansions) into distinct subfamilies |
+| Lower sequence-identity threshold | Within-HOG proteins diverge across species; the default `subcluster_min_seq_id: 0.4` is intentionally lower than the global `mmseqs.min_seq_id: 0.6` |
+| Cross-HOG edges preserved | HMM-HMM edges (Step 5) still compare across all HOGs, revealing domain sharing, convergent evolution, and fusion events |
+| Biological provenance | `og_subfamily_map.tsv` maps every subfamily back to its source OG for downstream phylogenetic and functional analyses |
+
+### Quick start
+
+```bash
+# 1. Run OrthoFinder on your proteomes (produces HOG FASTA files)
+orthofinder -f proteomes/ -t 16
+
+# 2. Point plm_cluster at the N0 HOG directory (root-level, non-redundant)
+plm_cluster run-all-orthofinder \
+  --og_dir OrthoFinder/Results_*/Phylogenetic_Hierarchical_Orthogroups/N0/ \
+  --weights_path /path/to/esm2_t33_650M_UR50D.pt \
+  --config config.yaml \
+  --results_root results
+```
+
+Or use OG sequences instead of HOGs:
+
+```bash
+plm_cluster run-all-orthofinder \
+  --og_dir OrthoFinder/Results_*/Orthogroup_Sequences/ \
+  --weights_path /path/to/esm2_t33_650M_UR50D.pt \
+  --results_root results
+```
+
+### HOG level choice
+
+OrthoFinder writes HOGs at every node of the species tree:
+
+| Directory | Level | Recommendation |
+|-----------|-------|---------------|
+| `N0/` | Species-tree root | **Broadest non-redundant set; equivalent to OGs.  Recommended starting point.** |
+| `N1/`, `N2/`, … | Internal nodes | Finer pre-grouping; use when you want to restrict subclustering to a specific clade |
+| Leaf directories | Species-specific | Very fine; most subfamilies will be singletons |
+
+### New output files
+
+```
+results/01_mmseqs/
+  subfamily_map.tsv        # Same format as standard run (protein_id, subfamily_id, is_rep)
+  subfamily_reps.faa       # One representative per subfamily
+  subfamily_stats.tsv      # Per-subfamily member count, rep ID, rep length
+  proteins_combined.faa    # All proteins from all HOGs/OGs (used by downstream steps)
+  og_subfamily_map.tsv     # Provenance: (subfamily_id, og_id) — NEW
+```
+
+### New config keys (`orthofinder` section)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `subcluster_min_seq_id` | `0.4` | Min sequence identity within an OG for subclustering |
+| `subcluster_coverage` | `0.8` | Min alignment coverage for within-OG subclustering |
+| `subcluster_cov_mode` | `1` | MMseqs2 coverage mode (0=query, 1=target, 2=bidirectional) |
+| `min_og_size_for_subclustering` | `2` | OGs smaller than this skip MMseqs2; each protein becomes a singleton subfamily |
 
 ## Resuming interrupted runs and progress logging
 
