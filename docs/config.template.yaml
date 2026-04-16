@@ -34,7 +34,10 @@ mmseqs:
   cov_mode: 1                     # MMseqs2 coverage mode (0=query, 1=target, 2=bidirectional)
   evalue: 1e-3                    # E-value threshold for clustering
   sensitivity: 7.5                # Sensitivity (-s); ignored for linclust mode
-  threads: 16                     # CPU threads for MMseqs2 (and profile/edge workers)
+  # threads: CPU threads passed to each MMseqs2 invocation.
+  # Keep ≤ the physical cores allocated to a single SLURM task/job.
+  # This is DISTINCT from parallel_workers (number of concurrent jobs).
+  threads: 8
   tmpdir: tmp/mmseqs              # Temporary directory for MMseqs2
 
 # ---------------------------------------------------------------------------
@@ -43,6 +46,10 @@ mmseqs:
 # MSAs and HMM profiles are built for each subfamily.
 profiles:
   max_members_per_subfamily: 256  # Cap sequences per subfamily MSA to limit memory
+  # parallel_workers: number of subfamily profiles built concurrently.
+  # Distinct from mmseqs.threads (per-tool thread count).
+  # Recommended value: number of CPU cores in your SLURM allocation.
+  parallel_workers: 8
 
 # ---------------------------------------------------------------------------
 # Step 3 — HMM-HMM edge construction (hhalign / hhsearch)
@@ -57,6 +64,10 @@ hmm_hmm:
   #                    datasets (220K+ families), requires only mmseqs in PATH.
   mode: pairwise                  # "pairwise" | "db-search" | "mmseqs-profile"
   topN: 200                       # Max candidate neighbors per subfamily from KNN
+  # parallel_workers: number of concurrent hhalign/hhsearch jobs.
+  # Distinct from mmseqs.threads (per-tool thread count).
+  # Total CPUs ≈ parallel_workers × (1 for hhalign, or mmseqs.threads for hhsearch).
+  parallel_workers: 8
   # --- Core (strict) edge thresholds ---
   mincov_core: 0.70               # Min bidirectional alignment coverage [0-1]
   min_prob_core: 90               # Min HHalign probability [0-100]
@@ -80,6 +91,13 @@ embed:
   max_len: 2048                          # Max residues per sequence (truncate above)
   batch_size: 4                          # Sequences per forward pass
   device: cpu                            # "cpu" or "cuda" / "cuda:0" for GPU
+  # checkpoint_dir: directory to store per-batch embedding checkpoints.
+  # When set (non-empty), each completed batch is saved as a .npy file here.
+  # If the run is interrupted (OOM, timeout, node failure), re-running with
+  # --resume will reload completed batches and continue from the last one.
+  # Leave empty ("") to disable checkpointing (no overhead, no resumability).
+  # Recommended: set to a fast scratch directory on HPC (e.g. $TMPDIR/ckpt).
+  checkpoint_dir: ""
 
 # ---------------------------------------------------------------------------
 # Step 5 — Candidate neighbor generation (embedding space)
@@ -154,7 +172,9 @@ graph:
 mapping:
   search_mode: family_reps        # Search strategy (currently only family_reps)
   profile_cov_min: 0.70           # Min fraction of profile (target) covered [0-1]
-  min_prob: 90                    # Min percent identity to accept a hit [0-100]
+  # min_pident: minimum percent identity (0–100) to accept an mmseqs hit.
+  # Replaces the legacy key 'min_prob' (which is still accepted but deprecated).
+  min_pident: 0.0
   max_evalue: 1e-5                # Max E-value for mmseqs easy-search
   min_segment_len: 120            # Min alignment length (aa) to accept a segment
   max_overlap_aa: 30              # Max overlap (aa) between accepted segments
@@ -177,6 +197,15 @@ outputs:
 # group.  This preserves orthology context while separating recent paralogs
 # (lineage-specific expansions) into distinct subfamilies.
 #
+# Provenance chain
+# ----------------
+# Each output file contains the keys needed to reconstruct the full join:
+#
+#   protein_id  →  subfamily_id       via  01_mmseqs/subfamily_map.tsv
+#   subfamily_id → og_id              via  01_mmseqs/og_subfamily_map.tsv
+#   subfamily_id → strict_family_id   via  06_family_clustering/subfamily_to_family_strict.tsv
+#   subfamily_id → functional_family  via  06_family_clustering/subfamily_to_family_functional.tsv
+#
 # Point --og_dir at a directory of *.faa or *.fa files, e.g.:
 #   OrthoFinder/Results_*/Phylogenetic_Hierarchical_Orthogroups/N0/
 #   OrthoFinder/Results_*/Orthogroup_Sequences/
@@ -185,10 +214,48 @@ outputs:
 #   N0 (species-tree root) — broadest non-redundant set, closest to OGs.
 #   Leaf-level HOGs        — finer pre-grouping but can be very small.
 orthofinder:
-  subcluster_min_seq_id: 0.4    # Min seq identity within an OG [0-1]
-                                 # Lower than mmseqs.min_seq_id because within-HOG
-                                 # proteins are already orthologous; divergence is expected.
+  # subcluster_mode: which MMseqs2 algorithm to use within each HOG/OG.
+  #   "linclust" (default) — fast linear-time greedy clustering.  Scales to
+  #                          very large HOGs without memory explosion.
+  #   "cluster"            — sensitive quadratic-time clustering.  Better
+  #                          recall for small/divergent HOGs; also supports
+  #                          --cluster-reassign for improved membership.
+  #   "auto"               — use "cluster" for HOGs below
+  #                          auto_linclust_min_size members, "linclust" for
+  #                          larger ones.  The choice is logged per HOG.
+  subcluster_mode: linclust
+
+  # auto_linclust_min_size: HOGs at or above this member count switch to
+  # linclust when subcluster_mode is "auto".  Ignored for other modes.
+  auto_linclust_min_size: 1000
+
+  # --- Sequence identity / coverage thresholds ----------------------------
+  # Lower than mmseqs.min_seq_id because proteins within a HOG are already
+  # orthologous; more divergence is expected and desirable to cluster.
+  subcluster_min_seq_id: 0.4    # Min sequence identity within an OG [0-1]
   subcluster_coverage: 0.8      # Min alignment coverage for within-OG subclustering [0-1]
   subcluster_cov_mode: 1        # MMseqs2 coverage mode (0=query, 1=target, 2=bidirectional)
-  min_og_size_for_subclustering: 2  # OGs with fewer members skip MMseqs2;
-                                     # each protein becomes its own singleton subfamily.
+
+  # subcluster_alignment_mode: MMseqs2 --alignment-mode value.
+  #   0 = automatic, 1 = score only, 2 = score + end positions,
+  #   3 = score + full alignment (default; required for cluster-reassign).
+  # Ignored for linclust mode.
+  subcluster_alignment_mode: 3
+
+  # subcluster_cluster_reassign: pass --cluster-reassign to mmseqs cluster.
+  # Improves cluster membership by reassigning border-zone members to their
+  # nearest cluster centre.  Only valid for "cluster" mode; silently ignored
+  # for "linclust" (which does not support this flag).
+  subcluster_cluster_reassign: false
+
+  # min_og_size_for_subclustering: OGs with fewer members skip MMseqs2 and
+  # each protein is assigned its own singleton subfamily.
+  min_og_size_for_subclustering: 2
+
+  # --- Concurrency controls -------------------------------------------------
+  # subcluster_threads: CPU threads passed to each MMseqs2 OG invocation.
+  # parallel_og_workers: number of OGs subclustered concurrently.
+  # Total CPU use ≈ parallel_og_workers × subcluster_threads.
+  # Keep within the core count of your SLURM allocation to avoid oversubscription.
+  subcluster_threads: 4
+  parallel_og_workers: 4

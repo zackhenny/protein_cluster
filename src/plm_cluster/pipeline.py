@@ -381,8 +381,17 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
     min_seq_id = float(of_cfg.get("subcluster_min_seq_id", 0.4))
     coverage = float(of_cfg.get("subcluster_coverage", 0.8))
     cov_mode = int(of_cfg.get("subcluster_cov_mode", 1))
+    alignment_mode = int(of_cfg.get("subcluster_alignment_mode", 3))
+    cluster_reassign = bool(of_cfg.get("subcluster_cluster_reassign", False))
+    subcluster_mode = str(of_cfg.get("subcluster_mode", "linclust")).lower()
+    auto_linclust_min_size = int(of_cfg.get("auto_linclust_min_size", 1000))
     min_og_size = int(of_cfg.get("min_og_size_for_subclustering", 2))
-    threads = str(config.get("mmseqs", {}).get("threads", 8))
+    # per-OG MMseqs2 thread count (subcluster_threads) and number of OGs
+    # processed concurrently (parallel_og_workers) are kept separate so that
+    # total CPU load = parallel_og_workers × subcluster_threads.
+    og_threads = str(int(of_cfg.get("subcluster_threads",
+                         config.get("mmseqs", {}).get("threads", 4))))
+    parallel_ogs = int(of_cfg.get("parallel_og_workers", 4))
     tmpdir = _ensure_dir(config.get("mmseqs", {}).get("tmpdir", "tmp/mmseqs"))
 
     og_dir_path = Path(og_dir)
@@ -402,43 +411,48 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
             "Please point --og_dir at a directory of OrthoFinder HOG or OG FASTA files."
         )
 
-    logger.info("OrthoFinder subclustering: found %d OG/HOG FASTA files in %s", len(og_files), og_dir)
+    logger.info(
+        "OrthoFinder subclustering: found %d OG/HOG FASTA files in %s "
+        "(mode=%s, parallel_og_workers=%d, subcluster_threads=%s)",
+        len(og_files), og_dir, subcluster_mode, parallel_ogs, og_threads,
+    )
 
-    all_rows: list[dict] = []
-    og_subfamily_rows: list[dict] = []
-    rep_records: list[FastaRecord] = []
-    combined_seqs: list[FastaRecord] = []
-
-    n_singletons = 0
-
-    for og_file in og_files:
-        # Derive a clean OG identifier from the filename stem
-        og_stem = og_file.stem  # e.g. "N0.HOG0000001" or "OG0000001"
+    # ------------------------------------------------------------------
+    # Per-OG worker function (may run in a thread pool)
+    # ------------------------------------------------------------------
+    def _process_og(og_file: Path) -> tuple[list[dict], list[dict], list[FastaRecord], list[FastaRecord], int]:
+        """Process a single OG FASTA → (all_rows, og_subfam_rows, rep_records, combined_seqs, n_singletons)."""
+        og_stem = og_file.stem
         og_id = _sanitize_id(og_stem)
 
         records = read_fasta(str(og_file))
         if not records:
             logger.warning("OG file %s is empty, skipping.", str(og_file))
-            continue
-
-        # Accumulate all proteins for proteins_combined.faa
-        for rec in records:
-            combined_seqs.append(rec)
+            return [], [], [], [], 0
 
         seqs = {r.id: r.seq for r in records}
         sorted_protein_ids = sorted(seqs.keys())
+        combined = list(records)
 
         if len(records) < min_og_size:
-            # Singleton / below-threshold path: each protein → its own subfamily
+            rows: list[dict] = []
+            og_rows: list[dict] = []
+            reps: list[FastaRecord] = []
             for i, pid in enumerate(sorted_protein_ids):
                 subfam_id = f"{og_id}_subfam_{i:06d}"
-                all_rows.append({"protein_id": pid, "subfamily_id": subfam_id, "is_rep": 1})
-                og_subfamily_rows.append({"subfamily_id": subfam_id, "og_id": og_stem})
-                rep_records.append(FastaRecord(subfam_id, seqs[pid]))
-            n_singletons += len(records)
-            continue
+                rows.append({"protein_id": pid, "subfamily_id": subfam_id, "is_rep": 1})
+                og_rows.append({"subfamily_id": subfam_id, "og_id": og_stem})
+                reps.append(FastaRecord(subfam_id, seqs[pid]))
+            return rows, og_rows, reps, combined, len(records)
 
-        # Normal path: run MMseqs2 linclust on this OG
+        # Determine effective clustering algorithm for this OG
+        if subcluster_mode == "auto":
+            effective_algo = "linclust" if len(records) >= auto_linclust_min_size else "cluster"
+            logger.info("OG %s: %d members → using mmseqs %s (auto_linclust_min_size=%d)",
+                        og_stem, len(records), effective_algo, auto_linclust_min_size)
+        else:
+            effective_algo = subcluster_mode  # "linclust" or "cluster"
+
         with tempfile.TemporaryDirectory(dir=str(tmpdir)) as og_tmp:
             og_tmp_path = Path(og_tmp)
             fa_path = og_tmp_path / "og.faa"
@@ -451,13 +465,21 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
             rep_faa = og_tmp_path / "reps.faa"
 
             run_cmd([tools["mmseqs"], "createdb", str(fa_path), str(db)], logger)
-            run_cmd([
-                tools["mmseqs"], "linclust", str(db), str(clu), str(og_tmp_path / "mmseqs_tmp"),
+
+            cluster_cmd = [
+                tools["mmseqs"], effective_algo, str(db), str(clu),
+                str(og_tmp_path / "mmseqs_tmp"),
                 "--min-seq-id", str(min_seq_id),
                 "-c", str(coverage),
                 "--cov-mode", str(cov_mode),
-                "--threads", threads,
-            ], logger)
+                "--threads", og_threads,
+            ]
+            if effective_algo == "cluster":
+                cluster_cmd += ["--alignment-mode", str(alignment_mode)]
+                if cluster_reassign:
+                    cluster_cmd += ["--cluster-reassign"]
+            run_cmd(cluster_cmd, logger)
+
             run_cmd([tools["mmseqs"], "createtsv", str(db), str(db), str(clu), str(tsv)], logger)
             run_cmd([tools["mmseqs"], "result2repseq", str(db), str(clu), str(rep_db)], logger)
             run_cmd([tools["mmseqs"], "result2flat", str(db), str(db), str(rep_db), str(rep_faa)], logger)
@@ -467,23 +489,59 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
             reps_sorted = sorted(raw["rep_protein_id"].unique().to_list())
             rep_to_sub = {r: f"{og_id}_subfam_{i:06d}" for i, r in enumerate(reps_sorted)}
 
-            # Read representative sequences from MMseqs2 output
             rep_seqs = {r.id: r.seq for r in read_fasta(str(rep_faa))}
 
+            og_rows_inner: list[dict] = []
+            reps_inner: list[FastaRecord] = []
             for rep_pid, subfam_id in rep_to_sub.items():
-                og_subfamily_rows.append({"subfamily_id": subfam_id, "og_id": og_stem})
-                # Prefer the original record; fall back to MMseqs2 result2flat output
+                og_rows_inner.append({"subfamily_id": subfam_id, "og_id": og_stem})
                 seq = seqs[rep_pid] if rep_pid in seqs else rep_seqs.get(rep_pid, "")
-                rep_records.append(FastaRecord(subfam_id, seq))
+                reps_inner.append(FastaRecord(subfam_id, seq))
 
+            rows_inner: list[dict] = []
             for row in raw.iter_rows(named=True):
                 subfam_id = rep_to_sub[row["rep_protein_id"]]
                 is_rep = 1 if row["rep_protein_id"] == row["protein_id"] else 0
-                all_rows.append({
+                rows_inner.append({
                     "protein_id": row["protein_id"],
                     "subfamily_id": subfam_id,
                     "is_rep": is_rep,
                 })
+
+        return rows_inner, og_rows_inner, reps_inner, combined, 0
+
+    # ------------------------------------------------------------------
+    # Process all OGs (optionally in parallel)
+    # ------------------------------------------------------------------
+    all_rows: list[dict] = []
+    og_subfamily_rows: list[dict] = []
+    rep_records: list[FastaRecord] = []
+    combined_seqs: list[FastaRecord] = []
+    n_singletons = 0
+
+    if parallel_ogs > 1 and len(og_files) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_ogs) as pool:
+            future_map = {pool.submit(_process_og, f): f for f in og_files}
+            for fut in concurrent.futures.as_completed(future_map):
+                og_file = future_map[fut]
+                try:
+                    rows, og_rows, reps, combined, n_sing = fut.result()
+                except Exception as exc:
+                    logger.error("OG processing FAILED for %s: %s", str(og_file), exc)
+                    continue
+                all_rows.extend(rows)
+                og_subfamily_rows.extend(og_rows)
+                rep_records.extend(reps)
+                combined_seqs.extend(combined)
+                n_singletons += n_sing
+    else:
+        for og_file in og_files:
+            rows, og_rows, reps, combined, n_sing = _process_og(og_file)
+            all_rows.extend(rows)
+            og_subfamily_rows.extend(og_rows)
+            rep_records.extend(reps)
+            combined_seqs.extend(combined)
+            n_singletons += n_sing
 
     if not all_rows:
         raise RuntimeError("orthofinder_cluster: no proteins were processed. Check input FASTA files.")
@@ -570,6 +628,13 @@ def build_profiles(
         }
 
     threads = int(config.get("mmseqs", {}).get("threads", 8))
+    # parallel_workers governs concurrent profile build jobs; distinct from
+    # per-tool thread counts.  Falls back to profiles.parallel_workers, then
+    # to mmseqs.threads for backward compatibility.
+    parallel_workers = int(
+        config.get("profiles", {}).get("parallel_workers",
+        config.get("mmseqs", {}).get("threads", 8))
+    )
     rows: list[dict] = []
 
     agg = (
@@ -602,7 +667,7 @@ def build_profiles(
         pending_subfams = list(subfam_members.items())
 
     failed: list[str] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_workers) as executor:
         future_to_subfam: dict[concurrent.futures.Future, str] = {}
         for subfam, members in pending_subfams:
             fut = executor.submit(_process_subfam, subfam, members)
@@ -920,6 +985,13 @@ def hmm_hmm_edges(
         }
 
     threads = int(config.get("mmseqs", {}).get("threads", 8))
+    # parallel_workers: concurrent hhalign/hhsearch jobs.  Distinct from
+    # per-tool thread counts.  Falls back to hmm_hmm.parallel_workers, then
+    # mmseqs.threads for backward compatibility.
+    parallel_workers = int(
+        config.get("hmm_hmm", {}).get("parallel_workers",
+        config.get("mmseqs", {}).get("threads", 8))
+    )
 
     # ------------------------------------------------------------------
     # Pairwise mode
@@ -934,7 +1006,7 @@ def hmm_hmm_edges(
             run_cmd([tools["hhalign"], "-i", hhm[q], "-t", hhm[t], "-o", str(out_hhr)], logger)
             return _make_row(q, t, _parse_hhr_metrics(out_hhr), "hhalign")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_workers) as executor:
             future_to_pair: dict[concurrent.futures.Future, tuple[str, str]] = {}
             for q, t in pending_cands:
                 fut = executor.submit(_process_hh_edge, q, t)
@@ -1024,8 +1096,8 @@ def hmm_hmm_edges(
             if any((q, t) not in processed and (t, q) not in processed for t in query_to_targets[q])
         )
 
-        logger.info("Running hhsearch (parallel, %d threads) for %d unique query profiles",
-                    threads, len(pending_queries))
+        logger.info("Running hhsearch (parallel, %d workers, %d threads/query) for %d unique query profiles",
+                    parallel_workers, threads, len(pending_queries))
 
         raw_rows_db: list[dict] = []
         failed_queries: list[str] = []
@@ -1047,7 +1119,7 @@ def hmm_hmm_edges(
             except Exception as exc:
                 return q, [], exc
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_workers) as executor:
             future_to_q: dict[concurrent.futures.Future, str] = {
                 executor.submit(_do_hhsearch, q): q for q in pending_queries
             }
@@ -1168,7 +1240,15 @@ def hmm_hmm_edges(
 
 
 def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, logger, resume: bool = False) -> None:
-    """Step 4: Generate ESM-2 mean-pooled embeddings for subfamily representatives."""
+    """Step 4: Generate ESM-2 mean-pooled embeddings for subfamily representatives.
+
+    Supports mid-run resumability via per-batch checkpoints.  If
+    ``embed.checkpoint_dir`` is set (non-empty), each completed batch is
+    persisted as a ``.npy`` file under that directory.  On a subsequent call
+    with ``resume=True`` the function reloads any already-computed batches and
+    skips them, so an OOM or timeout mid-run does not require restarting from
+    scratch.
+    """
     out_path = Path(outdir) / "embeddings.npy"
     if resume and out_path.exists():
         logger.info("Resume: embeddings already exist at %s, skipping.", str(out_path))
@@ -1185,6 +1265,13 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
         raise RuntimeError(f"weights_path does not exist: {weights_path}")
 
     out = _ensure_dir(outdir)
+
+    # ------------------------------------------------------------------ #
+    # Checkpoint directory for mid-run resumability                       #
+    # ------------------------------------------------------------------ #
+    ckpt_dir_str = str(config["embed"].get("checkpoint_dir", ""))
+    ckpt_dir: Path | None = _ensure_dir(ckpt_dir_str) if ckpt_dir_str else None
+
     recs = sorted(read_fasta(reps_fasta), key=lambda x: x.id)
 
     import functools
@@ -1232,22 +1319,54 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
             "Check your FASTA file and long_seq_policy / max_len settings."
         )
 
-    embs = []
     total_batches = (len(seqs) + batch_size - 1) // batch_size
-    logger.info("Processing %d sequences in %d batches of size %d", len(seqs), total_batches, batch_size)
 
-    for i in range(0, len(seqs), batch_size):
+    # Check for already-completed checkpoints when resuming
+    embs: list[np.ndarray] = []
+    start_batch = 0
+    if resume and ckpt_dir is not None:
+        for batch_num in range(total_batches):
+            ckpt_file = ckpt_dir / f"embed_batch_{batch_num:06d}.npy"
+            if ckpt_file.exists():
+                try:
+                    loaded = np.load(str(ckpt_file))
+                    embs.append(loaded)
+                    start_batch = batch_num + 1
+                except Exception as exc:
+                    logger.warning("Could not load checkpoint %s: %s", str(ckpt_file), exc)
+                    break
+            else:
+                break
+        if start_batch > 0:
+            logger.info(
+                "Resume: loaded %d completed embedding batches from %s, continuing from batch %d/%d",
+                start_batch, str(ckpt_dir), start_batch + 1, total_batches,
+            )
+
+    logger.info(
+        "Processing %d sequences in %d batches of size %d (starting from batch %d)",
+        len(seqs), total_batches, batch_size, start_batch + 1,
+    )
+
+    for i in range(start_batch * batch_size, len(seqs), batch_size):
         batch = seqs[i:i + batch_size]
-        batch_num = i // batch_size + 1
-        logger.info("Processing batch %d/%d (%d sequences)", batch_num, total_batches, len(batch))
+        batch_num = i // batch_size
+        logger.info("Processing batch %d/%d (%d sequences)", batch_num + 1, total_batches, len(batch))
         labels, strs, toks = batch_converter(batch)
         toks = toks.to(device)
         with torch.no_grad():
             outp = model(toks, repr_layers=[model.num_layers], return_contacts=False)
         reps = outp["representations"][model.num_layers]
-        for j, seq in enumerate(strs):
-            L = len(seq)
-            embs.append(reps[j, 1: L + 1].mean(0).cpu().numpy())
+        batch_embs = np.vstack([
+            reps[j, 1: len(seq) + 1].mean(0).cpu().numpy()
+            for j, seq in enumerate(strs)
+        ]).astype(np.float32)
+        embs.append(batch_embs)
+
+        if ckpt_dir is not None:
+            ckpt_file = ckpt_dir / f"embed_batch_{batch_num:06d}.npy"
+            np.save(str(ckpt_file), batch_embs)
+
         del toks, outp, reps
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1270,6 +1389,12 @@ def embed(reps_fasta: str, outdir: str, config: dict, weights_path: str | None, 
             "dim": int(mat.shape[1]),
         }, indent=2)
     )
+
+    # Clean up checkpoints now that the final file is written
+    if ckpt_dir is not None:
+        for batch_num in range(total_batches):
+            ckpt_file = ckpt_dir / f"embed_batch_{batch_num:06d}.npy"
+            ckpt_file.unlink(missing_ok=True)
 
 
 def knn(
@@ -1505,6 +1630,62 @@ def cluster_families(
         pl.col("community").map_elements(lambda x: f"famF_{int(x):06d}", return_dtype=pl.String).alias("family_id")
     )
 
+    # ------------------------------------------------------------------ #
+    # Preserve edge-less subfamilies as singleton families                #
+    # Every subfamily in subfamily_map.tsv must appear in the output.    #
+    # Subfamilies that have no retained graph edges are not assigned a   #
+    # community by Leiden, so we give each one a unique singleton family. #
+    # ------------------------------------------------------------------ #
+    smap = pl.read_csv(subfamily_map, separator="\t")
+    all_subfamilies: list[str] = sorted(smap["subfamily_id"].unique().to_list())
+
+    assigned_strict: set[str] = set(strict["subfamily_id"].to_list())
+    assigned_func: set[str] = set(func["subfamily_id"].to_list())
+
+    # Determine the next available community index for each tier so that
+    # singleton IDs never collide with graph-derived IDs.
+    next_strict_idx = (strict["community"].max() + 1) if len(strict) > 0 else 0
+    next_func_idx = (func["community"].max() + 1) if len(func) > 0 else 0
+
+    singleton_strict_rows: list[dict] = []
+    singleton_func_rows: list[dict] = []
+    for subfam in all_subfamilies:
+        if subfam not in assigned_strict:
+            singleton_strict_rows.append({
+                "subfamily_id": subfam,
+                "community": next_strict_idx,
+                "family_id": f"famS_{next_strict_idx:06d}",
+            })
+            next_strict_idx += 1
+        if subfam not in assigned_func:
+            singleton_func_rows.append({
+                "subfamily_id": subfam,
+                "community": next_func_idx,
+                "family_id": f"famF_{next_func_idx:06d}",
+            })
+            next_func_idx += 1
+
+    if singleton_strict_rows:
+        strict = pl.concat([
+            strict,
+            pl.DataFrame(singleton_strict_rows),
+        ]).sort("subfamily_id")
+        if logger:
+            logger.info(
+                "cluster-families (strict): %d edge-less subfamilies assigned singleton family IDs",
+                len(singleton_strict_rows),
+            )
+    if singleton_func_rows:
+        func = pl.concat([
+            func,
+            pl.DataFrame(singleton_func_rows),
+        ]).sort("subfamily_id")
+        if logger:
+            logger.info(
+                "cluster-families (functional): %d edge-less subfamilies assigned singleton family IDs",
+                len(singleton_func_rows),
+            )
+
     strict_out = strict.select(["subfamily_id", "family_id"]).with_columns(
         pl.lit(method).alias("method"),
         pl.lit(json.dumps({"resolution": config["graph"]["leiden_resolution_strict"], "seed": config["graph"]["seed"]})).alias("method_params_json"),
@@ -1520,7 +1701,6 @@ def cluster_families(
     )
     func_out.write_csv(out / "subfamily_to_family_functional.tsv", separator="\t")
 
-    smap = pl.read_csv(subfamily_map, separator="\t")
     for tag, sdf in [("strict", strict_out), ("functional", func_out)]:
         st = sdf.group_by("family_id").agg(pl.col("subfamily_id").len().alias("n_subfamilies"))
         prot = (
@@ -1590,8 +1770,19 @@ def map_proteins_to_families(
     else:
         df = pl.DataFrame(schema={c: pl.String for c in _cols})
 
+    import warnings
     min_cov = float(config["mapping"]["profile_cov_min"])
-    min_pident = float(config["mapping"].get("min_prob", 0.0))
+    # Support both min_pident (canonical) and legacy min_prob
+    mapping_cfg = config["mapping"]
+    if "min_prob" in mapping_cfg and "min_pident" not in mapping_cfg:
+        warnings.warn(
+            "Config key 'mapping.min_prob' is deprecated. Use 'mapping.min_pident' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        min_pident = float(mapping_cfg["min_prob"])
+    else:
+        min_pident = float(mapping_cfg.get("min_pident", 0.0))
     min_seg_len = int(config["mapping"].get("min_segment_len", 0))
     if len(df) > 0:
         df = df.with_columns([

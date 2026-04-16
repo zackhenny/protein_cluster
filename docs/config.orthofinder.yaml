@@ -1,0 +1,189 @@
+# ============================================================================
+# plm-cluster — OrthoFinder mode configuration
+# ============================================================================
+# Use this template when running:
+#   plm_cluster orthofinder-cluster  --config config.orthofinder.yaml
+#   plm_cluster run-all-orthofinder  --config config.orthofinder.yaml
+#
+# This file is tuned for within-HOG subfamily splitting.
+# Copy and edit to taste.  Any key omitted here falls back to built-in defaults.
+#
+# Typical invocation
+# ------------------
+# plm_cluster run-all-orthofinder \
+#   --og_dir OrthoFinder/Results_*/Phylogenetic_Hierarchical_Orthogroups/N0/ \
+#   --weights_path /path/to/esm2_t33_650M_UR50D.pt \
+#   --config config.orthofinder.yaml \
+#   --resume
+
+seed: 42
+
+# ---------------------------------------------------------------------------
+# External tool paths (leave "" to auto-detect from $PATH)
+# ---------------------------------------------------------------------------
+tools:
+  mmseqs_path: ""
+  hhmake_path: ""
+  hhalign_path: ""                # Required for hmm_hmm.mode: pairwise (default)
+  hhsearch_path: ""               # Required for hmm_hmm.mode: db-search
+  ffindex_build_path: ""          # Required for hmm_hmm.mode: db-search
+  cstranslate_path: ""            # Required for hmm_hmm.mode: db-search
+  mafft_path: ""
+  mcl_path: ""
+
+# ---------------------------------------------------------------------------
+# OrthoFinder subclustering — Step 1 replacement
+# ---------------------------------------------------------------------------
+# OrthoFinder groups proteins into HOGs/OGs by orthology.  plm-cluster then
+# subcluster each group independently to split recent paralogs (lineage-
+# specific expansions) into distinct subfamilies.
+#
+# Provenance chain (easy to join downstream)
+# ------------------------------------------
+#   protein_id  →  subfamily_id       via  01_mmseqs/subfamily_map.tsv
+#   subfamily_id → og_id              via  01_mmseqs/og_subfamily_map.tsv
+#   subfamily_id → strict_family_id   via  06_family_clustering/subfamily_to_family_strict.tsv
+#   subfamily_id → functional_family  via  06_family_clustering/subfamily_to_family_functional.tsv
+#
+# Recommended SQL join skeleton (using SQLite / DuckDB syntax):
+#   SELECT sm.protein_id, sm.subfamily_id, og.og_id,
+#          sf_s.family_id AS strict_family, sf_f.family_id AS functional_family
+#   FROM   subfamily_map                   sm
+#   JOIN   og_subfamily_map                og   USING (subfamily_id)
+#   LEFT JOIN subfamily_to_family_strict   sf_s USING (subfamily_id)
+#   LEFT JOIN subfamily_to_family_functional sf_f USING (subfamily_id)
+orthofinder:
+  # subcluster_mode controls which MMseqs2 algorithm runs within each HOG/OG.
+  #
+  #   "linclust"  – O(n) greedy clustering.  Fast, scales to millions of
+  #                 sequences.  Default and recommended for production runs.
+  #
+  #   "cluster"   – O(n²) sensitive clustering.  Better recall for divergent
+  #                 or small HOGs.  Supports --cluster-reassign.
+  #                 Use when HOG sizes are manageable (< a few thousand).
+  #
+  #   "auto"      – Hybrid: uses "cluster" for HOGs smaller than
+  #                 auto_linclust_min_size, "linclust" for larger ones.
+  #                 The choice is logged per HOG so you can audit it.
+  subcluster_mode: auto
+
+  # Threshold for "auto" mode: HOGs at or above this size use linclust.
+  auto_linclust_min_size: 1000
+
+  # --- Sequence identity / coverage ---
+  # These are lower than the global mmseqs defaults because within-HOG
+  # proteins are already homologous; more divergence is biologically expected.
+  subcluster_min_seq_id: 0.4      # [0-1]
+  subcluster_coverage: 0.8        # [0-1]
+  subcluster_cov_mode: 1          # 0=query, 1=target, 2=bidirectional
+
+  # --- cluster mode options (only apply when mode = "cluster" or "auto" chooses "cluster") ---
+  # subcluster_alignment_mode: 3 (full alignment) is required for cluster-reassign.
+  subcluster_alignment_mode: 3
+  # subcluster_cluster_reassign: reassign border-zone members to their nearest
+  # cluster center.  Only valid for "cluster" mode; silently ignored for linclust.
+  subcluster_cluster_reassign: true
+
+  # OGs smaller than this skip MMseqs2 entirely; each protein becomes its own
+  # singleton subfamily.  This ensures all proteins have a subfamily assignment.
+  min_og_size_for_subclustering: 2
+
+  # --- Concurrency knobs ---
+  # subcluster_threads: CPU threads per individual MMseqs2 OG invocation.
+  # parallel_og_workers: number of OGs processed concurrently.
+  # Total CPU load ≈ parallel_og_workers × subcluster_threads.
+  # Adjust to fit your SLURM --ntasks-per-node allocation.
+  subcluster_threads: 4
+  parallel_og_workers: 4
+
+# ---------------------------------------------------------------------------
+# Step 1 global MMseqs2 settings (used for tmpdir and threads by orthofinder)
+# ---------------------------------------------------------------------------
+mmseqs:
+  threads: 8                      # Per-tool thread count for non-OG MMseqs2 calls
+  tmpdir: tmp/mmseqs
+
+# ---------------------------------------------------------------------------
+# Step 2 — Profile construction
+# ---------------------------------------------------------------------------
+profiles:
+  max_members_per_subfamily: 256
+  # Separate from mmseqs.threads; controls concurrent MAFFT+hhmake jobs.
+  parallel_workers: 8
+
+# ---------------------------------------------------------------------------
+# Step 3 — HMM-HMM edges
+# ---------------------------------------------------------------------------
+hmm_hmm:
+  # Recommended for OrthoFinder mode: mmseqs-profile is fastest for large
+  # datasets; pairwise is more accurate for smaller ones.
+  mode: pairwise                  # "pairwise" | "db-search" | "mmseqs-profile"
+  # parallel_workers: concurrent hhalign/hhsearch jobs (pairwise/db-search mode).
+  # Separate from mmseqs.threads.
+  parallel_workers: 8
+  topN: 200
+  mincov_core: 0.70
+  min_prob_core: 90
+  max_evalue_core: 1e-5
+  min_aln_len_core: 120
+  mincov_relaxed: 0.60
+  min_prob_relaxed: 80
+  max_evalue_relaxed: 1e-3
+  min_aln_len_relaxed: 80
+
+# ---------------------------------------------------------------------------
+# Step 4 — ESM-2 embeddings
+# ---------------------------------------------------------------------------
+embed:
+  esm_model_name: esm2_t33_650M_UR50D
+  pooling: mean
+  long_seq_policy: truncate
+  max_len: 2048
+  batch_size: 4
+  device: cpu
+  # Set checkpoint_dir to enable mid-run resumability on OOM/timeout.
+  # Each completed batch is saved here; re-run with --resume to continue.
+  checkpoint_dir: ""              # e.g. "tmp/embed_checkpoints"
+
+# ---------------------------------------------------------------------------
+# Step 5 — KNN
+# ---------------------------------------------------------------------------
+knn:
+  mode: knn
+  k: 100
+  min_cosine: 0.35
+  min_len_ratio: 0.5
+  max_len_ratio: 2.0
+  device: cpu
+
+# ---------------------------------------------------------------------------
+# Step 6 — Graph merge & Leiden clustering
+# ---------------------------------------------------------------------------
+graph:
+  edge_weight_policy: downweight_embeddings
+  w_hmm: 1.0
+  w_emb: 0.35
+  weak_hmm_threshold: 0.2
+  leiden_resolution_strict: 0.7
+  leiden_resolution_functional: 1.0
+  seed: 42
+
+# ---------------------------------------------------------------------------
+# Step 7 — Protein-to-family mapping
+# ---------------------------------------------------------------------------
+mapping:
+  search_mode: family_reps
+  profile_cov_min: 0.70
+  # min_pident: minimum percent identity to accept an mmseqs hit [0-100].
+  # Legacy key 'min_prob' is still accepted but emits a deprecation warning.
+  min_pident: 0.0
+  max_evalue: 1e-5
+  min_segment_len: 120
+  max_overlap_aa: 30
+
+# ---------------------------------------------------------------------------
+# Output matrices
+# ---------------------------------------------------------------------------
+outputs:
+  write_dense_threshold: 2000000
+  write_matrix_market: true

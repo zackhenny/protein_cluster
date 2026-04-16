@@ -26,10 +26,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cov_mode": 1,
         "evalue": 1e-3,
         "sensitivity": 7.5,
+        # threads: CPU threads passed to each MMseqs2 / tool invocation.
+        # Keep this ≤ the physical cores allocated to a single job/task.
         "threads": 8,
         "tmpdir": "tmp/mmseqs",
     },
-    "profiles": {"max_members_per_subfamily": 256},
+    "profiles": {
+        "max_members_per_subfamily": 256,
+        # parallel_workers: number of subfamily profiles built concurrently.
+        # Distinct from mmseqs.threads (which controls per-tool parallelism).
+        # On HPC set this to the number of CPU cores in your allocation.
+        "parallel_workers": 8,
+    },
     "hmm_hmm": {
         "mode": "pairwise",
         "topN": 200,
@@ -41,6 +49,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "min_prob_relaxed": 80.0,
         "max_evalue_relaxed": 1e-3,
         "min_aln_len_relaxed": 80,
+        # parallel_workers: number of concurrent hhalign/hhsearch jobs.
+        # Distinct from mmseqs.threads.  Set to core count on HPC.
+        "parallel_workers": 8,
     },
     "embed": {
         "esm_model_name": "esm2_t33_650M_UR50D",
@@ -49,6 +60,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_len": 2048,
         "pooling": "mean",
         "device": "cpu",
+        # checkpoint_dir: directory to write per-batch embedding checkpoints.
+        # If set (and non-empty), the embedding step can resume after a crash
+        # or OOM by reloading already-computed batches from disk.
+        # Leave empty ("") to disable checkpointing.
+        "checkpoint_dir": "",
     },
     "knn": {
         "mode": "knn",
@@ -78,17 +94,41 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "mapping": {
         "search_mode": "family_reps",
         "profile_cov_min": 0.70,
-        "min_prob": 90.0,
+        # min_pident: minimum percent identity (0–100) to accept an mmseqs hit.
+        # Legacy key 'min_prob' is still accepted but emits a deprecation warning.
+        "min_pident": 0.0,
         "max_evalue": 1e-5,
         "min_segment_len": 120,
         "max_overlap_aa": 30,
     },
     "outputs": {"write_dense_threshold": 2_000_000, "write_matrix_market": True},
     "orthofinder": {
+        # subcluster_mode: MMseqs2 algorithm used within each HOG/OG.
+        #   "linclust" – fast linear-time clustering (default, good for most sizes)
+        #   "cluster"  – sensitive quadratic clustering; better recall for small HOGs
+        #   "auto"     – uses "cluster" for HOGs below auto_linclust_min_size,
+        #                 "linclust" for larger HOGs; logs the choice per HOG
+        "subcluster_mode": "linclust",
+        # auto_linclust_min_size: HOGs at or above this member count switch to
+        # linclust when subcluster_mode="auto".
+        "auto_linclust_min_size": 1000,
         "subcluster_min_seq_id": 0.4,
         "subcluster_coverage": 0.8,
         "subcluster_cov_mode": 1,
+        # subcluster_alignment_mode: MMseqs2 --alignment-mode value.
+        #   0 = automatic, 1 = only score, 2 = score + end positions,
+        #   3 = score + alignment (default; needed for cluster-reassign).
+        "subcluster_alignment_mode": 3,
+        # subcluster_cluster_reassign: pass --cluster-reassign to mmseqs cluster.
+        # Improves cluster membership by reassigning border members.
+        # Only valid for "cluster" mode (silently ignored for linclust).
+        "subcluster_cluster_reassign": False,
         "min_og_size_for_subclustering": 2,
+        # subcluster_threads: CPU threads per individual MMseqs2 OG invocation.
+        "subcluster_threads": 4,
+        # parallel_og_workers: how many OGs to subcluster concurrently.
+        # Total CPU load ≈ parallel_og_workers × subcluster_threads.
+        "parallel_og_workers": 4,
     },
 }
 
@@ -101,10 +141,12 @@ _RANGE_CHECKS: list[tuple[str, str, float, float]] = [
     ("mmseqs", "coverage", 0.0, 1.0),
     ("mmseqs", "evalue", 0.0, 1e6),
     ("mmseqs", "threads", 1, 1024),
+    ("profiles", "parallel_workers", 1, 1024),
     ("hmm_hmm", "mincov_core", 0.0, 1.0),
     ("hmm_hmm", "min_prob_core", 0.0, 100.0),
     ("hmm_hmm", "mincov_relaxed", 0.0, 1.0),
     ("hmm_hmm", "min_prob_relaxed", 0.0, 100.0),
+    ("hmm_hmm", "parallel_workers", 1, 1024),
     ("embed", "batch_size", 1, 512),
     ("embed", "max_len", 64, 100_000),
     ("knn", "k", 1, 100_000),
@@ -117,12 +159,16 @@ _RANGE_CHECKS: list[tuple[str, str, float, float]] = [
     ("graph", "leiden_resolution_strict", 0.01, 100.0),
     ("graph", "leiden_resolution_functional", 0.01, 100.0),
     ("mapping", "profile_cov_min", 0.0, 1.0),
-    ("mapping", "min_prob", 0.0, 100.0),
+    ("mapping", "min_pident", 0.0, 100.0),
     ("mapping", "max_overlap_aa", 0, 10_000),
     ("orthofinder", "subcluster_min_seq_id", 0.0, 1.0),
     ("orthofinder", "subcluster_coverage", 0.0, 1.0),
     ("orthofinder", "subcluster_cov_mode", 0, 5),
+    ("orthofinder", "subcluster_alignment_mode", 0, 4),
     ("orthofinder", "min_og_size_for_subclustering", 1, 1_000_000),
+    ("orthofinder", "auto_linclust_min_size", 1, 100_000_000),
+    ("orthofinder", "subcluster_threads", 1, 1024),
+    ("orthofinder", "parallel_og_workers", 1, 1024),
 ]
 
 _VALID_EMBED_DEVICES = {"cpu", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3"}
@@ -131,11 +177,18 @@ _VALID_LONG_SEQ_POLICIES = {"truncate", "skip", "full"}
 _VALID_HMM_MODES = {"pairwise", "db-search", "mmseqs-profile"}
 _VALID_KNN_MODES = {"knn", "rkcnn"}
 _VALID_RKCNN_WEIGHTINGS = {"separation", "uniform"}
+_VALID_OF_SUBCLUSTER_MODES = {"linclust", "cluster", "auto"}
 
 
 def validate_config(cfg: dict[str, Any]) -> list[str]:
-    """Return a list of human-readable validation errors (empty = OK)."""
+    """Return a list of human-readable validation errors (empty = OK).
+
+    Note: ``mapping.min_prob`` → ``mapping.min_pident`` normalization is
+    performed by :func:`load_config` before this function is called.  This
+    function only validates values that are already in their canonical form.
+    """
     errors: list[str] = []
+
     for section, key, lo, hi in _RANGE_CHECKS:
         val = cfg.get(section, {}).get(key)
         if val is not None:
@@ -174,6 +227,10 @@ def validate_config(cfg: dict[str, Any]) -> list[str]:
     if rkcnn_w and rkcnn_w not in _VALID_RKCNN_WEIGHTINGS:
         errors.append(f"knn.rkcnn_weighting='{rkcnn_w}' not in {_VALID_RKCNN_WEIGHTINGS}")
 
+    of_mode = cfg.get("orthofinder", {}).get("subcluster_mode", "")
+    if of_mode and of_mode not in _VALID_OF_SUBCLUSTER_MODES:
+        errors.append(f"orthofinder.subcluster_mode='{of_mode}' not in {_VALID_OF_SUBCLUSTER_MODES}")
+
     return errors
 
 
@@ -193,7 +250,13 @@ def load_config(path: str | None) -> dict[str, Any]:
     Only ``.yaml`` and ``.yml`` files are accepted.  Passing a ``.json`` file
     raises a ``ValueError`` with a clear message.
     Validates parameter ranges and raises ``ValueError`` on problems.
+
+    Backward compatibility
+    ----------------------
+    ``mapping.min_prob`` is accepted as a legacy alias for ``mapping.min_pident``.
+    A deprecation warning is emitted when it is used.
     """
+    import warnings
     if not path:
         return deepcopy(DEFAULT_CONFIG)
     p = Path(path)
@@ -209,6 +272,19 @@ def load_config(path: str | None) -> dict[str, Any]:
         )
     with p.open() as f:
         user = yaml.safe_load(f) or {}
+
+    # Emit deprecation warning for legacy mapping.min_prob before merging
+    user_mapping = user.get("mapping", {})
+    if "min_prob" in user_mapping and "min_pident" not in user_mapping:
+        warnings.warn(
+            "Config key 'mapping.min_prob' is deprecated and will be removed in a "
+            "future release.  Rename it to 'mapping.min_pident'.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        user_mapping["min_pident"] = user_mapping.pop("min_prob")
+        user["mapping"] = user_mapping
+
     cfg = _deep_merge(DEFAULT_CONFIG, user)
     errors = validate_config(cfg)
     if errors:
