@@ -146,6 +146,9 @@ def main() -> None:
     p.add_argument("--hmm-mode", default=None, dest="hmm_mode",
                    choices=["pairwise", "db-search", "mmseqs-profile"],
                    help="HMM-HMM execution mode for run-all (overrides config)")
+    p.add_argument("--knn-mode", default=None, dest="knn_mode",
+                   choices=["knn", "rkcnn"],
+                   help="KNN candidate generation mode for run-all (overrides config)")
     p.add_argument("--shard-id", type=int, default=0, dest="shard_id",
                    help="Shard index for the HMM-HMM step in run-all")
     p.add_argument("--n-shards", type=int, default=1, dest="n_shards",
@@ -170,6 +173,9 @@ def main() -> None:
     p.add_argument("--hmm-mode", default=None, dest="hmm_mode",
                    choices=["pairwise", "db-search", "mmseqs-profile"],
                    help="HMM-HMM execution mode (overrides config)")
+    p.add_argument("--knn-mode", default=None, dest="knn_mode",
+                   choices=["knn", "rkcnn"],
+                   help="KNN candidate generation mode (overrides config)")
     p.add_argument("--shard-id", type=int, default=0, dest="shard_id",
                    help="Shard index for the HMM-HMM step")
     p.add_argument("--n-shards", type=int, default=1, dest="n_shards",
@@ -188,6 +194,11 @@ def main() -> None:
     # Propagate CLI override into the config so downstream pipeline steps see it.
     if _cli_hmm_mode:
         cfg["hmm_hmm"]["mode"] = _cli_hmm_mode
+
+    # Propagate --knn-mode CLI override into the config so the KNN step sees it.
+    _cli_knn_mode = getattr(args, "knn_mode", None)
+    if _cli_knn_mode:
+        cfg["knn"]["mode"] = _cli_knn_mode
 
     manifest_tools: dict[str, str] = {}
     try:

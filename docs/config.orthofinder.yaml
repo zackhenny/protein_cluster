@@ -15,6 +15,16 @@
 #   --weights_path /path/to/esm2_t33_650M_UR50D.pt \
 #   --config config.orthofinder.yaml \
 #   --resume
+#
+# To use rKCNN for candidate neighbor generation (Step 5), either set
+# knn.mode: rkcnn in this file or pass --knn-mode rkcnn on the CLI:
+#
+# plm_cluster run-all-orthofinder \
+#   --og_dir OrthoFinder/Results_*/Phylogenetic_Hierarchical_Orthogroups/N0/ \
+#   --weights_path /path/to/esm2_t33_650M_UR50D.pt \
+#   --config config.orthofinder.yaml \
+#   --knn-mode rkcnn \
+#   --resume
 
 seed: 42
 
@@ -146,15 +156,51 @@ embed:
   checkpoint_dir: ""              # e.g. "tmp/embed_checkpoints"
 
 # ---------------------------------------------------------------------------
-# Step 5 — KNN
+# Step 5 — KNN candidate neighbor generation
 # ---------------------------------------------------------------------------
+# Two modes are available:
+#
+#   knn   (default) — Standard FAISS/sklearn cosine KNN.  Fast, unsupervised.
+#   rkcnn           — Random K-Conditional Nearest Neighbor.  Supervised ensemble
+#                     that uses HOG-based MMseqs2 subfamily IDs as class labels
+#                     and random feature subspaces to overcome the curse of
+#                     dimensionality in high-dimensional embedding space.
+#                     Particularly suited to OrthoFinder input where HOG
+#                     membership provides strong prior class structure.
+#                     Paper: https://peerj.com/articles/cs-2497/
+#
+# Both modes produce the same output TSV so all downstream steps are unaffected.
 knn:
-  mode: knn
+  mode: knn                       # "knn" (default) | "rkcnn"
   k: 100
   min_cosine: 0.35
   min_len_ratio: 0.5
   max_len_ratio: 2.0
-  device: cpu
+
+  # --- GPU acceleration -------------------------------------------------------
+  # Set to "cuda" (or "cuda:0", "cuda:1", etc.) to use FAISS-GPU for the KNN
+  # index and (when mode=rkcnn) for the cascading FAISS pre-filter and rKCNN
+  # pairwise-distance computations via PyTorch.  Requires the faiss-gpu package;
+  # falls back to CPU FAISS or sklearn if unavailable.
+  device: cpu                     # "cpu" or "cuda" / "cuda:0" for GPU
+
+  # --- rKCNN-specific (only used when mode: rkcnn) ----------------------------
+  # rKCNN operates directly on full-dimensional ESM-2 embeddings — do NOT apply
+  # PCA or any dimensionality reduction.  Embeddings are L2-normalized before
+  # fitting.  HOG-based MMseqs2 subfamily IDs (from Step 1) serve as ground-truth
+  # class labels.
+  #
+  # Cascading strategy: with tens of thousands of subfamilies, computing
+  # conditional neighbors against all classes is expensive.  Set
+  # rkcnn_cascade_topn > 0 to first use FAISS to retrieve the top-N closest
+  # subfamily centroids per query, then run rKCNN only over those N classes.
+  rkcnn_n_subspaces: 50           # Number of random feature subspaces to sample
+  rkcnn_subspace_fraction: 0.5    # Fraction of embedding dims per subspace [0.01–1.0]
+  rkcnn_n_neighbors: 5            # k for the inner kCNN classifiers (per subspace)
+  rkcnn_score_threshold: 0.0      # Min separation score to retain a subspace (0 = keep all)
+  rkcnn_weighting: separation     # "separation" (score-weighted) | "uniform"
+  rkcnn_cascade_topn: 500         # FAISS pre-filter: top-N candidate classes (0 = disabled)
+  rkcnn_random_state: 42          # Random seed for subspace sampling
 
 # ---------------------------------------------------------------------------
 # Step 6 — Graph merge & Leiden clustering

@@ -121,6 +121,11 @@ orthofinder:
   # standard 60% identity threshold (mmseqs.min_seq_id) would collapse many
   # distinct paralog lineages.  These parameters control the finer-grained
   # within-OG subclustering step.
+  #
+  # KNN mode for the OrthoFinder pipeline is controlled by the knn.mode setting
+  # above (or via --knn-mode on the CLI).  Set knn.mode to "rkcnn" to use the
+  # Random K-Conditional Nearest Neighbor algorithm in the run-all-orthofinder
+  # pipeline instead of standard KNN.
   subcluster_min_seq_id: 0.4    # Min seq identity within an OG (lower than global mmseqs.min_seq_id)
   subcluster_coverage: 0.8      # Min alignment coverage for within-OG subclustering
   subcluster_cov_mode: 1        # MMseqs2 coverage mode (0=query, 1=target, 2=bidirectional)
