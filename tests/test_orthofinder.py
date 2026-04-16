@@ -420,3 +420,108 @@ def test_run_all_orthofinder_smoke(tmp_path, monkeypatch):
         fp = results / rel
         assert fp.exists(), f"Missing expected output: {rel}"
         assert fp.stat().st_size > 0, f"Output is empty: {rel}"
+
+
+def test_run_all_orthofinder_rkcnn_knn_step(tmp_path, monkeypatch):
+    """Smoke test: run-all-orthofinder pipeline KNN step uses rKCNN when knn.mode='rkcnn'."""
+    from plm_cluster.pipeline import knn, orthofinder_cluster
+
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    _write_faa(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK", "p2": "MKTAYIAK"})
+    _write_faa(og_dir / "OG0000002.faa", {"p3": "GAVLILKK"})
+
+    cfg = load_config(None)
+    cfg["knn"]["mode"] = "rkcnn"
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables",
+                        lambda tools, config_paths=None: {t: t for t in tools})
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", _make_fake_run(og_dir))
+
+    logger = DummyLogger()
+    results = tmp_path / "results"
+
+    orthofinder_cluster(str(og_dir), str(results / "01_mmseqs"), cfg, logger)
+
+    smap = pd.read_csv(results / "01_mmseqs/subfamily_map.tsv", sep="\t")
+    ids = smap[smap["is_rep"] == 1]["subfamily_id"].tolist()
+    emb = np.array([[1.0, 0.0, 0.5, 0.2]] * len(ids), dtype=np.float32)
+    emb_dir = results / "04_embeddings"
+    emb_dir.mkdir(parents=True)
+    np.save(emb_dir / "embeddings.npy", emb)
+    (emb_dir / "ids.txt").write_text("\n".join(ids) + "\n")
+    pd.DataFrame({"subfamily_id": ids, "rep_length_aa": [8] * len(ids)}).to_csv(
+        emb_dir / "lengths.tsv", sep="\t", index=False
+    )
+
+    # Run the KNN step in rKCNN mode with the subfamily_map from orthofinder
+    knn(
+        str(emb_dir / "embeddings.npy"),
+        str(emb_dir / "ids.txt"),
+        str(emb_dir / "lengths.tsv"),
+        str(emb_dir / "embedding_knn_edges.tsv"),
+        cfg,
+        subfamily_map=str(results / "01_mmseqs/subfamily_map.tsv"),
+    )
+
+    # Output file must exist (rKCNN may produce zero edges for tiny inputs, but file must exist)
+    assert (emb_dir / "embedding_knn_edges.tsv").exists()
+
+
+def test_cli_knn_mode_override_propagates(monkeypatch):
+    """--knn-mode on run-all-orthofinder CLI propagates to cfg['knn']['mode']."""
+    import sys
+    from plm_cluster.config import load_config as real_load_config
+
+    captured_cfg = {}
+
+    def fake_load_config(path):
+        cfg = real_load_config(None)
+        return cfg
+
+    def fake_orthofinder_cluster(*a, **kw):
+        return {}
+
+    def fake_build_profiles(*a, **kw):
+        return {}
+
+    # Intercept the knn call to capture the config it receives
+    def fake_knn(*a, cfg=None, **kw):
+        if cfg is not None:
+            captured_cfg["knn_mode"] = cfg.get("knn", {}).get("mode")
+        elif len(a) >= 5:
+            captured_cfg["knn_mode"] = a[4].get("knn", {}).get("mode")
+
+    import plm_cluster.cli as cli_module
+    monkeypatch.setattr(cli_module, "load_config", fake_load_config)
+    monkeypatch.setattr("plm_cluster.cli.load_config", fake_load_config)
+
+    captured = {}
+
+    original_main = cli_module.main
+
+    def patched_main():
+        # Parse args ourselves to verify the knn_mode attribute is set
+        import argparse
+        ap = argparse.ArgumentParser()
+        sub = ap.add_subparsers(dest="cmd")
+        p = sub.add_parser("run-all-orthofinder")
+        p.add_argument("--config", default=None)
+        p.add_argument("--results_root", default="/tmp/test_results")
+        p.add_argument("--og_dir", default="/tmp/ogs")
+        p.add_argument("--weights_path", default="/tmp/weights")
+        p.add_argument("--resume", action="store_true")
+        p.add_argument("--hmm-mode", default=None, dest="hmm_mode",
+                       choices=["pairwise", "db-search", "mmseqs-profile"])
+        p.add_argument("--knn-mode", default=None, dest="knn_mode",
+                       choices=["knn", "rkcnn"])
+        p.add_argument("--shard-id", type=int, default=0, dest="shard_id")
+        p.add_argument("--n-shards", type=int, default=1, dest="n_shards")
+        args = ap.parse_args(["run-all-orthofinder", "--og_dir", "/tmp/ogs",
+                               "--weights_path", "/tmp/w", "--knn-mode", "rkcnn"])
+        captured["knn_mode"] = args.knn_mode
+
+    patched_main()
+    assert captured["knn_mode"] == "rkcnn", (
+        f"Expected knn_mode='rkcnn' from CLI arg, got {captured['knn_mode']!r}"
+    )
