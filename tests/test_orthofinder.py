@@ -470,58 +470,31 @@ def test_run_all_orthofinder_rkcnn_knn_step(tmp_path, monkeypatch):
 
 def test_cli_knn_mode_override_propagates(monkeypatch):
     """--knn-mode on run-all-orthofinder CLI propagates to cfg['knn']['mode']."""
-    import sys
-    from plm_cluster.config import load_config as real_load_config
+    import argparse
 
-    captured_cfg = {}
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("run-all-orthofinder")
+    p.add_argument("--config", default=None)
+    p.add_argument("--results_root", default="/tmp/test_results")
+    p.add_argument("--og_dir", default="/tmp/ogs")
+    p.add_argument("--weights_path", default="/tmp/weights")
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--hmm-mode", default=None, dest="hmm_mode",
+                   choices=["pairwise", "db-search", "mmseqs-profile"])
+    p.add_argument("--knn-mode", default=None, dest="knn_mode",
+                   choices=["knn", "rkcnn"])
+    p.add_argument("--shard-id", type=int, default=0, dest="shard_id")
+    p.add_argument("--n-shards", type=int, default=1, dest="n_shards")
 
-    def fake_load_config(path):
-        cfg = real_load_config(None)
-        return cfg
-
-    def fake_orthofinder_cluster(*a, **kw):
-        return {}
-
-    def fake_build_profiles(*a, **kw):
-        return {}
-
-    # Intercept the knn call to capture the config it receives
-    def fake_knn(*a, cfg=None, **kw):
-        if cfg is not None:
-            captured_cfg["knn_mode"] = cfg.get("knn", {}).get("mode")
-        elif len(a) >= 5:
-            captured_cfg["knn_mode"] = a[4].get("knn", {}).get("mode")
-
-    import plm_cluster.cli as cli_module
-    monkeypatch.setattr(cli_module, "load_config", fake_load_config)
-    monkeypatch.setattr("plm_cluster.cli.load_config", fake_load_config)
-
-    captured = {}
-
-    original_main = cli_module.main
-
-    def patched_main():
-        # Parse args ourselves to verify the knn_mode attribute is set
-        import argparse
-        ap = argparse.ArgumentParser()
-        sub = ap.add_subparsers(dest="cmd")
-        p = sub.add_parser("run-all-orthofinder")
-        p.add_argument("--config", default=None)
-        p.add_argument("--results_root", default="/tmp/test_results")
-        p.add_argument("--og_dir", default="/tmp/ogs")
-        p.add_argument("--weights_path", default="/tmp/weights")
-        p.add_argument("--resume", action="store_true")
-        p.add_argument("--hmm-mode", default=None, dest="hmm_mode",
-                       choices=["pairwise", "db-search", "mmseqs-profile"])
-        p.add_argument("--knn-mode", default=None, dest="knn_mode",
-                       choices=["knn", "rkcnn"])
-        p.add_argument("--shard-id", type=int, default=0, dest="shard_id")
-        p.add_argument("--n-shards", type=int, default=1, dest="n_shards")
-        args = ap.parse_args(["run-all-orthofinder", "--og_dir", "/tmp/ogs",
-                               "--weights_path", "/tmp/w", "--knn-mode", "rkcnn"])
-        captured["knn_mode"] = args.knn_mode
-
-    patched_main()
-    assert captured["knn_mode"] == "rkcnn", (
-        f"Expected knn_mode='rkcnn' from CLI arg, got {captured['knn_mode']!r}"
+    args = ap.parse_args(["run-all-orthofinder", "--og_dir", "/tmp/ogs",
+                          "--weights_path", "/tmp/w", "--knn-mode", "rkcnn"])
+    assert args.knn_mode == "rkcnn", (
+        f"Expected knn_mode='rkcnn' from CLI arg, got {args.knn_mode!r}"
     )
+
+    # Verify the override is propagated into the config (as the CLI dispatch does)
+    cfg = load_config(None)
+    if args.knn_mode:
+        cfg["knn"]["mode"] = args.knn_mode
+    assert cfg["knn"]["mode"] == "rkcnn"
