@@ -313,7 +313,6 @@ def test_resume_per_hog_checkpoint_skips_completed(tmp_path, monkeypatch):
 
     # OG0000001 was checkpointed — mmseqs should NOT have been called for it.
     # OG0000002 was not checkpointed — mmseqs SHOULD have been called for it.
-    og1_mmseqs = [c for c in run_cmd_calls if "OG0000001" in " ".join(c)]
     # createdb creates the DB inside a temp dir; we can't detect OG identity from the
     # command args easily, but we can verify that SOME mmseqs calls happened (for OG2)
     # and that the final outputs contain both OGs' proteins.
