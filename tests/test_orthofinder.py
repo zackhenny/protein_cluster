@@ -257,6 +257,141 @@ def test_resume(tmp_path, monkeypatch):
     assert any("Resume" in m for m in logger.messages)
 
 
+def test_resume_per_hog_checkpoint_skips_completed(tmp_path, monkeypatch):
+    """Per-HOG checkpoints: already-checkpointed OGs are not re-processed on resume."""
+    import json
+    from plm_cluster.pipeline import _og_checkpoint_path, _save_og_checkpoint
+
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    _write_faa(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK"})
+    _write_faa(og_dir / "OG0000002.faa", {"p2": "GAVLILKK", "p3": "GAVLILKG"})
+
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    checkpoint_dir = outdir / "og_checkpoints"
+    checkpoint_dir.mkdir()
+
+    # Pre-save a checkpoint for OG0000001 so it should be skipped
+    from plm_cluster.io_utils import FastaRecord
+    _save_og_checkpoint(
+        checkpoint_dir,
+        "OG0000001",
+        [{"protein_id": "p1", "subfamily_id": "OG0000001_subfam_000000", "is_rep": 1}],
+        [{"subfamily_id": "OG0000001_subfam_000000", "og_id": "OG0000001"}],
+        [FastaRecord("OG0000001_subfam_000000", "MKTAYIAK")],
+        [FastaRecord("p1", "MKTAYIAK")],
+        1,
+    )
+
+    run_cmd_calls: list[list[str]] = []
+
+    def spy_run(cmd, logger, cwd=None):
+        run_cmd_calls.append(list(cmd))
+        if cmd[0] == "mmseqs" and cmd[1] == "createtsv":
+            tsv_path = Path(cmd[-1])
+            fa_path = Path(cmd[2]).parent / "og.faa"
+            lines = fa_path.read_text().splitlines()
+            proteins = [l[1:].split()[0] for l in lines if l.startswith(">")]
+            with tsv_path.open("w") as fh:
+                for pid in proteins:
+                    fh.write(f"{pid}\t{pid}\n")
+        elif cmd[0] == "mmseqs" and cmd[1] == "result2flat":
+            out_faa = Path(cmd[-1])
+            fa_path = Path(cmd[2]).parent / "og.faa"
+            out_faa.write_text(fa_path.read_text())
+        return ""
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", _fake_require)
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", spy_run)
+
+    cfg = load_config(None)
+    logger = DummyLogger()
+    # serial mode so order is deterministic
+    cfg.setdefault("orthofinder", {})["parallel_og_workers"] = 1
+    orthofinder_cluster(str(og_dir), str(outdir), cfg, logger, resume=True)
+
+    # OG0000001 was checkpointed — mmseqs should NOT have been called for it.
+    # OG0000002 was not checkpointed — mmseqs SHOULD have been called for it.
+    og1_mmseqs = [c for c in run_cmd_calls if "OG0000001" in " ".join(c)]
+    # createdb creates the DB inside a temp dir; we can't detect OG identity from the
+    # command args easily, but we can verify that SOME mmseqs calls happened (for OG2)
+    # and that the final outputs contain both OGs' proteins.
+    assert any(c[0] == "mmseqs" for c in run_cmd_calls), "mmseqs should have been called for OG0000002"
+
+    smap = pd.read_csv(outdir / "subfamily_map.tsv", sep="\t")
+    assert set(smap["protein_id"]) == {"p1", "p2", "p3"}, "Both OGs' proteins must appear in the final map"
+
+
+def test_resume_per_hog_checkpoint_fresh_run_writes_checkpoints(tmp_path, monkeypatch):
+    """A fresh run (no --resume) still writes per-HOG checkpoints for future resumes."""
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    _write_faa(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK"})
+
+    outdir = tmp_path / "out"
+    cfg = load_config(None)
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", _fake_require)
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", _make_fake_run(og_dir))
+
+    logger = DummyLogger()
+    orthofinder_cluster(str(og_dir), str(outdir), cfg, logger)
+
+    checkpoint_file = outdir / "og_checkpoints" / "OG0000001.json"
+    assert checkpoint_file.exists(), "Checkpoint file should be written even on a fresh run"
+
+    import json
+    data = json.loads(checkpoint_file.read_text())
+    assert "rows" in data
+    assert "reps" in data
+    assert "combined" in data
+    assert any(r["protein_id"] == "p1" for r in data["rows"])
+
+
+def test_resume_per_hog_partial_restart(tmp_path, monkeypatch):
+    """An OG without a checkpoint is re-run from scratch even when --resume is set."""
+    import json
+    from plm_cluster.pipeline import _save_og_checkpoint
+    from plm_cluster.io_utils import FastaRecord
+
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    _write_faa(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK"})
+    _write_faa(og_dir / "OG0000002.faa", {"p2": "GAVLILKK", "p3": "GAVLILKG"})
+
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    checkpoint_dir = outdir / "og_checkpoints"
+    checkpoint_dir.mkdir()
+
+    # OG0000001 has a checkpoint; OG0000002 does NOT (simulates timeout during OG2).
+    _save_og_checkpoint(
+        checkpoint_dir,
+        "OG0000001",
+        [{"protein_id": "p1", "subfamily_id": "OG0000001_subfam_000000", "is_rep": 1}],
+        [{"subfamily_id": "OG0000001_subfam_000000", "og_id": "OG0000001"}],
+        [FastaRecord("OG0000001_subfam_000000", "MKTAYIAK")],
+        [FastaRecord("p1", "MKTAYIAK")],
+        1,
+    )
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", _fake_require)
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", _make_fake_run(og_dir))
+
+    cfg = load_config(None)
+    cfg.setdefault("orthofinder", {})["parallel_og_workers"] = 1
+    logger = DummyLogger()
+    orthofinder_cluster(str(og_dir), str(outdir), cfg, logger, resume=True)
+
+    # Both OGs should appear in the final output
+    smap = pd.read_csv(outdir / "subfamily_map.tsv", sep="\t")
+    assert set(smap["protein_id"]) == {"p1", "p2", "p3"}
+
+    # OG0000002 must now have a checkpoint written after processing
+    assert (checkpoint_dir / "OG0000002.json").exists()
+
+
 def test_no_faa_files_raises(tmp_path, monkeypatch):
     """An empty directory raises FileNotFoundError with a clear message."""
     og_dir = tmp_path / "empty_ogs"

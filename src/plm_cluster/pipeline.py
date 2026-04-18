@@ -353,6 +353,52 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger, resum
     return tools
 
 
+def _og_checkpoint_path(checkpoint_dir: Path, og_stem: str) -> Path:
+    """Return the path to the per-OG checkpoint JSON file."""
+    return checkpoint_dir / f"{og_stem}.json"
+
+
+def _load_og_checkpoint(
+    checkpoint_dir: Path, og_stem: str
+) -> "tuple[list[dict], list[dict], list[FastaRecord], list[FastaRecord], int] | None":
+    """Load per-OG results from a checkpoint file.
+
+    Returns ``None`` if no checkpoint exists for *og_stem*.
+    """
+    cp = _og_checkpoint_path(checkpoint_dir, og_stem)
+    if not cp.exists():
+        return None
+    with cp.open() as fh:
+        data = json.load(fh)
+    reps = [FastaRecord(r["id"], r["seq"]) for r in data["reps"]]
+    combined = [FastaRecord(r["id"], r["seq"]) for r in data["combined"]]
+    return data["rows"], data["og_rows"], reps, combined, data["n_singletons"]
+
+
+def _save_og_checkpoint(
+    checkpoint_dir: Path,
+    og_stem: str,
+    rows: list[dict],
+    og_rows: list[dict],
+    reps: "list[FastaRecord]",
+    combined: "list[FastaRecord]",
+    n_singletons: int,
+) -> None:
+    """Atomically write per-OG results to a checkpoint JSON file."""
+    data = {
+        "rows": rows,
+        "og_rows": og_rows,
+        "reps": [{"id": r.id, "seq": r.seq} for r in reps],
+        "combined": [{"id": r.id, "seq": r.seq} for r in combined],
+        "n_singletons": n_singletons,
+    }
+    cp = _og_checkpoint_path(checkpoint_dir, og_stem)
+    tmp = cp.with_suffix(".tmp")
+    with tmp.open("w") as fh:
+        json.dump(data, fh)
+    tmp.rename(cp)
+
+
 def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: bool = False) -> dict[str, str]:
     """Step 1 (OrthoFinder mode): Subcluster each HOG/OG FASTA into subfamilies using MMseqs2.
 
@@ -370,6 +416,15 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
       required by ``build_profiles`` and ``map_proteins_to_families``.
     * ``og_subfamily_map.tsv``  — provenance table mapping each subfamily back
       to its source OG identifier.
+
+    A ``og_checkpoints/`` subdirectory is written inside *outdir* during
+    processing.  Each successfully processed OG is saved as
+    ``og_checkpoints/<og_stem>.json``.  When *resume* is ``True`` and
+    ``subfamily_map.tsv`` does not yet exist (i.e. the previous run did not
+    finish), OGs that already have a checkpoint are loaded from disk and
+    skipped, while OGs without a checkpoint (including any that timed out
+    mid-run) are (re-)processed from scratch.  This allows a long run to be
+    safely interrupted and resumed without using any partial per-OG data.
     """
     out = _ensure_dir(outdir)
     if resume and (out / "subfamily_map.tsv").exists():
@@ -411,10 +466,21 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
             "Please point --og_dir at a directory of OrthoFinder HOG or OG FASTA files."
         )
 
+    # Per-HOG checkpoint directory: stores one JSON per successfully processed OG so
+    # that a resumable run can skip already-completed OGs without re-running them.
+    checkpoint_dir = _ensure_dir(out / "og_checkpoints")
+
+    # Count how many OGs already have checkpoints (for the progress log message).
+    n_already_done = sum(
+        1 for f in og_files
+        if _og_checkpoint_path(checkpoint_dir, f.stem).exists()
+    ) if resume else 0
+
     logger.info(
         "OrthoFinder subclustering: found %d OG/HOG FASTA files in %s "
-        "(mode=%s, parallel_og_workers=%d, subcluster_threads=%s)",
+        "(mode=%s, parallel_og_workers=%d, subcluster_threads=%s%s)",
         len(og_files), og_dir, subcluster_mode, parallel_ogs, og_threads,
+        f", resuming — {n_already_done}/{len(og_files)} OGs already checkpointed" if resume else "",
     )
 
     # ------------------------------------------------------------------
@@ -511,6 +577,20 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
         return rows_inner, og_rows_inner, reps_inner, combined, 0
 
     # ------------------------------------------------------------------
+    # Per-HOG checkpoint wrapper: on resume, loads existing checkpoint;
+    # otherwise processes and saves a new checkpoint.
+    # ------------------------------------------------------------------
+    def _run_or_load_og(og_file: Path) -> tuple[list[dict], list[dict], list[FastaRecord], list[FastaRecord], int]:
+        og_stem = og_file.stem
+        if resume:
+            cached = _load_og_checkpoint(checkpoint_dir, og_stem)
+            if cached is not None:
+                return cached
+        result = _process_og(og_file)
+        _save_og_checkpoint(checkpoint_dir, og_stem, *result)
+        return result
+
+    # ------------------------------------------------------------------
     # Process all OGs (optionally in parallel)
     # ------------------------------------------------------------------
     all_rows: list[dict] = []
@@ -521,7 +601,7 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
 
     if parallel_ogs > 1 and len(og_files) > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_ogs) as pool:
-            future_map = {pool.submit(_process_og, f): f for f in og_files}
+            future_map = {pool.submit(_run_or_load_og, f): f for f in og_files}
             for fut in concurrent.futures.as_completed(future_map):
                 og_file = future_map[fut]
                 try:
@@ -536,7 +616,7 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
                 n_singletons += n_sing
     else:
         for og_file in og_files:
-            rows, og_rows, reps, combined, n_sing = _process_og(og_file)
+            rows, og_rows, reps, combined, n_sing = _run_or_load_og(og_file)
             all_rows.extend(rows)
             og_subfamily_rows.extend(og_rows)
             rep_records.extend(reps)
