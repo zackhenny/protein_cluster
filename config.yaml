@@ -23,6 +23,16 @@ mmseqs:
   sensitivity: 7.5
   threads: 16
   tmpdir: tmp/mmseqs
+  # min_protein_length: remove proteins shorter than this many amino acids
+  # before clustering.  Set to 0 (default) to disable.  Dropped proteins are
+  # written to 01_mmseqs/filtered_short_proteins.tsv.
+  min_protein_length: 0
+  # min_cluster_size_for_profile: skip profile building (Step 2) for clusters
+  # with fewer members than this threshold.  Singletons (n=1) are still
+  # embedded and can join families via KNN edges (Step 4).
+  # Set to 1 (default) to build profiles for every cluster including
+  # singletons; set to 2 to skip singleton profile building.
+  min_cluster_size_for_profile: 1
 
 profiles:
   # Step 2 — MAFFT + hhmake profile construction

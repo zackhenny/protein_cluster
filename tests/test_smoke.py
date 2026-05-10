@@ -613,3 +613,82 @@ def test_db_search_keeps_best_direction(tmp_path: Path, monkeypatch):
     assert raw["prob"][0] == pytest.approx(98.0), \
         f"Expected best prob=98.0 from reverse direction, got {raw['prob'][0]}"
 
+
+
+# ---------------------------------------------------------------------------
+# Smoke test with new singleton/QC config keys
+# ---------------------------------------------------------------------------
+
+def test_smoke_pipeline_with_min_protein_length_and_min_cluster_size(tmp_path: Path, monkeypatch):
+    """Smoke test: pipeline runs end-to-end with min_protein_length and
+    min_cluster_size_for_profile set, correctly producing report and filtering."""
+    cfg = load_config(None)
+    cfg["mmseqs"]["min_protein_length"] = 5   # only sequences >= 5 AA pass
+    cfg["mmseqs"]["min_cluster_size_for_profile"] = 2  # singletons skip profile build
+
+    proteins = tmp_path / "toy.faa"
+    # p1+p2 cluster together (8 AA each); p3 is a singleton (8 AA); px is too short (3 AA)
+    proteins.write_text(">p1\nMKTAYIAK\n>p2\nMKTAYIAK\n>p3\nGAVLILKK\n>px\nMKT\n")
+
+    def fake_require(tools, config_paths=None):
+        return {t: t for t in tools}
+
+    def fake_run(cmd, logger, cwd=None, stdin=None):
+        if cmd[0] == "mmseqs" and cmd[1] == "createtsv":
+            # p1 and p2 cluster; p3 is a singleton; px was filtered out
+            Path(cmd[-1]).write_text("p1\tp1\np1\tp2\np3\tp3\n")
+        elif cmd[0] == "mmseqs" and cmd[1] == "result2flat":
+            Path(cmd[-1]).write_text(">p1\nMKTAYIAK\n>p3\nGAVLILKK\n")
+        elif cmd[0] == "mafft":
+            fa = Path(cmd[-1])
+            return fa.read_text()
+        elif cmd[0] == "hhmake":
+            out = Path(cmd[cmd.index("-o") + 1])
+            out.write_text("HHsearch 3.3\nLENG 8\n")
+        return ""
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", fake_require)
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", fake_run)
+
+    class DummyLogger:
+        def info(self, *args, **kwargs): return None
+        def warning(self, *args, **kwargs): return None
+        def error(self, *args, **kwargs): return None
+
+    logger = DummyLogger()
+
+    mmseqs_cluster(str(proteins), str(tmp_path / "results/01_mmseqs"), cfg, logger)
+
+    # Verify report
+    report = pd.read_csv(tmp_path / "results/01_mmseqs/mmseqs_cluster_report.tsv", sep="\t")
+    assert report["n_proteins_input"].iloc[0] == 4   # total including "px"
+    assert report["n_proteins_filtered_short"].iloc[0] == 1   # "px" filtered
+    assert report["n_singletons"].iloc[0] == 1   # p3 cluster
+
+    # Verify is_singleton column
+    stats = pd.read_csv(tmp_path / "results/01_mmseqs/subfamily_stats.tsv", sep="\t")
+    assert "is_singleton" in stats.columns
+    assert stats["is_singleton"].sum() == 1
+
+    # Verify length stats columns are present
+    for col in ("min_length_aa", "max_length_aa", "mean_length_aa", "std_length_aa"):
+        assert col in stats.columns
+
+    # Now build profiles — singleton should be skipped
+    build_profiles(
+        str(proteins),
+        str(tmp_path / "results/01_mmseqs/subfamily_map.tsv"),
+        str(tmp_path / "results/02_profiles"),
+        cfg,
+        logger,
+    )
+
+    idx = pd.read_csv(tmp_path / "results/02_profiles/subfamily_profile_index.tsv", sep="\t")
+    assert "profile_built" in idx.columns
+    assert "skipped_reason" in idx.columns
+    # Both subfamilies in index (built + skipped)
+    assert len(idx) == 2
+    # Exactly one has profile_built=True (the 2-member cluster)
+    assert idx["profile_built"].sum() == 1
+    skipped = idx[~idx["profile_built"]]
+    assert skipped["skipped_reason"].iloc[0] == "singleton"
