@@ -128,7 +128,7 @@ def plot_fusion_fraction(results_root: str, ax: Any) -> None:
 
 
 def plot_singleton_summary(results_root: str, ax: Any) -> None:
-    """Bar chart of singletons, 2-member, and 3+ member clusters with percentage annotations."""
+    """Bar chart of cluster size distribution with singleton percentage statistics in title."""
     report = _safe_read(Path(results_root) / "01_mmseqs" / "mmseqs_cluster_report.tsv")
     df = _safe_read(Path(results_root) / "01_mmseqs" / "subfamily_stats.tsv")
 
