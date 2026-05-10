@@ -10,7 +10,7 @@
 plm_cluster run-all \
   --proteins_fasta example_data/toy_proteins.faa \
   --weights_path /path/to/esm2_weights.pt \
-  --config docs/config.template.yaml \
+  --config config.yaml \
   --results_root results
 ```
 
