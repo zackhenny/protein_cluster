@@ -690,5 +690,5 @@ def test_smoke_pipeline_with_min_protein_length_and_min_cluster_size(tmp_path: P
     assert len(idx) == 2
     # Exactly one has profile_built=True (the 2-member cluster)
     assert idx["profile_built"].sum() == 1
-    skipped = idx[idx["profile_built"] == False]  # noqa: E712
+    skipped = idx[~idx["profile_built"]]
     assert skipped["skipped_reason"].iloc[0] == "singleton"

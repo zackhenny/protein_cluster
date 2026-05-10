@@ -422,8 +422,12 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger, resum
             # Map query protein → subfamily
             pid_to_sub = dict(zip(raw["protein_id"].to_list(), raw["subfamily_id"].to_list()))
             aln_df = aln_df.filter(pl.col("query") != pl.col("target"))
+
+            def _map_pid_to_subfam(p: str) -> str:
+                return pid_to_sub.get(p, "")
+
             aln_df = aln_df.with_columns(
-                pl.col("query").map_elements(lambda p: pid_to_sub.get(p, ""), return_dtype=pl.String).alias("subfamily_id")
+                pl.col("query").map_elements(_map_pid_to_subfam, return_dtype=pl.String).alias("subfamily_id")
             ).filter(pl.col("subfamily_id") != "")
             pident_stats = (
                 aln_df.group_by("subfamily_id")

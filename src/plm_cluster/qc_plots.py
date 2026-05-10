@@ -157,9 +157,10 @@ def plot_singleton_summary(results_root: str, ax: Any) -> None:
     bars = ax.bar(categories, counts, color=colors, edgecolor="white")
     ax.set_ylabel("Cluster count")
     ax.set_title("Cluster size breakdown")
+    y_offset = 0.01 * max(counts, default=1)
     for bar, v in zip(bars, counts):
         if v > 0:
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01 * max(counts, default=1),
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + y_offset,
                     str(v), ha="center", va="bottom", fontsize=8)
 
 

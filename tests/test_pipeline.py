@@ -902,7 +902,7 @@ def test_build_profiles_skips_singletons_when_min_size_2(tmp_path: Path, monkeyp
     assert "skipped_reason" in idx.columns
 
     skipped = idx[idx["subfamily_id"] == "subfam_000001"].iloc[0]
-    assert skipped["profile_built"] == False  # noqa: E712
+    assert not skipped["profile_built"]
     assert skipped["skipped_reason"] == "singleton"
 
 
@@ -947,7 +947,7 @@ def test_build_profiles_skips_below_min_cluster_size(tmp_path: Path, monkeypatch
 
     idx = pd.read_csv(outdir / "subfamily_profile_index.tsv", sep="\t")
     assert len(idx) == 2
-    assert all(idx["profile_built"] == False)  # noqa: E712
+    assert not any(idx["profile_built"])
     singleton = idx[idx["subfamily_id"] == "subfam_000001"].iloc[0]
     two_member = idx[idx["subfamily_id"] == "subfam_000000"].iloc[0]
     assert singleton["skipped_reason"] == "singleton"
@@ -992,7 +992,7 @@ def test_build_profiles_default_builds_all(tmp_path: Path, monkeypatch):
 
     assert sorted(hhmake_calls) == ["subfam_000000", "subfam_000001"]
     idx = pd.read_csv(outdir / "subfamily_profile_index.tsv", sep="\t")
-    assert all(idx["profile_built"] == True)  # noqa: E712
+    assert all(idx["profile_built"])
 
 
 # ---------------------------------------------------------------------------
