@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from plm_cluster.config import load_config
-from plm_cluster.pipeline import _build_hhsuite_db, embed, merge_graph, write_matrices
+from plm_cluster.pipeline import _build_hhsuite_db, build_profiles, embed, merge_graph, mmseqs_cluster, write_matrices
 
 
 def test_load_config_rejects_json(tmp_path: Path):
@@ -690,3 +690,449 @@ def test_embed_empty_fasta_raises(tmp_path: Path):
     with um.patch.dict(sys.modules, {"esm": esm_mod, "torch": torch_mod}):
         with pytest.raises(RuntimeError, match="No sequences remain to embed"):
             embed(str(fasta), str(tmp_path / "out"), cfg, str(weights_file), log)
+
+
+# ---------------------------------------------------------------------------
+# mmseqs_cluster(): min_protein_length pre-filtering
+# ---------------------------------------------------------------------------
+
+class _DummyLogger:
+    def info(self, *a, **kw): pass
+    def warning(self, *a, **kw): pass
+    def error(self, *a, **kw): pass
+
+
+def _make_mmseqs_fake_run(tsv_content: str, faa_content: str = ">p1\nMKTAYIAK\n"):
+    """Return a fake run_cmd for mmseqs_cluster tests."""
+    def fake_run(cmd, logger, cwd=None, stdin=None):
+        if cmd[0] == "mmseqs" and cmd[1] == "createtsv":
+            Path(cmd[-1]).write_text(tsv_content)
+        elif cmd[0] == "mmseqs" and cmd[1] == "result2flat":
+            Path(cmd[-1]).write_text(faa_content)
+        # align / convertalis / createdb / linclust / result2repseq: no-ops
+        return ""
+    return fake_run
+
+
+def test_mmseqs_cluster_min_protein_length_filters_short(tmp_path: Path, monkeypatch):
+    """Proteins shorter than min_protein_length are removed before clustering."""
+    cfg = load_config(None)
+    cfg["mmseqs"]["min_protein_length"] = 10
+
+    proteins = tmp_path / "toy.faa"
+    # "short" is 5 AA, "long" is 15 AA
+    proteins.write_text(">short\nMKTAY\n>long\nMKTAYIAKTAYIAKT\n")
+
+    monkeypatch.setattr(
+        "plm_cluster.pipeline.require_executables",
+        lambda t, c=None: {k: k for k in t},
+    )
+    monkeypatch.setattr(
+        "plm_cluster.pipeline.run_cmd",
+        _make_mmseqs_fake_run("long\tlong\n", ">long\nMKTAYIAKTAYIAKT\n"),
+    )
+
+    outdir = tmp_path / "out"
+    mmseqs_cluster(str(proteins), str(outdir), cfg, _DummyLogger())
+
+    filtered = pd.read_csv(outdir / "filtered_short_proteins.tsv", sep="\t")
+    assert list(filtered["protein_id"]) == ["short"]
+    assert filtered["length_aa"].iloc[0] == 5
+
+    smap = pd.read_csv(outdir / "subfamily_map.tsv", sep="\t")
+    assert set(smap["protein_id"]) == {"long"}
+
+    report = pd.read_csv(outdir / "mmseqs_cluster_report.tsv", sep="\t")
+    assert report["n_proteins_input"].iloc[0] == 2
+    assert report["n_proteins_filtered_short"].iloc[0] == 1
+    assert report["n_proteins_clustered"].iloc[0] == 1
+
+
+def test_mmseqs_cluster_min_protein_length_zero_no_filter(tmp_path: Path, monkeypatch):
+    """With min_protein_length=0 (default) no proteins are filtered."""
+    cfg = load_config(None)
+    cfg["mmseqs"]["min_protein_length"] = 0
+
+    proteins = tmp_path / "toy.faa"
+    proteins.write_text(">p1\nMK\n>p2\nMKTAYIAK\n")
+
+    monkeypatch.setattr(
+        "plm_cluster.pipeline.require_executables",
+        lambda t, c=None: {k: k for k in t},
+    )
+    monkeypatch.setattr(
+        "plm_cluster.pipeline.run_cmd",
+        _make_mmseqs_fake_run("p1\tp1\np2\tp2\n", ">p1\nMK\n>p2\nMKTAYIAK\n"),
+    )
+
+    outdir = tmp_path / "out"
+    mmseqs_cluster(str(proteins), str(outdir), cfg, _DummyLogger())
+
+    assert not (outdir / "filtered_short_proteins.tsv").exists()
+
+    report = pd.read_csv(outdir / "mmseqs_cluster_report.tsv", sep="\t")
+    assert report["n_proteins_filtered_short"].iloc[0] == 0
+
+
+def test_mmseqs_cluster_report_singleton_counts(tmp_path: Path, monkeypatch):
+    """mmseqs_cluster_report.tsv must correctly count singletons vs multi-member clusters."""
+    cfg = load_config(None)
+    cfg["mmseqs"]["min_cluster_size_for_profile"] = 2
+
+    proteins = tmp_path / "toy.faa"
+    proteins.write_text(">p1\nMKTAYIAK\n>p2\nMKTAYIAK\n>p3\nGAVLILKK\n")
+
+    monkeypatch.setattr(
+        "plm_cluster.pipeline.require_executables",
+        lambda t, c=None: {k: k for k in t},
+    )
+    monkeypatch.setattr(
+        "plm_cluster.pipeline.run_cmd",
+        _make_mmseqs_fake_run("p1\tp1\np1\tp2\np3\tp3\n", ">p1\nMKTAYIAK\n>p3\nGAVLILKK\n"),
+    )
+
+    outdir = tmp_path / "out"
+    mmseqs_cluster(str(proteins), str(outdir), cfg, _DummyLogger())
+
+    report = pd.read_csv(outdir / "mmseqs_cluster_report.tsv", sep="\t")
+    assert report["n_clusters_total"].iloc[0] == 2
+    assert report["n_singletons"].iloc[0] == 1
+    assert report["n_clusters_2plus"].iloc[0] == 1
+    assert report["n_clusters_above_min_profile_size"].iloc[0] == 1
+
+
+def test_mmseqs_cluster_stats_is_singleton_column(tmp_path: Path, monkeypatch):
+    """subfamily_stats.tsv must have is_singleton=1 for singletons, 0 otherwise."""
+    cfg = load_config(None)
+
+    proteins = tmp_path / "toy.faa"
+    proteins.write_text(">p1\nMKTAYIAK\n>p2\nMKTAYIAK\n>p3\nGAVLILKK\n")
+
+    monkeypatch.setattr(
+        "plm_cluster.pipeline.require_executables",
+        lambda t, c=None: {k: k for k in t},
+    )
+    monkeypatch.setattr(
+        "plm_cluster.pipeline.run_cmd",
+        _make_mmseqs_fake_run("p1\tp1\np1\tp2\np3\tp3\n", ">p1\nMKTAYIAK\n>p3\nGAVLILKK\n"),
+    )
+
+    outdir = tmp_path / "out"
+    mmseqs_cluster(str(proteins), str(outdir), cfg, _DummyLogger())
+
+    stats = pd.read_csv(outdir / "subfamily_stats.tsv", sep="\t")
+    assert "is_singleton" in stats.columns
+    assert len(stats[stats["is_singleton"] == 1]) == 1
+    assert len(stats[stats["is_singleton"] == 0]) == 1
+
+
+def test_mmseqs_cluster_stats_length_columns(tmp_path: Path, monkeypatch):
+    """subfamily_stats.tsv must include min/max/mean/std_length_aa columns."""
+    cfg = load_config(None)
+    proteins = tmp_path / "toy.faa"
+    proteins.write_text(">p1\nMKTAYIAK\n>p2\nMKTAYIAK\n>p3\nGAVLILKK\n")
+
+    monkeypatch.setattr(
+        "plm_cluster.pipeline.require_executables",
+        lambda t, c=None: {k: k for k in t},
+    )
+    monkeypatch.setattr(
+        "plm_cluster.pipeline.run_cmd",
+        _make_mmseqs_fake_run("p1\tp1\np1\tp2\np3\tp3\n", ">p1\nMKTAYIAK\n>p3\nGAVLILKK\n"),
+    )
+
+    outdir = tmp_path / "out"
+    mmseqs_cluster(str(proteins), str(outdir), cfg, _DummyLogger())
+
+    stats = pd.read_csv(outdir / "subfamily_stats.tsv", sep="\t")
+    for col in ("min_length_aa", "max_length_aa", "mean_length_aa", "std_length_aa"):
+        assert col in stats.columns, f"Expected column {col} in subfamily_stats.tsv"
+    multi = stats[stats["n_members"] == 2].iloc[0]
+    assert multi["min_length_aa"] == 8
+    assert multi["max_length_aa"] == 8
+    assert multi["std_length_aa"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# build_profiles(): min_cluster_size_for_profile skip logic
+# ---------------------------------------------------------------------------
+
+def test_build_profiles_skips_singletons_when_min_size_2(tmp_path: Path, monkeypatch):
+    """build_profiles skips singletons when min_cluster_size_for_profile=2."""
+    cfg = load_config(None)
+    cfg["mmseqs"]["min_cluster_size_for_profile"] = 2
+
+    proteins = tmp_path / "toy.faa"
+    proteins.write_text(">p1\nMKTAYIAK\n>p2\nMKTAYIAK\n>p3\nGAVLILKK\n")
+
+    smap = tmp_path / "smap.tsv"
+    pd.DataFrame([
+        {"protein_id": "p1", "subfamily_id": "subfam_000000", "is_rep": 1},
+        {"protein_id": "p2", "subfamily_id": "subfam_000000", "is_rep": 0},
+        {"protein_id": "p3", "subfamily_id": "subfam_000001", "is_rep": 1},
+    ]).to_csv(smap, sep="\t", index=False)
+
+    hhmake_calls: list[str] = []
+
+    def fake_run(cmd, logger, cwd=None, stdin=None):
+        if cmd[0] == "mafft":
+            return Path(cmd[-1]).read_text()
+        if cmd[0] == "hhmake":
+            name_idx = cmd.index("-name")
+            hhmake_calls.append(cmd[name_idx + 1])
+            out_path = Path(cmd[cmd.index("-o") + 1])
+            out_path.write_text(f"HHsearch 3.3\nNAME {cmd[name_idx + 1]}\nLENG 8\n")
+        return ""
+
+    monkeypatch.setattr(
+        "plm_cluster.pipeline.require_executables",
+        lambda t, c=None: {k: k for k in t},
+    )
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", fake_run)
+
+    outdir = tmp_path / "profiles"
+    outdir.mkdir()
+    build_profiles(str(proteins), str(smap), str(outdir), cfg, _DummyLogger())
+
+    assert hhmake_calls == ["subfam_000000"]
+
+    idx = pd.read_csv(outdir / "subfamily_profile_index.tsv", sep="\t")
+    assert len(idx) == 2
+    assert "profile_built" in idx.columns
+    assert "skipped_reason" in idx.columns
+
+    skipped = idx[idx["subfamily_id"] == "subfam_000001"].iloc[0]
+    assert skipped["profile_built"] == False  # noqa: E712
+    assert skipped["skipped_reason"] == "singleton"
+
+
+def test_build_profiles_skips_below_min_cluster_size(tmp_path: Path, monkeypatch):
+    """build_profiles also skips clusters with 2 members when threshold=3."""
+    cfg = load_config(None)
+    cfg["mmseqs"]["min_cluster_size_for_profile"] = 3
+
+    proteins = tmp_path / "toy.faa"
+    proteins.write_text(">p1\nMKTAYIAK\n>p2\nMKTAYIAK\n>p3\nGAVLILKK\n")
+
+    smap = tmp_path / "smap.tsv"
+    pd.DataFrame([
+        {"protein_id": "p1", "subfamily_id": "subfam_000000", "is_rep": 1},
+        {"protein_id": "p2", "subfamily_id": "subfam_000000", "is_rep": 0},
+        {"protein_id": "p3", "subfamily_id": "subfam_000001", "is_rep": 1},
+    ]).to_csv(smap, sep="\t", index=False)
+
+    hhmake_calls: list[str] = []
+
+    def fake_run(cmd, logger, cwd=None, stdin=None):
+        if cmd[0] == "mafft":
+            return Path(cmd[-1]).read_text()
+        if cmd[0] == "hhmake":
+            name_idx = cmd.index("-name")
+            hhmake_calls.append(cmd[name_idx + 1])
+            out_path = Path(cmd[cmd.index("-o") + 1])
+            out_path.write_text("HHsearch 3.3\nLENG 8\n")
+        return ""
+
+    monkeypatch.setattr(
+        "plm_cluster.pipeline.require_executables",
+        lambda t, c=None: {k: k for k in t},
+    )
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", fake_run)
+
+    outdir = tmp_path / "profiles"
+    outdir.mkdir()
+    build_profiles(str(proteins), str(smap), str(outdir), cfg, _DummyLogger())
+
+    assert hhmake_calls == []
+
+    idx = pd.read_csv(outdir / "subfamily_profile_index.tsv", sep="\t")
+    assert len(idx) == 2
+    assert all(idx["profile_built"] == False)  # noqa: E712
+    singleton = idx[idx["subfamily_id"] == "subfam_000001"].iloc[0]
+    two_member = idx[idx["subfamily_id"] == "subfam_000000"].iloc[0]
+    assert singleton["skipped_reason"] == "singleton"
+    assert two_member["skipped_reason"] == "below_min_cluster_size"
+
+
+def test_build_profiles_default_builds_all(tmp_path: Path, monkeypatch):
+    """With default min_cluster_size_for_profile=1, singletons still get profiles."""
+    cfg = load_config(None)
+    assert cfg["mmseqs"]["min_cluster_size_for_profile"] == 1
+
+    proteins = tmp_path / "toy.faa"
+    proteins.write_text(">p1\nMKTAYIAK\n>p2\nGAVLILKK\n")
+
+    smap = tmp_path / "smap.tsv"
+    pd.DataFrame([
+        {"protein_id": "p1", "subfamily_id": "subfam_000000", "is_rep": 1},
+        {"protein_id": "p2", "subfamily_id": "subfam_000001", "is_rep": 1},
+    ]).to_csv(smap, sep="\t", index=False)
+
+    hhmake_calls: list[str] = []
+
+    def fake_run(cmd, logger, cwd=None, stdin=None):
+        if cmd[0] == "mafft":
+            return Path(cmd[-1]).read_text()
+        if cmd[0] == "hhmake":
+            name_idx = cmd.index("-name")
+            hhmake_calls.append(cmd[name_idx + 1])
+            out_path = Path(cmd[cmd.index("-o") + 1])
+            out_path.write_text("HHsearch 3.3\nLENG 8\n")
+        return ""
+
+    monkeypatch.setattr(
+        "plm_cluster.pipeline.require_executables",
+        lambda t, c=None: {k: k for k in t},
+    )
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", fake_run)
+
+    outdir = tmp_path / "profiles"
+    outdir.mkdir()
+    build_profiles(str(proteins), str(smap), str(outdir), cfg, _DummyLogger())
+
+    assert sorted(hhmake_calls) == ["subfam_000000", "subfam_000001"]
+    idx = pd.read_csv(outdir / "subfamily_profile_index.tsv", sep="\t")
+    assert all(idx["profile_built"] == True)  # noqa: E712
+
+
+# ---------------------------------------------------------------------------
+# Config validation: new keys
+# ---------------------------------------------------------------------------
+
+def test_config_min_protein_length_loaded(tmp_path: Path):
+    """mmseqs.min_protein_length is accepted and round-trips through load_config."""
+    cfg_yaml = tmp_path / "cfg.yaml"
+    cfg_yaml.write_text("mmseqs:\n  min_protein_length: 50\n")
+    cfg = load_config(str(cfg_yaml))
+    assert cfg["mmseqs"]["min_protein_length"] == 50
+
+
+def test_config_min_protein_length_range_validation(tmp_path: Path):
+    """mmseqs.min_protein_length must be >= 0; negative values are rejected."""
+    cfg_yaml = tmp_path / "cfg.yaml"
+    cfg_yaml.write_text("mmseqs:\n  min_protein_length: -1\n")
+    with pytest.raises(ValueError, match="min_protein_length"):
+        load_config(str(cfg_yaml))
+
+
+def test_config_min_cluster_size_for_profile_loaded(tmp_path: Path):
+    """mmseqs.min_cluster_size_for_profile is accepted and round-trips through load_config."""
+    cfg_yaml = tmp_path / "cfg.yaml"
+    cfg_yaml.write_text("mmseqs:\n  min_cluster_size_for_profile: 5\n")
+    cfg = load_config(str(cfg_yaml))
+    assert cfg["mmseqs"]["min_cluster_size_for_profile"] == 5
+
+
+def test_config_min_cluster_size_for_profile_range_validation(tmp_path: Path):
+    """mmseqs.min_cluster_size_for_profile must be >= 1; 0 is rejected."""
+    cfg_yaml = tmp_path / "cfg.yaml"
+    cfg_yaml.write_text("mmseqs:\n  min_cluster_size_for_profile: 0\n")
+    with pytest.raises(ValueError, match="min_cluster_size_for_profile"):
+        load_config(str(cfg_yaml))
+
+
+# ---------------------------------------------------------------------------
+# QC plots: new functions render without error
+# ---------------------------------------------------------------------------
+
+def test_qc_new_plots_render_with_empty_data(tmp_path: Path):
+    """New QC plot functions handle missing data gracefully (set_visible(False))."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        pytest.skip("matplotlib not installed")
+
+    from plm_cluster.qc_plots import (
+        plot_cluster_identity_range,
+        plot_cluster_length_variation,
+        plot_singleton_summary,
+    )
+
+    results_root = str(tmp_path)
+    for func in (plot_singleton_summary, plot_cluster_length_variation, plot_cluster_identity_range):
+        fig, ax = plt.subplots()
+        func(results_root, ax)  # must not raise
+        plt.close(fig)
+
+
+def test_qc_singleton_summary_with_report(tmp_path: Path):
+    """plot_singleton_summary reads mmseqs_cluster_report.tsv correctly."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        pytest.skip("matplotlib not installed")
+
+    from plm_cluster.qc_plots import plot_singleton_summary
+
+    mm_dir = tmp_path / "01_mmseqs"
+    mm_dir.mkdir(parents=True)
+    pd.DataFrame({
+        "n_proteins_input": [100],
+        "n_proteins_filtered_short": [5],
+        "n_proteins_clustered": [95],
+        "n_clusters_total": [50],
+        "n_singletons": [20],
+        "n_clusters_2plus": [30],
+        "n_clusters_above_min_profile_size": [30],
+    }).to_csv(mm_dir / "mmseqs_cluster_report.tsv", sep="\t", index=False)
+    pd.DataFrame({
+        "subfamily_id": [f"s{i}" for i in range(50)],
+        "n_members": [1] * 20 + [2] * 15 + [4] * 15,
+    }).to_csv(mm_dir / "subfamily_stats.tsv", sep="\t", index=False)
+
+    fig, ax = plt.subplots()
+    plot_singleton_summary(str(tmp_path), ax)  # must not raise
+    plt.close(fig)
+
+
+def test_qc_cluster_length_variation_with_data(tmp_path: Path):
+    """plot_cluster_length_variation renders a scatter for multi-member clusters."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        pytest.skip("matplotlib not installed")
+
+    from plm_cluster.qc_plots import plot_cluster_length_variation
+
+    mm_dir = tmp_path / "01_mmseqs"
+    mm_dir.mkdir(parents=True)
+    pd.DataFrame({
+        "subfamily_id": ["s1", "s2", "s3"],
+        "n_members": [1, 5, 10],
+        "std_length_aa": [0.0, 15.0, 25.0],
+    }).to_csv(mm_dir / "subfamily_stats.tsv", sep="\t", index=False)
+
+    fig, ax = plt.subplots()
+    plot_cluster_length_variation(str(tmp_path), ax)
+    plt.close(fig)
+
+
+def test_qc_cluster_identity_range_with_data(tmp_path: Path):
+    """plot_cluster_identity_range renders a scatter for multi-member clusters."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        pytest.skip("matplotlib not installed")
+
+    from plm_cluster.qc_plots import plot_cluster_identity_range
+
+    mm_dir = tmp_path / "01_mmseqs"
+    mm_dir.mkdir(parents=True)
+    pd.DataFrame({
+        "subfamily_id": ["s1", "s2"],
+        "n_members": [5, 10],
+        "min_pident": [70.0, 60.0],
+        "max_pident": [100.0, 95.0],
+    }).to_csv(mm_dir / "subfamily_stats.tsv", sep="\t", index=False)
+
+    fig, ax = plt.subplots()
+    plot_cluster_identity_range(str(tmp_path), ax)
+    plt.close(fig)

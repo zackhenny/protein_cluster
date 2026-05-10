@@ -30,6 +30,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Keep this ≤ the physical cores allocated to a single job/task.
         "threads": 8,
         "tmpdir": "tmp/mmseqs",
+        # min_protein_length: proteins shorter than this (amino acids) are
+        # removed from the input FASTA before clustering.  Set to 0 to
+        # disable filtering.  Dropped proteins are recorded in
+        # filtered_short_proteins.tsv for auditing.
+        "min_protein_length": 0,
+        # min_cluster_size_for_profile: clusters with fewer members than this
+        # threshold are skipped during profile building (Step 2).  Singletons
+        # (n=1) are still embedded and can join families via KNN.
+        # Set to 1 (default) to build profiles for all clusters including
+        # singletons; set to 2 to skip singleton profile building.
+        "min_cluster_size_for_profile": 1,
     },
     "profiles": {
         "max_members_per_subfamily": 256,
@@ -141,6 +152,8 @@ _RANGE_CHECKS: list[tuple[str, str, float, float]] = [
     ("mmseqs", "coverage", 0.0, 1.0),
     ("mmseqs", "evalue", 0.0, 1e6),
     ("mmseqs", "threads", 1, 1024),
+    ("mmseqs", "min_protein_length", 0, 1_000_000),
+    ("mmseqs", "min_cluster_size_for_profile", 1, 100_000),
     ("profiles", "parallel_workers", 1, 1024),
     ("hmm_hmm", "mincov_core", 0.0, 1.0),
     ("hmm_hmm", "min_prob_core", 0.0, 100.0),

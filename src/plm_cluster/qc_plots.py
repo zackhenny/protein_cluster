@@ -127,6 +127,89 @@ def plot_fusion_fraction(results_root: str, ax: Any) -> None:
         ax.text(i, v + 0.01 * max(counts), str(v), ha="center", fontsize=8)
 
 
+def plot_singleton_summary(results_root: str, ax: Any) -> None:
+    """Stacked bar chart of singletons, 2-member, and 3+ member clusters."""
+    report = _safe_read(Path(results_root) / "01_mmseqs" / "mmseqs_cluster_report.tsv")
+    if report is None:
+        # Fall back to computing from subfamily_stats.tsv if report is absent
+        df = _safe_read(Path(results_root) / "01_mmseqs" / "subfamily_stats.tsv")
+        if df is None or "n_members" not in df.columns:
+            ax.set_visible(False)
+            return
+        n_singletons = int((df["n_members"] == 1).sum())
+        n_2 = int((df["n_members"] == 2).sum())
+        n_3plus = int((df["n_members"] >= 3).sum())
+    else:
+        n_singletons = int(report["n_singletons"].iloc[0])
+        n_total = int(report["n_clusters_total"].iloc[0])
+        df = _safe_read(Path(results_root) / "01_mmseqs" / "subfamily_stats.tsv")
+        if df is not None and "n_members" in df.columns:
+            n_2 = int((df["n_members"] == 2).sum())
+            n_3plus = int((df["n_members"] >= 3).sum())
+        else:
+            n_2plus = n_total - n_singletons
+            n_2 = 0
+            n_3plus = n_2plus
+
+    categories = ["Singletons\n(n=1)", "2-member\nclusters", "≥3-member\nclusters"]
+    counts = [n_singletons, n_2, n_3plus]
+    colors = ["#dd8452", "#4c72b0", "#55a868"]
+    bars = ax.bar(categories, counts, color=colors, edgecolor="white")
+    ax.set_ylabel("Cluster count")
+    ax.set_title("Cluster size breakdown")
+    for bar, v in zip(bars, counts):
+        if v > 0:
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01 * max(counts, default=1),
+                    str(v), ha="center", va="bottom", fontsize=8)
+
+
+def plot_cluster_length_variation(results_root: str, ax: Any) -> None:
+    """Scatter of within-cluster length std vs cluster size (multi-member clusters only)."""
+    df = _safe_read(Path(results_root) / "01_mmseqs" / "subfamily_stats.tsv")
+    if df is None or "std_length_aa" not in df.columns or "n_members" not in df.columns:
+        ax.set_visible(False)
+        return
+    multi = df[df["n_members"] >= 2].copy()
+    if multi.empty:
+        ax.set_visible(False)
+        return
+    ax.scatter(
+        multi["n_members"], multi["std_length_aa"],
+        alpha=0.4, s=10, color="#4c72b0", rasterized=True,
+    )
+    ax.set_xlabel("Cluster size (members)")
+    ax.set_ylabel("Std dev of sequence length (aa)")
+    ax.set_title("Within-cluster length variation")
+    ax.set_xscale("log")
+
+
+def plot_cluster_identity_range(results_root: str, ax: Any) -> None:
+    """Scatter of within-cluster pident spread (max−min) vs cluster size."""
+    df = _safe_read(Path(results_root) / "01_mmseqs" / "subfamily_stats.tsv")
+    if (
+        df is None
+        or "min_pident" not in df.columns
+        or "max_pident" not in df.columns
+        or "n_members" not in df.columns
+    ):
+        ax.set_visible(False)
+        return
+    multi = df[df["n_members"] >= 2].copy()
+    multi = multi.dropna(subset=["min_pident", "max_pident"])
+    if multi.empty:
+        ax.set_visible(False)
+        return
+    pident_spread = multi["max_pident"] - multi["min_pident"]
+    ax.scatter(
+        multi["n_members"], pident_spread,
+        alpha=0.4, s=10, color="#c44e52", rasterized=True,
+    )
+    ax.set_xlabel("Cluster size (members)")
+    ax.set_ylabel("Identity range (max − min pident, %)")
+    ax.set_title("Within-cluster identity range")
+    ax.set_xscale("log")
+
+
 # ---------------------------------------------------------------------------
 # Summary dashboard
 # ---------------------------------------------------------------------------
@@ -166,7 +249,8 @@ def generate_qc_plots(results_root: str, logger=None, resume: bool = False) -> P
 
     out.mkdir(parents=True, exist_ok=True)
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    # 3×3 grid: original 6 plots + 3 new singleton/QC plots
+    fig, axes = plt.subplots(3, 3, figsize=(21, 15))
     fig.suptitle("plm-cluster QC Summary", fontsize=16, fontweight="bold")
 
     plot_subfamily_sizes(results_root, axes[0, 0])
@@ -175,6 +259,9 @@ def generate_qc_plots(results_root: str, logger=None, resume: bool = False) -> P
     plot_family_sizes(results_root, axes[1, 0])
     plot_protein_coverage(results_root, axes[1, 1])
     plot_fusion_fraction(results_root, axes[1, 2])
+    plot_singleton_summary(results_root, axes[2, 0])
+    plot_cluster_length_variation(results_root, axes[2, 1])
+    plot_cluster_identity_range(results_root, axes[2, 2])
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(summary_path, dpi=150)
@@ -188,6 +275,9 @@ def generate_qc_plots(results_root: str, logger=None, resume: bool = False) -> P
         ("family_size_distribution.png", plot_family_sizes),
         ("protein_coverage_fraction.png", plot_protein_coverage),
         ("fusion_summary.png", plot_fusion_fraction),
+        ("singleton_summary.png", plot_singleton_summary),
+        ("cluster_length_variation.png", plot_cluster_length_variation),
+        ("cluster_identity_range.png", plot_cluster_identity_range),
     ]
     for fname, func in plot_funcs:
         fig_i, ax_i = plt.subplots(figsize=(8, 5))

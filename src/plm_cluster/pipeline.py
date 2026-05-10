@@ -288,7 +288,30 @@ def merge_hmm_shards(outdir: str, config: dict, logger, resume: bool = False) ->
 
 
 def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger, resume: bool = False) -> dict[str, str]:
-    """Step 1: Cluster proteins into subfamilies using MMseqs2."""
+    """Step 1: Cluster proteins into subfamilies using MMseqs2.
+
+    Pre-filtering
+    -------------
+    When ``mmseqs.min_protein_length > 0``, proteins shorter than that threshold
+    are removed before clustering.  Dropped proteins are written to
+    ``filtered_short_proteins.tsv`` (columns: ``protein_id``, ``length_aa``).
+
+    Extended stats
+    --------------
+    ``subfamily_stats.tsv`` now includes the following extra columns:
+
+    * ``is_singleton`` – 1 when the cluster has exactly one member, else 0.
+    * ``min_length_aa``, ``max_length_aa``, ``mean_length_aa``, ``std_length_aa``
+      – length distribution of member sequences.
+    * ``min_pident``, ``max_pident``, ``mean_pident`` – identity range across
+      within-cluster pairwise alignments produced by ``mmseqs align``.
+      Null for singletons.
+
+    Summary report
+    --------------
+    ``mmseqs_cluster_report.tsv`` (one wide row) summarises counts of singletons,
+    multi-member clusters, filtered proteins, and profile-eligible clusters.
+    """
     out = _ensure_dir(outdir)
     if resume and (out / "subfamily_map.tsv").exists():
         logger.info("Resume: mmseqs-cluster outputs already exist in %s, skipping.", str(out))
@@ -296,12 +319,46 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger, resum
     mm = config["mmseqs"]
     tools = require_executables(["mmseqs"], config["tools"])
     tmpdir = _ensure_dir(mm["tmpdir"])
+    min_len = int(mm.get("min_protein_length", 0))
+    min_cluster_size_for_profile = int(mm.get("min_cluster_size_for_profile", 1))
 
+    # ------------------------------------------------------------------
+    # Load sequences and apply length pre-filter
+    # ------------------------------------------------------------------
+    all_records = list(read_fasta(proteins_fasta))
+    n_input = len(all_records)
+    if min_len > 0:
+        kept_records = [r for r in all_records if len(r.seq) >= min_len]
+        filtered_records = [r for r in all_records if len(r.seq) < min_len]
+        if filtered_records:
+            pl.DataFrame({
+                "protein_id": [r.id for r in filtered_records],
+                "length_aa": [len(r.seq) for r in filtered_records],
+            }).write_csv(out / "filtered_short_proteins.tsv", separator="\t")
+            logger.info(
+                "Length pre-filter (min_protein_length=%d): removed %d / %d proteins",
+                min_len, len(filtered_records), n_input,
+            )
+    else:
+        kept_records = all_records
+        filtered_records = []
+
+    n_filtered = len(filtered_records)
+    n_clustered = len(kept_records)
+
+    # Write the (possibly filtered) FASTA for MMseqs2
+    filtered_fasta = out / "proteins_for_clustering.faa"
+    write_fasta(filtered_fasta, kept_records)
+    seqs = {r.id: r.seq for r in kept_records}
+
+    # ------------------------------------------------------------------
+    # Run MMseqs2 clustering
+    # ------------------------------------------------------------------
     db = out / "proteinsDB"
     clu = out / "clusterDB"
     tsv = out / "clusters.tsv"
     rep_db = out / "repDB"
-    run_cmd([tools["mmseqs"], "createdb", proteins_fasta, str(db)], logger)
+    run_cmd([tools["mmseqs"], "createdb", str(filtered_fasta), str(db)], logger)
     mmseqs_cmd = [
         tools["mmseqs"], mm["mode"], str(db), str(clu), str(tmpdir),
         "--min-seq-id", str(mm["min_seq_id"]),
@@ -332,10 +389,62 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger, resum
     mapping = raw.select(["protein_id", "subfamily_id", "is_rep"]).sort(["subfamily_id", "protein_id"])
     mapping.write_csv(out / "subfamily_map.tsv", separator="\t")
 
-    seqs = {r.id: r.seq for r in read_fasta(proteins_fasta)}
     rep_records = [FastaRecord(rep_to_sub[rid], seqs[rid]) for rid in reps_sorted if rid in seqs]
     write_fasta(out / "subfamily_reps.faa", rep_records)
 
+    # ------------------------------------------------------------------
+    # Compute within-cluster identity stats via mmseqs align
+    # ------------------------------------------------------------------
+    align_db = out / "alignDB"
+    align_tsv = out / "align.tsv"
+    try:
+        run_cmd(
+            [tools["mmseqs"], "align", str(db), str(db), str(clu), str(align_db),
+             "--threads", str(mm["threads"]), "-a"],
+            logger,
+        )
+        run_cmd(
+            [tools["mmseqs"], "convertalis", str(db), str(db), str(align_db), str(align_tsv),
+             "--format-output", "query,target,pident",
+             "--threads", str(mm["threads"])],
+            logger,
+        )
+    except Exception as exc:
+        logger.warning("mmseqs align for identity stats failed (skipping): %s", exc)
+        align_tsv = None
+
+    # Build per-cluster pident stats from the alignment TSV
+    cluster_pident: dict[str, dict[str, float]] = {}
+    if align_tsv is not None and Path(str(align_tsv)).exists() and Path(str(align_tsv)).stat().st_size > 0:
+        try:
+            aln_df = pl.read_csv(align_tsv, separator="\t", has_header=False,
+                                 new_columns=["query", "target", "pident"])
+            # Map query protein → subfamily
+            pid_to_sub = dict(zip(raw["protein_id"].to_list(), raw["subfamily_id"].to_list()))
+            aln_df = aln_df.filter(pl.col("query") != pl.col("target"))
+            aln_df = aln_df.with_columns(
+                pl.col("query").map_elements(lambda p: pid_to_sub.get(p, ""), return_dtype=pl.String).alias("subfamily_id")
+            ).filter(pl.col("subfamily_id") != "")
+            pident_stats = (
+                aln_df.group_by("subfamily_id")
+                .agg([
+                    pl.col("pident").min().alias("min_pident"),
+                    pl.col("pident").max().alias("max_pident"),
+                    pl.col("pident").mean().alias("mean_pident"),
+                ])
+            )
+            for row in pident_stats.iter_rows(named=True):
+                cluster_pident[row["subfamily_id"]] = {
+                    "min_pident": row["min_pident"],
+                    "max_pident": row["max_pident"],
+                    "mean_pident": row["mean_pident"],
+                }
+        except Exception as exc:
+            logger.warning("Failed to parse alignment TSV for identity stats: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Build extended subfamily_stats.tsv
+    # ------------------------------------------------------------------
     stats = raw.group_by("subfamily_id").agg(pl.col("protein_id").len().alias("n_members"))
     reps_df = (
         raw.filter(pl.col("is_rep") == 1)
@@ -343,13 +452,88 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger, resum
         .rename({"protein_id": "rep_protein_id"})
     )
     stats = stats.join(reps_df, on="subfamily_id", how="left")
+
+    # Collect all member lengths per cluster
+    subfam_member_ids: dict[str, list[str]] = {}
+    for row in raw.iter_rows(named=True):
+        subfam_member_ids.setdefault(row["subfamily_id"], []).append(row["protein_id"])
+
+    subfam_ids_list = stats["subfamily_id"].to_list()
     rep_ids = stats["rep_protein_id"].to_list()
-    stats = stats.with_columns(
-        pl.Series("rep_length_aa", [len(seqs.get(rid, "")) if rid else 0 for rid in rep_ids])
-    )
+
+    rep_lengths = [len(seqs.get(rid, "")) if rid else 0 for rid in rep_ids]
+    min_lens, max_lens, mean_lens, std_lens = [], [], [], []
+    is_singleton_col = []
+    min_pident_col, max_pident_col, mean_pident_col = [], [], []
+
+    for sfid in subfam_ids_list:
+        member_lens = [len(seqs.get(pid, "")) for pid in subfam_member_ids.get(sfid, [])]
+        if member_lens:
+            min_lens.append(min(member_lens))
+            max_lens.append(max(member_lens))
+            mean_lens.append(sum(member_lens) / len(member_lens))
+            n = len(member_lens)
+            if n > 1:
+                variance = sum((x - mean_lens[-1]) ** 2 for x in member_lens) / n
+                std_lens.append(variance ** 0.5)
+            else:
+                std_lens.append(0.0)
+        else:
+            min_lens.append(0)
+            max_lens.append(0)
+            mean_lens.append(0.0)
+            std_lens.append(0.0)
+
+        n_mem = len(subfam_member_ids.get(sfid, []))
+        is_singleton_col.append(1 if n_mem == 1 else 0)
+
+        pident_info = cluster_pident.get(sfid, {})
+        min_pident_col.append(pident_info.get("min_pident", None))
+        max_pident_col.append(pident_info.get("max_pident", None))
+        mean_pident_col.append(pident_info.get("mean_pident", None))
+
+    stats = stats.with_columns([
+        pl.Series("rep_length_aa", rep_lengths),
+        pl.Series("is_singleton", is_singleton_col, dtype=pl.Int8),
+        pl.Series("min_length_aa", min_lens),
+        pl.Series("max_length_aa", max_lens),
+        pl.Series("mean_length_aa", mean_lens),
+        pl.Series("std_length_aa", std_lens),
+        pl.Series("min_pident", min_pident_col, dtype=pl.Float64),
+        pl.Series("max_pident", max_pident_col, dtype=pl.Float64),
+        pl.Series("mean_pident", mean_pident_col, dtype=pl.Float64),
+    ])
     stats.sort("subfamily_id").write_csv(out / "subfamily_stats.tsv", separator="\t")
-    logger.info("MMseqs2 clustering complete: %d proteins -> %d subfamilies (median size: %.0f)",
-                len(raw), len(reps_sorted), float(stats["n_members"].median()))
+
+    # ------------------------------------------------------------------
+    # Write summary report
+    # ------------------------------------------------------------------
+    n_clusters_total = len(reps_sorted)
+    n_singletons = int(stats["is_singleton"].sum())
+    n_clusters_2plus = n_clusters_total - n_singletons
+    n_clusters_above_profile_threshold = int(
+        (stats["n_members"] >= min_cluster_size_for_profile).sum()
+    )
+    report = pl.DataFrame({
+        "n_proteins_input": [n_input],
+        "n_proteins_filtered_short": [n_filtered],
+        "n_proteins_clustered": [n_clustered],
+        "n_clusters_total": [n_clusters_total],
+        "n_singletons": [n_singletons],
+        "n_clusters_2plus": [n_clusters_2plus],
+        "n_clusters_above_min_profile_size": [n_clusters_above_profile_threshold],
+    })
+    report.write_csv(out / "mmseqs_cluster_report.tsv", separator="\t")
+
+    median_size = float(stats["n_members"].median())
+    logger.info(
+        "MMseqs2 clustering complete: %d proteins -> %d subfamilies "
+        "(median size: %.0f, singletons: %d, clusters ≥2: %d, "
+        "eligible for profiles [≥%d]: %d)",
+        len(raw), n_clusters_total, median_size,
+        n_singletons, n_clusters_2plus,
+        min_cluster_size_for_profile, n_clusters_above_profile_threshold,
+    )
     return tools
 
 
@@ -441,6 +625,7 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
     subcluster_mode = str(of_cfg.get("subcluster_mode", "linclust")).lower()
     auto_linclust_min_size = int(of_cfg.get("auto_linclust_min_size", 1000))
     min_og_size = int(of_cfg.get("min_og_size_for_subclustering", 2))
+    min_protein_length = int(config.get("mmseqs", {}).get("min_protein_length", 0))
     # per-OG MMseqs2 thread count (subcluster_threads) and number of OGs
     # processed concurrently (parallel_og_workers) are kept separate so that
     # total CPU load = parallel_og_workers × subcluster_threads.
@@ -495,6 +680,19 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
         if not records:
             logger.warning("OG file %s is empty, skipping.", str(og_file))
             return [], [], [], [], 0
+
+        # Apply protein length pre-filter
+        if min_protein_length > 0:
+            filtered_out = [r for r in records if len(r.seq) < min_protein_length]
+            records = [r for r in records if len(r.seq) >= min_protein_length]
+            if filtered_out:
+                logger.info(
+                    "OG %s: removed %d short protein(s) (min_protein_length=%d)",
+                    og_stem, len(filtered_out), min_protein_length,
+                )
+            if not records:
+                logger.warning("OG file %s: all proteins removed by length filter, skipping.", str(og_file))
+                return [], [], [], [], 0
 
         seqs = {r.id: r.seq for r in records}
         sorted_protein_ids = sorted(seqs.keys())
@@ -642,7 +840,7 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
     rep_records_sorted = sorted(rep_records, key=lambda r: r.id)
     write_fasta(str(out / "subfamily_reps.faa"), rep_records_sorted)
 
-    # Write subfamily_stats.tsv (same schema as mmseqs_cluster output)
+    # Write extended subfamily_stats.tsv (matches mmseqs_cluster output schema)
     stats = (
         mapping_df
         .group_by("subfamily_id")
@@ -656,20 +854,64 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
     stats = stats.join(reps_df, on="subfamily_id", how="left")
     all_seqs = {r.id: r.seq for r in combined_seqs}
     rep_ids_list = stats["rep_protein_id"].to_list()
-    stats = stats.with_columns(
-        pl.Series("rep_length_aa", [len(all_seqs.get(rid, "")) if rid else 0 for rid in rep_ids_list])
-    )
+
+    # Build per-subfamily member sequences for length stats
+    subfam_member_ids_of: dict[str, list[str]] = {}
+    for row in mapping_df.iter_rows(named=True):
+        subfam_member_ids_of.setdefault(row["subfamily_id"], []).append(row["protein_id"])
+
+    of_subfam_ids = stats["subfamily_id"].to_list()
+    rep_lengths = [len(all_seqs.get(rid, "")) if rid else 0 for rid in rep_ids_list]
+    is_singleton_col: list[int] = []
+    min_lens: list[int] = []
+    max_lens: list[int] = []
+    mean_lens: list[float] = []
+    std_lens: list[float] = []
+
+    for sfid in of_subfam_ids:
+        member_lens = [len(all_seqs.get(pid, "")) for pid in subfam_member_ids_of.get(sfid, [])]
+        n_mem = len(member_lens)
+        is_singleton_col.append(1 if n_mem == 1 else 0)
+        if member_lens:
+            mn = min(member_lens)
+            mx = max(member_lens)
+            avg = sum(member_lens) / n_mem
+            if n_mem > 1:
+                variance = sum((x - avg) ** 2 for x in member_lens) / n_mem
+                std = variance ** 0.5
+            else:
+                std = 0.0
+        else:
+            mn, mx, avg, std = 0, 0, 0.0, 0.0
+        min_lens.append(mn)
+        max_lens.append(mx)
+        mean_lens.append(avg)
+        std_lens.append(std)
+
+    stats = stats.with_columns([
+        pl.Series("rep_length_aa", rep_lengths),
+        pl.Series("is_singleton", is_singleton_col, dtype=pl.Int8),
+        pl.Series("min_length_aa", min_lens),
+        pl.Series("max_length_aa", max_lens),
+        pl.Series("mean_length_aa", mean_lens),
+        pl.Series("std_length_aa", std_lens),
+        # pident stats not computed for OrthoFinder mode (no within-cluster align step)
+        pl.Series("min_pident", [None] * len(of_subfam_ids), dtype=pl.Float64),
+        pl.Series("max_pident", [None] * len(of_subfam_ids), dtype=pl.Float64),
+        pl.Series("mean_pident", [None] * len(of_subfam_ids), dtype=pl.Float64),
+    ])
     stats.sort("subfamily_id").write_csv(str(out / "subfamily_stats.tsv"), separator="\t")
 
     n_subfamilies = len(rep_records_sorted)
     n_proteins = len(all_rows)
     n_ogs = len(og_files)
+    n_of_singletons = int(stats["is_singleton"].sum()) if len(stats) > 0 else 0
     pct_singletons = 100.0 * n_singletons / n_proteins if n_proteins else 0.0
     median_size = float(stats["n_members"].median()) if len(stats) > 0 else 0.0
     logger.info(
         "OrthoFinder subclustering complete: %d OGs → %d subfamilies from %d proteins "
-        "(median size: %.0f, %.1f%% singletons)",
-        n_ogs, n_subfamilies, n_proteins, median_size, pct_singletons,
+        "(median size: %.0f, singletons: %d [%.1f%%])",
+        n_ogs, n_subfamilies, n_proteins, median_size, n_of_singletons, pct_singletons,
     )
     return tools
 
@@ -677,7 +919,16 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
 def build_profiles(
     proteins_fasta: str, subfamily_map: str, outdir: str, config: dict, logger, resume: bool = False
 ) -> dict[str, str]:
-    """Step 2: Build MSAs (MAFFT) and profile HMMs (hhmake) for each subfamily."""
+    """Step 2: Build MSAs (MAFFT) and profile HMMs (hhmake) for each subfamily.
+
+    Subfamilies with fewer members than ``mmseqs.min_cluster_size_for_profile``
+    are skipped — no profile is built for them.  Skipped subfamilies are still
+    included in ``subfamily_profile_index.tsv`` with ``profile_built=False`` and
+    an appropriate ``skipped_reason`` so that downstream steps can identify them.
+
+    Singletons that are skipped still appear in ``subfamily_reps.faa`` and are
+    embedded in Step 3, so they can join families via KNN edges in Step 4.
+    """
     out = _ensure_dir(outdir)
     tools = require_executables(["mafft", "hhmake"], config["tools"])
     if not Path(subfamily_map).exists():
@@ -687,6 +938,7 @@ def build_profiles(
     smap = pl.read_csv(subfamily_map, separator="\t")
     seqs = {r.id: r.seq for r in read_fasta(proteins_fasta)}
     cap = int(config["profiles"]["max_members_per_subfamily"])
+    min_cluster_size_for_profile = int(config.get("mmseqs", {}).get("min_cluster_size_for_profile", 1))
 
     def _process_subfam(subfam, members):
         fa = out / f"{subfam}.faa"
@@ -703,6 +955,8 @@ def build_profiles(
             "hhm_path": str(hhm),
             "msa_path": str(a3m),
             "n_members_used": len(members),
+            "profile_built": True,
+            "skipped_reason": "",
             "build_tool": "mafft+hhmake",
             "build_params_json": json.dumps({"mafft": "--auto", "max_members": cap}),
         }
@@ -727,24 +981,72 @@ def build_profiles(
         for row in agg.iter_rows(named=True)
     }
 
+    # Determine per-subfamily cluster sizes and identify those to skip
+    size_counts: dict[str, int] = {
+        row["subfamily_id"]: len(row["protein_id"])
+        for row in agg.iter_rows(named=True)
+    }
+
+    def _skipped_reason(n: int) -> str:
+        if n == 1:
+            return "singleton"
+        return "below_min_cluster_size"
+
+    # Rows for skipped subfamilies (no profile built)
+    skipped_rows: list[dict] = []
+    eligible_subfam_members: list[tuple[str, list[str]]] = []
+    n_skipped_singletons = 0
+    for sfid, members in subfam_members.items():
+        n = size_counts.get(sfid, len(members))
+        if n < min_cluster_size_for_profile:
+            reason = _skipped_reason(n)
+            if reason == "singleton":
+                n_skipped_singletons += 1
+            skipped_rows.append({
+                "subfamily_id": sfid,
+                "hhm_path": "",
+                "msa_path": "",
+                "n_members_used": 0,
+                "profile_built": False,
+                "skipped_reason": reason,
+                "build_tool": "",
+                "build_params_json": "",
+            })
+        else:
+            eligible_subfam_members.append((sfid, members))
+
+    n_skipped = len(skipped_rows)
+    if n_skipped > 0:
+        logger.info(
+            "Skipping profile build for %d subfamilies (%d singletons) "
+            "below min_cluster_size_for_profile=%d",
+            n_skipped, n_skipped_singletons, min_cluster_size_for_profile,
+        )
+
     if resume:
-        for subfam, members in subfam_members.items():
+        already_built: list[dict] = []
+        pending_subfams: list[tuple[str, list[str]]] = []
+        for subfam, members in eligible_subfam_members:
             hhm_path = out / f"{subfam}.hhm"
             if hhm_path.exists():
                 a3m_path = out / f"{subfam}.a3m"
-                rows.append({
+                already_built.append({
                     "subfamily_id": subfam,
                     "hhm_path": str(hhm_path),
                     "msa_path": str(a3m_path) if a3m_path.exists() else "",
                     "n_members_used": len(members),
+                    "profile_built": True,
+                    "skipped_reason": "",
                     "build_tool": "mafft+hhmake",
                     "build_params_json": json.dumps({"mafft": "--auto", "max_members": cap}),
                 })
-        pending_subfams = [(s, m) for s, m in subfam_members.items() if not (out / f"{s}.hhm").exists()]
+            else:
+                pending_subfams.append((subfam, members))
+        rows.extend(already_built)
         logger.info("Resume: %d profiles already built, building %d missing.",
-                    len(rows), len(pending_subfams))
+                    len(already_built), len(pending_subfams))
     else:
-        pending_subfams = list(subfam_members.items())
+        pending_subfams = list(eligible_subfam_members)
 
     failed: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_workers) as executor:
@@ -762,8 +1064,13 @@ def build_profiles(
     if failed:
         logger.warning("%d subfamily profile(s) failed: %s", len(failed), ", ".join(failed[:20]))
 
-    pl.from_dicts(rows).sort("subfamily_id").write_csv(out / "subfamily_profile_index.tsv", separator="\t")
-    logger.info("Profile construction complete: %d profiles built/loaded, %d failed", len(rows), len(failed))
+    # Combine built + skipped rows; write the full index
+    all_rows = rows + skipped_rows
+    pl.from_dicts(all_rows).sort("subfamily_id").write_csv(out / "subfamily_profile_index.tsv", separator="\t")
+    logger.info(
+        "Profile construction complete: %d profiles built/loaded, %d skipped, %d failed",
+        len(rows), n_skipped, len(failed),
+    )
     return tools
 
 
@@ -996,6 +1303,12 @@ def hmm_hmm_edges(
         progress_path = out / "hmm_hmm_progress.ndjson"
 
     idx = pl.read_csv(profile_index, separator="\t").sort("subfamily_id")
+    # Filter out subfamilies that were skipped during profile building
+    # (hhm_path is empty for singletons / below-threshold clusters).
+    if "profile_built" in idx.columns:
+        idx = idx.filter(pl.col("profile_built").cast(pl.Boolean))
+    else:
+        idx = idx.filter(pl.col("hhm_path") != "")
     lengths = dict(zip(idx["subfamily_id"].to_list(), [_parse_hhm_len(p) for p in idx["hhm_path"].to_list()]))
     hhm = dict(zip(idx["subfamily_id"].to_list(), idx["hhm_path"].to_list()))
 
