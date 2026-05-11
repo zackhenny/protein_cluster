@@ -53,6 +53,10 @@ def test_smoke_pipeline_with_mocked_tools(tmp_path: Path, monkeypatch):
     class DummyLogger:
         def info(self, *args, **kwargs):
             return None
+        def warning(self, *args, **kwargs):
+            return None
+        def error(self, *args, **kwargs):
+            return None
 
     logger = DummyLogger()
 
