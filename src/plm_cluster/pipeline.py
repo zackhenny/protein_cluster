@@ -538,6 +538,10 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger, resum
         n_singletons, n_clusters_2plus,
         min_cluster_size_for_profile, n_clusters_above_profile_threshold,
     )
+
+    from .qc_plots import generate_mmseqs_plots
+    generate_mmseqs_plots(str(out), logger=logger, resume=resume)
+
     return tools
 
 

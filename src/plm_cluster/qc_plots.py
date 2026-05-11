@@ -32,7 +32,7 @@ def plot_subfamily_sizes(results_root: str, ax: Any) -> None:
         ax.set_visible(False)
         return
     sizes = df["n_members"]
-    ax.hist(sizes, bins=min(50, max(10, len(sizes) // 5)), color="#4c72b0", edgecolor="white", linewidth=0.5)
+    ax.hist(sizes, bins=_hist_bins(len(sizes)), color="#4c72b0", edgecolor="white", linewidth=0.5)
     ax.set_xlabel("Members per subfamily")
     ax.set_ylabel("Count")
     ax.set_title("Subfamily size distribution")
@@ -237,6 +237,144 @@ def plot_cluster_identity_range(results_root: str, ax: Any) -> None:
     ax.set_ylabel("Identity range (max − min pident, %)")
     ax.set_title("Within-cluster identity range")
     ax.set_xscale("log")
+
+
+# ---------------------------------------------------------------------------
+# MMseqs-specific plot helpers (read directly from the mmseqs output dir)
+# ---------------------------------------------------------------------------
+
+def _safe_read_mmseqs(mmseqs_outdir: str | Path, filename: str, **kw) -> pd.DataFrame | None:
+    """Read a TSV from *mmseqs_outdir* if it exists and is non-empty."""
+    return _safe_read(Path(mmseqs_outdir) / filename, **kw)
+
+
+def _hist_bins(n: int) -> int:
+    """Return a sensible bin count for a histogram of *n* items."""
+    return min(50, max(10, n // 5))
+
+
+def plot_mmseqs_rep_lengths(mmseqs_outdir: str, ax: Any) -> None:
+    """Histogram of representative sequence lengths across all clusters."""
+    df = _safe_read_mmseqs(mmseqs_outdir, "subfamily_stats.tsv")
+    if df is None or "rep_length_aa" not in df.columns:
+        ax.set_visible(False)
+        return
+    lengths = df["rep_length_aa"].dropna()
+    if lengths.empty:
+        ax.set_visible(False)
+        return
+    ax.hist(lengths, bins=_hist_bins(len(lengths)), color="#4c72b0",
+            edgecolor="white", linewidth=0.5)
+    ax.set_xlabel("Representative sequence length (aa)")
+    ax.set_ylabel("Count")
+    ax.set_title("Representative sequence length distribution")
+    median = float(np.median(lengths))
+    ax.axvline(median, color="#c44e52", linestyle="--", label=f"median = {median:.0f}")
+    ax.legend(fontsize=8)
+
+
+def plot_mmseqs_mean_pident(mmseqs_outdir: str, ax: Any) -> None:
+    """Histogram of mean within-cluster sequence identity for multi-member clusters."""
+    df = _safe_read_mmseqs(mmseqs_outdir, "subfamily_stats.tsv")
+    if df is None or "mean_pident" not in df.columns or "n_members" not in df.columns:
+        ax.set_visible(False)
+        return
+    multi = df[df["n_members"] >= 2].dropna(subset=["mean_pident"])
+    if multi.empty:
+        ax.set_visible(False)
+        return
+    ax.hist(multi["mean_pident"], bins=_hist_bins(len(multi)),
+            color="#55a868", edgecolor="white", linewidth=0.5)
+    ax.set_xlabel("Mean pairwise identity (%)")
+    ax.set_ylabel("Count")
+    ax.set_title("Mean within-cluster identity (multi-member clusters)")
+    median = float(np.median(multi["mean_pident"]))
+    ax.axvline(median, color="#c44e52", linestyle="--", label=f"median = {median:.1f}%")
+    ax.legend(fontsize=8)
+
+
+# ---------------------------------------------------------------------------
+# MMseqs dashboard
+# ---------------------------------------------------------------------------
+
+def generate_mmseqs_plots(mmseqs_outdir: str, logger=None, resume: bool = False) -> Path | None:
+    """Generate a multi-panel QC figure for the MMseqs2 clustering step.
+
+    Plots are saved to ``{mmseqs_outdir}/plots/``.  Both a combined dashboard
+    (``mmseqs_summary.png``) and individual PNG files are written.
+
+    Parameters
+    ----------
+    mmseqs_outdir : str
+        Path to the MMseqs2 output directory (e.g. ``results/01_mmseqs``).
+    logger : logging.Logger, optional
+        Logger for status messages.
+    resume : bool, optional
+        If True and the summary figure already exists, skip generation.
+
+    Returns
+    -------
+    Path or None
+        Path to the saved summary figure, or None if matplotlib is unavailable.
+    """
+    out = Path(mmseqs_outdir) / "plots"
+    summary_path = out / "mmseqs_summary.png"
+    if resume and summary_path.exists():
+        if logger:
+            logger.info("Resume: MMseqs plots already exist at %s, skipping.", str(out))
+        return summary_path
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        if logger:
+            logger.warning("matplotlib not installed — skipping MMseqs QC plots")
+        return None
+
+    out.mkdir(parents=True, exist_ok=True)
+
+    # results_root is the parent of mmseqs_outdir; the existing plot helpers
+    # expect Path(results_root) / "01_mmseqs" / <file> which resolves correctly
+    # when mmseqs_outdir is named "01_mmseqs".  If a custom name is used the
+    # individual mmseqs-specific helpers (plot_mmseqs_*) are used instead.
+    results_root = str(Path(mmseqs_outdir).parent)
+
+    # 3×2 grid: 6 mmseqs-focused panels
+    fig, axes = plt.subplots(3, 2, figsize=(14, 15))
+    fig.suptitle("MMseqs2 Clustering QC", fontsize=16, fontweight="bold")
+
+    plot_subfamily_sizes(results_root, axes[0, 0])
+    plot_singleton_summary(results_root, axes[0, 1])
+    plot_cluster_length_variation(results_root, axes[1, 0])
+    plot_cluster_identity_range(results_root, axes[1, 1])
+    plot_mmseqs_rep_lengths(mmseqs_outdir, axes[2, 0])
+    plot_mmseqs_mean_pident(mmseqs_outdir, axes[2, 1])
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(summary_path, dpi=150)
+    plt.close(fig)
+
+    # Save individual plots
+    individual_plots = [
+        ("subfamily_size_distribution.png", lambda ax: plot_subfamily_sizes(results_root, ax)),
+        ("singleton_summary.png", lambda ax: plot_singleton_summary(results_root, ax)),
+        ("cluster_length_variation.png", lambda ax: plot_cluster_length_variation(results_root, ax)),
+        ("cluster_identity_range.png", lambda ax: plot_cluster_identity_range(results_root, ax)),
+        ("rep_length_distribution.png", lambda ax: plot_mmseqs_rep_lengths(mmseqs_outdir, ax)),
+        ("mean_pident_distribution.png", lambda ax: plot_mmseqs_mean_pident(mmseqs_outdir, ax)),
+    ]
+    for fname, func in individual_plots:
+        fig_i, ax_i = plt.subplots(figsize=(8, 5))
+        func(ax_i)
+        fig_i.tight_layout()
+        fig_i.savefig(out / fname, dpi=150)
+        plt.close(fig_i)
+
+    if logger:
+        logger.info("MMseqs QC plots saved to %s", str(out))
+    return summary_path
 
 
 # ---------------------------------------------------------------------------

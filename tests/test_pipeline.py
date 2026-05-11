@@ -1136,3 +1136,170 @@ def test_qc_cluster_identity_range_with_data(tmp_path: Path):
     fig, ax = plt.subplots()
     plot_cluster_identity_range(str(tmp_path), ax)
     plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# MMseqs plot helpers: new functions
+# ---------------------------------------------------------------------------
+
+def test_plot_mmseqs_rep_lengths_empty(tmp_path: Path):
+    """plot_mmseqs_rep_lengths handles missing data gracefully."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        pytest.skip("matplotlib not installed")
+
+    from plm_cluster.qc_plots import plot_mmseqs_rep_lengths
+
+    fig, ax = plt.subplots()
+    plot_mmseqs_rep_lengths(str(tmp_path), ax)  # no data file present
+    plt.close(fig)
+
+
+def test_plot_mmseqs_rep_lengths_with_data(tmp_path: Path):
+    """plot_mmseqs_rep_lengths renders a histogram from rep_length_aa data."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        pytest.skip("matplotlib not installed")
+
+    from plm_cluster.qc_plots import plot_mmseqs_rep_lengths
+
+    pd.DataFrame({
+        "subfamily_id": ["s1", "s2", "s3"],
+        "n_members": [1, 5, 10],
+        "rep_length_aa": [100, 200, 300],
+    }).to_csv(tmp_path / "subfamily_stats.tsv", sep="\t", index=False)
+
+    fig, ax = plt.subplots()
+    plot_mmseqs_rep_lengths(str(tmp_path), ax)
+    plt.close(fig)
+
+
+def test_plot_mmseqs_mean_pident_empty(tmp_path: Path):
+    """plot_mmseqs_mean_pident handles missing data gracefully."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        pytest.skip("matplotlib not installed")
+
+    from plm_cluster.qc_plots import plot_mmseqs_mean_pident
+
+    fig, ax = plt.subplots()
+    plot_mmseqs_mean_pident(str(tmp_path), ax)  # no data file present
+    plt.close(fig)
+
+
+def test_plot_mmseqs_mean_pident_with_data(tmp_path: Path):
+    """plot_mmseqs_mean_pident renders a histogram of per-cluster mean pident."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        pytest.skip("matplotlib not installed")
+
+    from plm_cluster.qc_plots import plot_mmseqs_mean_pident
+
+    pd.DataFrame({
+        "subfamily_id": ["s1", "s2", "s3"],
+        "n_members": [1, 5, 10],
+        "mean_pident": [None, 85.0, 90.0],
+    }).to_csv(tmp_path / "subfamily_stats.tsv", sep="\t", index=False)
+
+    fig, ax = plt.subplots()
+    plot_mmseqs_mean_pident(str(tmp_path), ax)
+    plt.close(fig)
+
+
+def test_generate_mmseqs_plots_no_data(tmp_path: Path):
+    """generate_mmseqs_plots completes without error even with no input files."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+    except ImportError:
+        pytest.skip("matplotlib not installed")
+
+    from plm_cluster.qc_plots import generate_mmseqs_plots
+
+    mm_dir = tmp_path / "01_mmseqs"
+    mm_dir.mkdir(parents=True)
+    result = generate_mmseqs_plots(str(mm_dir))
+    assert result is not None
+    assert result.exists()
+    plots_dir = mm_dir / "plots"
+    assert plots_dir.is_dir()
+
+
+def test_generate_mmseqs_plots_with_data(tmp_path: Path):
+    """generate_mmseqs_plots saves summary + all individual PNGs."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+    except ImportError:
+        pytest.skip("matplotlib not installed")
+
+    from plm_cluster.qc_plots import generate_mmseqs_plots
+
+    mm_dir = tmp_path / "01_mmseqs"
+    mm_dir.mkdir(parents=True)
+    pd.DataFrame({
+        "subfamily_id": [f"s{i}" for i in range(20)],
+        "n_members": [1] * 10 + [2] * 5 + [5] * 5,
+        "rep_protein_id": [f"p{i}" for i in range(20)],
+        "rep_length_aa": [100 + i * 10 for i in range(20)],
+        "is_singleton": [1] * 10 + [0] * 10,
+        "min_length_aa": [90] * 20,
+        "max_length_aa": [110] * 20,
+        "mean_length_aa": [100.0] * 20,
+        "std_length_aa": [0.0] * 10 + [5.0] * 10,
+        "min_pident": [None] * 10 + [75.0] * 10,
+        "max_pident": [None] * 10 + [100.0] * 10,
+        "mean_pident": [None] * 10 + [88.0] * 10,
+    }).to_csv(mm_dir / "subfamily_stats.tsv", sep="\t", index=False)
+
+    result = generate_mmseqs_plots(str(mm_dir))
+    assert result is not None
+    assert result.exists()
+
+    plots_dir = mm_dir / "plots"
+    expected_files = [
+        "mmseqs_summary.png",
+        "subfamily_size_distribution.png",
+        "singleton_summary.png",
+        "cluster_length_variation.png",
+        "cluster_identity_range.png",
+        "rep_length_distribution.png",
+        "mean_pident_distribution.png",
+    ]
+    for fname in expected_files:
+        assert (plots_dir / fname).exists(), f"Missing: {fname}"
+
+
+def test_generate_mmseqs_plots_resume(tmp_path: Path):
+    """generate_mmseqs_plots respects the resume flag."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+    except ImportError:
+        pytest.skip("matplotlib not installed")
+
+    from plm_cluster.qc_plots import generate_mmseqs_plots
+
+    mm_dir = tmp_path / "01_mmseqs"
+    mm_dir.mkdir(parents=True)
+    plots_dir = mm_dir / "plots"
+    plots_dir.mkdir(parents=True)
+    sentinel = plots_dir / "mmseqs_summary.png"
+    sentinel.write_bytes(b"fake")
+
+    result = generate_mmseqs_plots(str(mm_dir), resume=True)
+    assert result == sentinel
+    # The file should remain unchanged (the fake bytes, not a real PNG)
+    assert sentinel.read_bytes() == b"fake"
