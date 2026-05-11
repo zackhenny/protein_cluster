@@ -42,7 +42,7 @@ bash scripts/install_in_conda_env.sh plm_cluster . test,embed
 plm_cluster run-all \
   --proteins_fasta proteins.faa \
   --weights_path /path/to/esm2_t33_650M_UR50D.pt \
-  --config docs/config.template.yaml \
+  --config config.yaml \
   --results_root results
 ```
 
@@ -71,7 +71,7 @@ config lives in the project root:
 plm_cluster run-all --config config.yaml ...
 ```
 
-Copy `config.yaml` (or `docs/config.template.yaml`) and edit to taste.  Every
+Copy `config.yaml` and edit to taste.  Every
 parameter has inline comments explaining its purpose and allowed range.
 
 Key tuning knobs:
@@ -89,7 +89,7 @@ Key tuning knobs:
 | `profiles.parallel_workers` | Concurrent MAFFT+hhmake jobs (separate from per-tool thread count) |
 | `hmm_hmm.parallel_workers` | Concurrent hhalign/hhsearch jobs (separate from per-tool thread count) |
 
-See [`docs/config.template.yaml`](docs/config.template.yaml) for the full list.
+See [`config.yaml`](config.yaml) for the full list.
 
 > **HPC note (CPU oversubscription):** `mmseqs.threads` controls the thread
 > count passed to each tool invocation, while `profiles.parallel_workers` and
@@ -346,7 +346,7 @@ results/
 | [Algorithm background](docs/algorithm_background.md) | Scientific rationale and method details |
 | [rKCNN implementation plan](docs/rkcnn_implementation_plan.md) | rKCNN integration design and data flow |
 | [CLI workflow](docs/cli_workflow_and_options.md) | Step-by-step and `run-all` usage |
-| [Config reference](docs/config.template.yaml) | All parameters with inline comments |
+| [Config reference](config.yaml) | All parameters with inline comments |
 | [OrthoFinder config](docs/config.orthofinder.yaml) | OrthoFinder-specific config template with detailed comments |
 | [Output schemas](docs/output_schemas.md) | File formats and column descriptions |
 | [Installation](docs/installation_and_containers.md) | Conda, containers, and HPC tips |

@@ -128,11 +128,12 @@ def plot_fusion_fraction(results_root: str, ax: Any) -> None:
 
 
 def plot_singleton_summary(results_root: str, ax: Any) -> None:
-    """Stacked bar chart of singletons, 2-member, and 3+ member clusters."""
+    """Bar chart of cluster size distribution with singleton percentage statistics in title."""
     report = _safe_read(Path(results_root) / "01_mmseqs" / "mmseqs_cluster_report.tsv")
+    df = _safe_read(Path(results_root) / "01_mmseqs" / "subfamily_stats.tsv")
+
     if report is None:
-        # Fall back to computing from subfamily_stats.tsv if report is absent
-        df = _safe_read(Path(results_root) / "01_mmseqs" / "subfamily_stats.tsv")
+        # Compute everything from subfamily_stats.tsv
         if df is None or "n_members" not in df.columns:
             ax.set_visible(False)
             return
@@ -142,7 +143,6 @@ def plot_singleton_summary(results_root: str, ax: Any) -> None:
     else:
         n_singletons = int(report["n_singletons"].iloc[0])
         n_total = int(report["n_clusters_total"].iloc[0])
-        df = _safe_read(Path(results_root) / "01_mmseqs" / "subfamily_stats.tsv")
         if df is not None and "n_members" in df.columns:
             n_2 = int((df["n_members"] == 2).sum())
             n_3plus = int((df["n_members"] >= 3).sum())
@@ -151,12 +151,40 @@ def plot_singleton_summary(results_root: str, ax: Any) -> None:
             n_2 = 0
             n_3plus = n_2plus
 
+    n_clusters_total = n_singletons + n_2 + n_3plus
+
+    # Total proteins = sum of all members across all clusters
+    if df is not None and "n_members" in df.columns:
+        n_proteins_total = int(df["n_members"].sum())
+        n_proteins_in_singletons = n_singletons  # each singleton cluster has exactly 1 protein
+    else:
+        n_proteins_total = None
+        n_proteins_in_singletons = n_singletons
+
     categories = ["Singletons\n(n=1)", "2-member\nclusters", "≥3-member\nclusters"]
     counts = [n_singletons, n_2, n_3plus]
     colors = ["#dd8452", "#4c72b0", "#55a868"]
     bars = ax.bar(categories, counts, color=colors, edgecolor="white")
     ax.set_ylabel("Cluster count")
-    ax.set_title("Cluster size breakdown")
+
+    # Build title with singleton percentages
+    if n_clusters_total > 0:
+        pct_clusters = 100.0 * n_singletons / n_clusters_total
+        if n_proteins_total and n_proteins_total > 0:
+            pct_proteins = 100.0 * n_proteins_in_singletons / n_proteins_total
+            ax.set_title(
+                f"Cluster size breakdown\n"
+                f"{pct_clusters:.1f}% of clusters are singletons  |  "
+                f"{pct_proteins:.1f}% of proteins are in singleton clusters"
+            )
+        else:
+            ax.set_title(
+                f"Cluster size breakdown\n"
+                f"{pct_clusters:.1f}% of clusters are singletons"
+            )
+    else:
+        ax.set_title("Cluster size breakdown")
+
     y_offset = 0.01 * max(counts, default=1)
     for bar, v in zip(bars, counts):
         if v > 0:
