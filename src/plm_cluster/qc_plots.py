@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 
-def _safe_read(path: str | Path, **kw) -> "pd.DataFrame | None":
+def _safe_read(path: str | Path, **kw) -> pd.DataFrame | None:
     """Read a TSV if it exists and is non-empty, else return None."""
     p = Path(path)
     if p.exists() and p.stat().st_size > 0:
@@ -248,10 +248,10 @@ def plot_cluster_identity_range(results_root: str, ax: Any) -> None:
 # ---------------------------------------------------------------------------
 
 def generate_mmseqs_cluster_plots(
-    outdir: "str | Path",
+    outdir: str | Path,
     logger=None,
     resume: bool = False,
-) -> "Path | None":
+) -> Path | None:
     """Generate publication-quality QC plots for the MMseqs2 clustering step.
 
     Uses the **plotnine** library (install via ``pip install plotnine`` or
@@ -493,7 +493,7 @@ def generate_mmseqs_cluster_plots(
 # Summary dashboard (full pipeline QC, matplotlib)
 # ---------------------------------------------------------------------------
 
-def generate_qc_plots(results_root: str, logger=None, resume: bool = False) -> "Path | None":
+def generate_qc_plots(results_root: str, logger=None, resume: bool = False) -> Path | None:
     """Generate a multi-panel QC summary figure.
 
     Parameters
