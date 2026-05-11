@@ -2,6 +2,10 @@
 
 Generates diagnostic figures from pipeline intermediate files and saves them
 to ``results/qc_plots/``.  Requires matplotlib; gracefully skips if missing.
+
+MMseqs2 clustering step plots are generated separately via
+``generate_mmseqs_cluster_plots`` using the plotnine library and saved
+directly into the mmseqs-cluster output folder (``results/01_mmseqs/plots/``).
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ def _safe_read(path: str | Path, **kw) -> pd.DataFrame | None:
 
 
 # ---------------------------------------------------------------------------
-# Individual plot functions
+# Individual matplotlib plot functions (full-pipeline QC dashboard)
 # ---------------------------------------------------------------------------
 
 def plot_subfamily_sizes(results_root: str, ax: Any) -> None:
@@ -161,7 +165,7 @@ def plot_singleton_summary(results_root: str, ax: Any) -> None:
         n_proteins_total = None
         n_proteins_in_singletons = n_singletons
 
-    categories = ["Singletons\n(n=1)", "2-member\nclusters", "≥3-member\nclusters"]
+    categories = ["Singletons\n(n=1)", "2-member\nclusters", "\u22653-member\nclusters"]
     counts = [n_singletons, n_2, n_3plus]
     colors = ["#dd8452", "#4c72b0", "#55a868"]
     bars = ax.bar(categories, counts, color=colors, edgecolor="white")
@@ -213,7 +217,7 @@ def plot_cluster_length_variation(results_root: str, ax: Any) -> None:
 
 
 def plot_cluster_identity_range(results_root: str, ax: Any) -> None:
-    """Scatter of within-cluster pident spread (max−min) vs cluster size."""
+    """Scatter of within-cluster pident spread (max\u2212min) vs cluster size."""
     df = _safe_read(Path(results_root) / "01_mmseqs" / "subfamily_stats.tsv")
     if (
         df is None
@@ -234,13 +238,259 @@ def plot_cluster_identity_range(results_root: str, ax: Any) -> None:
         alpha=0.4, s=10, color="#c44e52", rasterized=True,
     )
     ax.set_xlabel("Cluster size (members)")
-    ax.set_ylabel("Identity range (max − min pident, %)")
+    ax.set_ylabel("Identity range (max \u2212 min pident, %)")
     ax.set_title("Within-cluster identity range")
     ax.set_xscale("log")
 
 
 # ---------------------------------------------------------------------------
-# Summary dashboard
+# MMseqs2 clustering step — publication-quality plots via plotnine
+# ---------------------------------------------------------------------------
+
+def generate_mmseqs_cluster_plots(
+    outdir: str | Path,
+    logger=None,
+    resume: bool = False,
+) -> Path | None:
+    """Generate publication-quality QC plots for the MMseqs2 clustering step.
+
+    Uses the **plotnine** library (install via ``pip install plotnine`` or
+    ``pip install 'plm-cluster[plots]'``) to produce figure-ready PNG files
+    saved to ``<outdir>/plots/``.
+
+    Four plots are produced:
+
+    * ``subfamily_size_distribution.png`` -- log-scale histogram of cluster
+      member counts with median line.
+    * ``cluster_size_breakdown.png`` -- bar chart of singleton / 2-member /
+      >=3-member cluster counts with percentage annotations.
+    * ``cluster_length_variation.png`` -- scatter of within-cluster sequence
+      length standard deviation vs cluster size (multi-member clusters only).
+    * ``cluster_identity_range.png`` -- scatter of within-cluster pident
+      range (max - min) vs cluster size.
+
+    Parameters
+    ----------
+    outdir : str or Path
+        MMseqs2 clustering output directory (``results/01_mmseqs`` by default).
+        Plots are written to ``<outdir>/plots/``.
+    logger : logging.Logger, optional
+        Logger for status messages.
+    resume : bool, optional
+        If *True* and plots already exist, skip generation.
+
+    Returns
+    -------
+    Path or None
+        Path to the plots sub-directory, or *None* if plotnine is unavailable
+        or required data files are missing.
+    """
+    out = Path(outdir)
+    plots_dir = out / "plots"
+    sentinel = plots_dir / "subfamily_size_distribution.png"
+
+    if resume and sentinel.exists():
+        if logger:
+            logger.info(
+                "Resume: MMseqs cluster plots already exist in %s, skipping.", str(plots_dir)
+            )
+        return plots_dir
+
+    try:
+        from plotnine import (  # noqa: PLC0415
+            aes,
+            element_blank,
+            element_text,
+            geom_col,
+            geom_histogram,
+            geom_point,
+            geom_text,
+            geom_vline,
+            ggplot,
+            labs,
+            scale_fill_manual,
+            scale_x_log10,
+            scale_y_log10,
+            theme,
+            theme_classic,
+        )
+    except ImportError:
+        if logger:
+            logger.warning(
+                "plotnine not installed — skipping MMseqs cluster plots. "
+                "Install with: pip install plotnine  or  pip install 'plm-cluster[plots]'"
+            )
+        return None
+
+    stats_df = _safe_read(out / "subfamily_stats.tsv")
+    if stats_df is None:
+        if logger:
+            logger.warning(
+                "subfamily_stats.tsv not found in %s — skipping MMseqs cluster plots.", str(out)
+            )
+        return None
+
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    _THEME = (
+        theme_classic(base_size=12)
+        + theme(
+            plot_title=element_text(size=13, face="bold", margin={"b": 6}),
+            axis_title=element_text(size=11),
+            axis_text=element_text(size=10),
+        )
+    )
+    _DPI = 300
+    _W, _H = 8, 5  # inches
+
+    saved: list[Path] = []
+
+    # ------------------------------------------------------------------
+    # 1. Subfamily size distribution (log-scale histogram)
+    # ------------------------------------------------------------------
+    median_size = float(stats_df["n_members"].median())
+    try:
+        p1 = (
+            ggplot(stats_df, aes(x="n_members"))
+            + geom_histogram(bins=50, fill="#4c72b0", color="white", size=0.3)
+            + geom_vline(xintercept=median_size, color="#c44e52", linetype="dashed", size=0.8)
+            + scale_y_log10()
+            + labs(
+                title="Subfamily size distribution",
+                x="Members per subfamily",
+                y="Count (log\u2081\u2080 scale)",
+                caption=f"Dashed line: median = {median_size:.0f}",
+            )
+            + _THEME
+        )
+        path1 = plots_dir / "subfamily_size_distribution.png"
+        p1.save(str(path1), dpi=_DPI, width=_W, height=_H, verbose=False)
+        saved.append(path1)
+    except Exception as exc:  # noqa: BLE001
+        if logger:
+            logger.warning("Could not generate subfamily_size_distribution plot: %s", exc)
+
+    # ------------------------------------------------------------------
+    # 2. Cluster size breakdown (bar chart — singletons / 2-member / >=3)
+    # ------------------------------------------------------------------
+    n_singletons = int((stats_df["n_members"] == 1).sum())
+    n_2 = int((stats_df["n_members"] == 2).sum())
+    n_3plus = int((stats_df["n_members"] >= 3).sum())
+    n_total_clusters = n_singletons + n_2 + n_3plus
+    n_proteins_total = int(stats_df["n_members"].sum())
+
+    pct_clusters = 100.0 * n_singletons / n_total_clusters if n_total_clusters > 0 else 0.0
+    pct_proteins = 100.0 * n_singletons / n_proteins_total if n_proteins_total > 0 else 0.0
+
+    bar_df = pd.DataFrame({
+        "Category": ["Singletons\n(n=1)", "2-member\nclusters", "\u22653-member\nclusters"],
+        "Count": [n_singletons, n_2, n_3plus],
+        "Fill": ["Singletons", "2-member", "\u22653-member"],
+    })
+    bar_df["Category"] = pd.Categorical(
+        bar_df["Category"], categories=bar_df["Category"].tolist(), ordered=True
+    )
+    bar_df["label"] = bar_df["Count"].apply(str)
+    subtitle = (
+        f"{pct_clusters:.1f}% of clusters are singletons  |  "
+        f"{pct_proteins:.1f}% of proteins are in singleton clusters"
+    )
+    try:
+        p2 = (
+            ggplot(bar_df, aes(x="Category", y="Count", fill="Fill"))
+            + geom_col(color="white", show_legend=False)
+            + geom_text(
+                aes(label="label"),
+                va="bottom",
+                size=9,
+                nudge_y=0.01 * max(int(bar_df["Count"].max()), 1),
+            )
+            + scale_fill_manual(
+                values={"Singletons": "#dd8452", "2-member": "#4c72b0", "\u22653-member": "#55a868"}
+            )
+            + labs(
+                title="Cluster size breakdown",
+                subtitle=subtitle,
+                x="",
+                y="Cluster count",
+            )
+            + _THEME
+            + theme(axis_line_x=element_blank(), axis_ticks_major_x=element_blank())
+        )
+        path2 = plots_dir / "cluster_size_breakdown.png"
+        p2.save(str(path2), dpi=_DPI, width=_W, height=_H, verbose=False)
+        saved.append(path2)
+    except Exception as exc:  # noqa: BLE001
+        if logger:
+            logger.warning("Could not generate cluster_size_breakdown plot: %s", exc)
+
+    # ------------------------------------------------------------------
+    # 3. Within-cluster length variation (scatter, multi-member only)
+    # ------------------------------------------------------------------
+    if "std_length_aa" in stats_df.columns:
+        multi = stats_df[stats_df["n_members"] >= 2].copy()
+        if not multi.empty:
+            try:
+                p3 = (
+                    ggplot(multi, aes(x="n_members", y="std_length_aa"))
+                    + geom_point(alpha=0.35, size=1.5, color="#4c72b0")
+                    + scale_x_log10()
+                    + labs(
+                        title="Within-cluster length variation",
+                        x="Cluster size (members, log\u2081\u2080 scale)",
+                        y="Std dev of sequence length (aa)",
+                    )
+                    + _THEME
+                )
+                path3 = plots_dir / "cluster_length_variation.png"
+                p3.save(str(path3), dpi=_DPI, width=_W, height=_H, verbose=False)
+                saved.append(path3)
+            except Exception as exc:  # noqa: BLE001
+                if logger:
+                    logger.warning("Could not generate cluster_length_variation plot: %s", exc)
+
+    # ------------------------------------------------------------------
+    # 4. Within-cluster identity range (scatter, multi-member only)
+    # ------------------------------------------------------------------
+    if "min_pident" in stats_df.columns and "max_pident" in stats_df.columns:
+        id_df = (
+            stats_df[stats_df["n_members"] >= 2]
+            .dropna(subset=["min_pident", "max_pident"])
+            .copy()
+        )
+        if not id_df.empty:
+            id_df["pident_spread"] = id_df["max_pident"] - id_df["min_pident"]
+            try:
+                p4 = (
+                    ggplot(id_df, aes(x="n_members", y="pident_spread"))
+                    + geom_point(alpha=0.35, size=1.5, color="#c44e52")
+                    + scale_x_log10()
+                    + labs(
+                        title="Within-cluster identity range",
+                        x="Cluster size (members, log\u2081\u2080 scale)",
+                        y="Identity range (max \u2212 min pident, %)",
+                    )
+                    + _THEME
+                )
+                path4 = plots_dir / "cluster_identity_range.png"
+                p4.save(str(path4), dpi=_DPI, width=_W, height=_H, verbose=False)
+                saved.append(path4)
+            except Exception as exc:  # noqa: BLE001
+                if logger:
+                    logger.warning("Could not generate cluster_identity_range plot: %s", exc)
+
+    if logger:
+        if saved:
+            logger.info(
+                "MMseqs cluster plots (%d files) saved to %s", len(saved), str(plots_dir)
+            )
+        else:
+            logger.warning("No MMseqs cluster plots were produced (check data files).")
+    return plots_dir if saved else None
+
+
+# ---------------------------------------------------------------------------
+# Summary dashboard (full pipeline QC, matplotlib)
 # ---------------------------------------------------------------------------
 
 def generate_qc_plots(results_root: str, logger=None, resume: bool = False) -> Path | None:
@@ -268,9 +518,9 @@ def generate_qc_plots(results_root: str, logger=None, resume: bool = False) -> P
         return summary_path
 
     try:
-        import matplotlib
+        import matplotlib  # noqa: PLC0415
         matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+        import matplotlib.pyplot as plt  # noqa: PLC0415
     except ImportError:
         if logger:
             logger.warning("matplotlib not installed — skipping QC plots")
@@ -278,7 +528,7 @@ def generate_qc_plots(results_root: str, logger=None, resume: bool = False) -> P
 
     out.mkdir(parents=True, exist_ok=True)
 
-    # 3×3 grid: original 6 plots + 3 new singleton/QC plots
+    # 3x3 grid: original 6 plots + 3 new singleton/QC plots
     fig, axes = plt.subplots(3, 3, figsize=(21, 15))
     fig.suptitle("plm-cluster QC Summary", fontsize=16, fontweight="bold")
 

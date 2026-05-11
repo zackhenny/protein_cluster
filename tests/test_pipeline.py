@@ -1136,3 +1136,75 @@ def test_qc_cluster_identity_range_with_data(tmp_path: Path):
     fig, ax = plt.subplots()
     plot_cluster_identity_range(str(tmp_path), ax)
     plt.close(fig)
+
+
+def test_generate_mmseqs_cluster_plots_with_data(tmp_path: Path):
+    """generate_mmseqs_cluster_plots saves PNG files into <outdir>/plots/ using plotnine."""
+    try:
+        import plotnine  # noqa: F401
+    except ImportError:
+        pytest.skip("plotnine not installed")
+
+    from plm_cluster.qc_plots import generate_mmseqs_cluster_plots
+
+    mm_dir = tmp_path / "01_mmseqs"
+    mm_dir.mkdir(parents=True)
+    pd.DataFrame({
+        "subfamily_id": [f"s{i}" for i in range(10)],
+        "n_members": [1, 1, 2, 2, 3, 5, 8, 10, 15, 20],
+        "std_length_aa": [0.0, 0.0, 5.0, 8.0, 3.0, 12.0, 7.0, 9.0, 6.0, 4.0],
+        "min_pident": [None, None, 70.0, 65.0, 75.0, 60.0, 80.0, 55.0, 72.0, 68.0],
+        "max_pident": [None, None, 100.0, 95.0, 99.0, 90.0, 98.0, 88.0, 96.0, 92.0],
+    }).to_csv(mm_dir / "subfamily_stats.tsv", sep="\t", index=False)
+
+    result = generate_mmseqs_cluster_plots(str(mm_dir))
+
+    assert result is not None, "Expected a plots directory path to be returned"
+    plots_dir = mm_dir / "plots"
+    assert plots_dir.exists(), "plots/ sub-directory should be created"
+    assert (plots_dir / "subfamily_size_distribution.png").exists()
+    assert (plots_dir / "cluster_size_breakdown.png").exists()
+    assert (plots_dir / "cluster_length_variation.png").exists()
+    assert (plots_dir / "cluster_identity_range.png").exists()
+
+
+def test_generate_mmseqs_cluster_plots_missing_data(tmp_path: Path):
+    """generate_mmseqs_cluster_plots returns None gracefully when no data file exists."""
+    try:
+        import plotnine  # noqa: F401
+    except ImportError:
+        pytest.skip("plotnine not installed")
+
+    from plm_cluster.qc_plots import generate_mmseqs_cluster_plots
+
+    # No subfamily_stats.tsv present
+    result = generate_mmseqs_cluster_plots(str(tmp_path / "empty_dir"))
+    assert result is None
+
+
+def test_generate_mmseqs_cluster_plots_resume(tmp_path: Path):
+    """generate_mmseqs_cluster_plots skips regeneration when resume=True and files exist."""
+    try:
+        import plotnine  # noqa: F401
+    except ImportError:
+        pytest.skip("plotnine not installed")
+
+    from plm_cluster.qc_plots import generate_mmseqs_cluster_plots
+
+    mm_dir = tmp_path / "01_mmseqs"
+    mm_dir.mkdir(parents=True)
+    pd.DataFrame({
+        "subfamily_id": ["s1", "s2"],
+        "n_members": [1, 5],
+        "std_length_aa": [0.0, 3.0],
+    }).to_csv(mm_dir / "subfamily_stats.tsv", sep="\t", index=False)
+
+    plots_dir = mm_dir / "plots"
+    plots_dir.mkdir(parents=True)
+    sentinel = plots_dir / "subfamily_size_distribution.png"
+    sentinel.write_bytes(b"dummy")
+
+    result = generate_mmseqs_cluster_plots(str(mm_dir), resume=True)
+    assert result == plots_dir
+    # Sentinel must not have been overwritten (still dummy bytes)
+    assert sentinel.read_bytes() == b"dummy"
