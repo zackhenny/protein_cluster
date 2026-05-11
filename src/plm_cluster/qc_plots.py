@@ -32,7 +32,7 @@ def plot_subfamily_sizes(results_root: str, ax: Any) -> None:
         ax.set_visible(False)
         return
     sizes = df["n_members"]
-    ax.hist(sizes, bins=min(50, max(10, len(sizes) // 5)), color="#4c72b0", edgecolor="white", linewidth=0.5)
+    ax.hist(sizes, bins=_hist_bins(len(sizes)), color="#4c72b0", edgecolor="white", linewidth=0.5)
     ax.set_xlabel("Members per subfamily")
     ax.set_ylabel("Count")
     ax.set_title("Subfamily size distribution")
@@ -248,6 +248,11 @@ def _safe_read_mmseqs(mmseqs_outdir: str | Path, filename: str, **kw) -> pd.Data
     return _safe_read(Path(mmseqs_outdir) / filename, **kw)
 
 
+def _hist_bins(n: int) -> int:
+    """Return a sensible bin count for a histogram of *n* items."""
+    return min(50, max(10, n // 5))
+
+
 def plot_mmseqs_rep_lengths(mmseqs_outdir: str, ax: Any) -> None:
     """Histogram of representative sequence lengths across all clusters."""
     df = _safe_read_mmseqs(mmseqs_outdir, "subfamily_stats.tsv")
@@ -258,7 +263,7 @@ def plot_mmseqs_rep_lengths(mmseqs_outdir: str, ax: Any) -> None:
     if lengths.empty:
         ax.set_visible(False)
         return
-    ax.hist(lengths, bins=min(50, max(10, len(lengths) // 5)), color="#4c72b0",
+    ax.hist(lengths, bins=_hist_bins(len(lengths)), color="#4c72b0",
             edgecolor="white", linewidth=0.5)
     ax.set_xlabel("Representative sequence length (aa)")
     ax.set_ylabel("Count")
@@ -278,7 +283,7 @@ def plot_mmseqs_mean_pident(mmseqs_outdir: str, ax: Any) -> None:
     if multi.empty:
         ax.set_visible(False)
         return
-    ax.hist(multi["mean_pident"], bins=min(50, max(10, len(multi) // 5)),
+    ax.hist(multi["mean_pident"], bins=_hist_bins(len(multi)),
             color="#55a868", edgecolor="white", linewidth=0.5)
     ax.set_xlabel("Mean pairwise identity (%)")
     ax.set_ylabel("Count")
