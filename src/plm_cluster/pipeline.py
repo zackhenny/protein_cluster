@@ -538,6 +538,11 @@ def mmseqs_cluster(proteins_fasta: str, outdir: str, config: dict, logger, resum
         n_singletons, n_clusters_2plus,
         min_cluster_size_for_profile, n_clusters_above_profile_threshold,
     )
+
+    # Generate publication-quality cluster QC plots directly into this step's output folder.
+    from .qc_plots import generate_mmseqs_cluster_plots  # noqa: PLC0415
+    generate_mmseqs_cluster_plots(out, logger=logger, resume=resume)
+
     return tools
 
 

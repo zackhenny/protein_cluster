@@ -25,6 +25,7 @@ dependencies:
   # The pipeline auto-detects GPU FAISS when knn.device is set to "cuda".
   - iniconfig
   - pygments
+  - plotnine
   - pip:
       - fair-esm
       - pytest
