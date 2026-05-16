@@ -177,8 +177,9 @@ def main() -> None:
         shutil.copytree(result, plots_dir)
 
     print(f"\nSample plots saved to: {plots_dir}")
-    for p in sorted(plots_dir.iterdir()):
-        print(f"  {p.name}")
+    if plots_dir.exists():
+        for p in sorted(plots_dir.iterdir()):
+            print(f"  {p.name}")
 
 
 if __name__ == "__main__":

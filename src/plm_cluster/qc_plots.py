@@ -535,8 +535,9 @@ def generate_orthofinder_split_plots(
     Returns
     -------
     Path or None
-        Path to the plots sub-directory, or *None* if plotnine is
-        unavailable or required data files are missing.
+        Path to the plots sub-directory, or *None* if **plotnine** is not
+        installed, if ``og_subfamily_map.tsv`` is absent, or if no plots
+        could be saved (e.g. all rendering attempts raised exceptions).
     """
     out = Path(outdir)
     plots_dir = out / "plots"
