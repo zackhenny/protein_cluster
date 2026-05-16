@@ -219,6 +219,11 @@ class RKCNN:
         if total_weight > 0:
             agg /= total_weight
 
+        # Renormalise rows so each sums to exactly 1 (guards against any
+        # floating-point drift or class-mapping gaps).
+        row_sums = agg.sum(axis=1, keepdims=True)
+        agg /= np.maximum(row_sums, 1e-12)
+
         return agg
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -387,16 +392,16 @@ def rkcnn_candidate_edges(
             X_cand = X[cand_idx_arr]
             y_cand = labels[cand_idx_arr]
 
+            # Pre-compute actual cosine similarities (dot products of unit vectors)
+            cos_sims_i = X[i] @ X_cand.T  # (len(cand_idx),)
+
             # Need at least 2 unique classes and 2 candidates for rKCNN
             unique_classes = np.unique(y_cand)
             if len(unique_classes) < 2 or len(cand_idx) < 2:
                 # Fall back to cosine similarity ordering (vectorized)
-                cosines = X[i] @ X[cand_idx_arr].T
                 for idx_pos, j_idx in enumerate(cand_idx):
                     t = ids[j_idx]
-                    if t == q:
-                        continue
-                    cosine = float(cosines[idx_pos])
+                    cosine = float(cos_sims_i[idx_pos])
                     qlen = int(lens.get(q, 0))
                     tlen = int(lens.get(t, 0))
                     ratio = qlen / max(1, tlen)
@@ -425,29 +430,29 @@ def rkcnn_candidate_edges(
             proba = rkcnn.predict_proba(X[i:i+1])[0]  # (n_classes,)
             classes = rkcnn.classes_
 
-            # Get top-k classes by probability
+            # Get top-k classes by rKCNN probability (ranking step)
             top_k_class_idx = np.argsort(proba)[::-1][:k]
 
             for ci in top_k_class_idx:
-                score = float(proba[ci])
-                if score < min_cosine:
-                    continue
                 target_class = classes[ci]
                 # Find the representative(s) in this class from candidate set
                 class_mask = y_cand == target_class
+                class_positions = np.where(class_mask)[0]  # positions within cand_idx_arr
                 class_indices = cand_idx_arr[class_mask]
-                for j_idx in class_indices:
+                for kk, j_idx in enumerate(class_indices):
                     t = ids[j_idx]
-                    if t == q:
-                        continue
+                    # Use actual cosine similarity (not rKCNN probability) for
+                    # the edge weight and min_cosine filtering so that the output
+                    # is consistent with standard KNN mode.
+                    cosine = float(cos_sims_i[class_positions[kk]])
                     qlen = int(lens.get(q, 0))
                     tlen = int(lens.get(t, 0))
                     ratio = qlen / max(1, tlen)
                     pass_lr = int(min_lr <= ratio <= max_lr)
-                    if pass_lr:
+                    if cosine >= min_cosine and pass_lr:
                         rows.append({
                             "q_subfamily_id": q, "t_subfamily_id": t,
-                            "cosine": score, "q_len": qlen, "t_len": tlen,
+                            "cosine": cosine, "q_len": qlen, "t_len": tlen,
                             "len_ratio": ratio, "pass_len_ratio": pass_lr,
                         })
     else:
@@ -468,35 +473,48 @@ def rkcnn_candidate_edges(
         rkcnn.fit(X, labels)
         classes = rkcnn.classes_
 
-        # Predict probabilities for all queries
+        # Predict probabilities for all queries (used for ranking only)
         proba = rkcnn.predict_proba(X)  # (N, n_classes)
+
+        # Build a lookup from class label to sample index for fast cosine lookup
+        class_to_sample_idx: dict[int, np.ndarray] = {
+            int(c): np.where(labels == c)[0] for c in classes
+        }
 
         for i in range(N):
             q = ids[i]
+            # Use rKCNN probabilities to rank top-k classes
             top_k_class_idx = np.argsort(proba[i])[::-1][:k]
 
+            # Collect all target indices for this query's top-k classes, then
+            # compute actual cosine similarities in one vectorised call.
+            target_indices: list[int] = []
             for ci in top_k_class_idx:
-                score = float(proba[i, ci])
-                if score < min_cosine:
-                    continue
-                target_class = classes[ci]
-                # Find all samples in this class
-                class_mask = labels == target_class
-                class_indices = np.where(class_mask)[0]
-                for j_idx in class_indices:
-                    t = ids[j_idx]
-                    if t == q:
-                        continue
-                    qlen = int(lens.get(q, 0))
-                    tlen = int(lens.get(t, 0))
-                    ratio = qlen / max(1, tlen)
-                    pass_lr = int(min_lr <= ratio <= max_lr)
-                    if pass_lr:
-                        rows.append({
-                            "q_subfamily_id": q, "t_subfamily_id": t,
-                            "cosine": score, "q_len": qlen, "t_len": tlen,
-                            "len_ratio": ratio, "pass_len_ratio": pass_lr,
-                        })
+                target_class = int(classes[ci])
+                for j_idx in class_to_sample_idx[target_class]:
+                    if int(j_idx) != i:
+                        target_indices.append(int(j_idx))
+
+            if not target_indices:
+                continue
+
+            target_arr = np.array(target_indices)
+            # Actual cosine similarities (dot products of L2-normalised vectors)
+            cos_sims_i = X[i] @ X[target_arr].T  # (len(target_arr),)
+
+            for kk, j_idx in enumerate(target_arr):
+                t = ids[j_idx]
+                cosine = float(cos_sims_i[kk])
+                qlen = int(lens.get(q, 0))
+                tlen = int(lens.get(t, 0))
+                ratio = qlen / max(1, tlen)
+                pass_lr = int(min_lr <= ratio <= max_lr)
+                if cosine >= min_cosine and pass_lr:
+                    rows.append({
+                        "q_subfamily_id": q, "t_subfamily_id": t,
+                        "cosine": cosine, "q_len": qlen, "t_len": tlen,
+                        "len_ratio": ratio, "pass_len_ratio": pass_lr,
+                    })
 
     log.info("rKCNN generated %d candidate edges", len(rows))
     return rows
