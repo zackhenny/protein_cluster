@@ -9,6 +9,19 @@ import yaml
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "seed": 42,
+    # results_root: top-level directory under which all step output directories
+    # are created.  This is the single location that individual module commands
+    # fall back to when --outdir / input path arguments are not specified on the
+    # command line.  Setting it here (or in your config.yaml) is all you need to
+    # run any individual step with just --config and --resume.
+    "results_root": "results",
+    # proteins_fasta: path to the full-length protein FASTA file.  Used by
+    # mmseqs-cluster, build-profiles, map-proteins-to-families, and run-all.
+    # Set here so those commands work with --config alone.
+    "proteins_fasta": "",
+    # weights_path: path to the ESM-2 model weights directory.  Used by embed
+    # and run-all.  Set here so those commands work with --config alone.
+    "weights_path": "",
     "tools": {
         "mmseqs_path": "",
         "hhmake_path": "",

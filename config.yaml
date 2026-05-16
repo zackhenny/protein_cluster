@@ -1,271 +1,440 @@
 # ============================================================================
 # plm-cluster configuration
 # ============================================================================
-# This file controls every tuneable parameter of the pipeline.
-# Any key you omit here falls back to built-in defaults.
-# Copy this file and edit to taste: plm_cluster run-all --config config.yaml
+# This file controls every tunable parameter of the pipeline.
+# Any key you omit falls back to built-in defaults (see config.py).
+#
+# Quick-start (run full pipeline from config alone):
+#   1. Set results_root, proteins_fasta, and weights_path below.
+#   2. Run: plm_cluster run-all --config config.yaml
+#
+# Running individual steps with --resume:
+#   Because results_root (and proteins_fasta / weights_path) are defined here,
+#   each module can derive all its input/output paths automatically.
+#   Example: plm_cluster build-profiles --config config.yaml --resume
+#
+# Sections are ordered to match the pipeline workflow (Steps 1 → 9).
+# ============================================================================
 
-seed: 42                          # Global random seed for reproducibility
+seed: 42                          # Global random seed (used by Leiden, rKCNN, etc.)
+
+# ---------------------------------------------------------------------------
+# Pipeline I/O — top-level paths shared across steps
+# ---------------------------------------------------------------------------
+# results_root: parent directory for all step output sub-directories.
+#   Step outputs land in: {results_root}/01_mmseqs/, 02_profiles/, etc.
+#   When running individual steps with --config and no --outdir, this value
+#   is used to derive both input and output paths automatically.
+results_root: results
+
+# proteins_fasta: path to the full-length protein FASTA used as pipeline input.
+#   Required for: run-all, mmseqs-cluster, build-profiles, map-proteins-to-families.
+#   Set here so those commands work with --config alone (no extra CLI flags).
+proteins_fasta: ""
+
+# weights_path: path to the ESM-2 model weights directory.
+#   Required for: run-all, embed.
+#   Set here so those commands work with --config alone.
+weights_path: ""
 
 # ---------------------------------------------------------------------------
 # External tool paths
 # ---------------------------------------------------------------------------
-# Leave empty ("") to auto-detect from $PATH.  Set full paths if tools are
-# installed in non-standard locations (e.g. HPC module loads).
+# Leave empty ("") to auto-detect each tool from $PATH.
+# Set full paths when tools are in non-standard locations (e.g. HPC modules).
 tools:
   mmseqs_path: ""                 # Path to mmseqs binary
   hhmake_path: ""                 # Path to hhmake (HH-suite)
-  hhsearch_path: ""               # Path to hhsearch (HH-suite, for db-search mode)
-  hhalign_path: ""                # Path to hhalign (HH-suite, for pairwise mode)
-  ffindex_build_path: ""          # Path to ffindex_build (HH-suite, for db-search mode)
-  cstranslate_path: ""            # Path to cstranslate (HH-suite, for db-search mode)
+  hhalign_path: ""                # Path to hhalign (HH-suite; pairwise mode only)
+  hhsearch_path: ""               # Path to hhsearch (HH-suite; db-search mode only)
+  ffindex_build_path: ""          # Path to ffindex_build (HH-suite; db-search mode only)
+  cstranslate_path: ""            # Path to cstranslate (HH-suite; db-search mode only)
   mafft_path: ""                  # Path to mafft aligner
-  mcl_path: ""                    # Path to mcl (only if --method mcl)
+  mcl_path: ""                    # Path to mcl (only needed when --method mcl)
 
 # ---------------------------------------------------------------------------
 # Step 1 — MMseqs2 subfamily clustering
 # ---------------------------------------------------------------------------
-# Proteins are clustered into subfamilies at high sequence identity.
-# Each subfamily gets a representative sequence used downstream.
+# Proteins are grouped into subfamilies at high sequence identity.
+# Each subfamily gets one representative sequence used in all downstream steps.
+#
+# Output directory (auto-derived when not specified):
+#   {results_root}/01_mmseqs/
 mmseqs:
-  mode: linclust                  # "linclust" (fast linear) or "cluster" (sensitive)
-  min_seq_id: 0.6                 # Minimum sequence identity to join a cluster [0-1]
-  coverage: 0.8                   # Minimum alignment coverage fraction [0-1]
-  cov_mode: 1                     # MMseqs2 coverage mode (0=query, 1=target, 2=bidirectional)
-  evalue: 1e-3                    # E-value threshold for clustering
-  sensitivity: 7.5                # Sensitivity (-s); ignored for linclust mode
-  # threads: CPU threads passed to each MMseqs2 invocation.
-  # Keep ≤ the physical cores allocated to a single SLURM task/job.
-  # This is DISTINCT from parallel_workers (number of concurrent jobs).
+  # mode: clustering algorithm.
+  #   "linclust"  — fast linear-time greedy clustering (recommended for large datasets).
+  #   "cluster"   — sensitive quadratic-time clustering; better recall but slower.
+  mode: linclust
+
+  # min_seq_id: minimum sequence identity to join a cluster [0.0–1.0].
+  #   Higher values → more, smaller, more homogeneous subfamilies.
+  #   Typical range: 0.5 (broad) to 0.9 (very tight).
+  min_seq_id: 0.6
+
+  # coverage: minimum alignment coverage fraction [0.0–1.0].
+  #   Requires this fraction of the sequence to be aligned in order to cluster.
+  coverage: 0.8
+
+  # cov_mode: which sequence's length is used for the coverage calculation.
+  #   0 = query coverage    1 = target coverage (default)    2 = bidirectional
+  cov_mode: 1
+
+  # evalue: E-value threshold; hits above this are ignored.
+  evalue: 1e-3
+
+  # sensitivity: search sensitivity (-s flag); higher = slower but more sensitive.
+  #   Ignored when mode is "linclust" (linclust has its own speed/sensitivity trade-off).
+  sensitivity: 7.5
+
+  # threads: CPU threads passed to each MMseqs2 call.
+  #   Keep ≤ the physical cores in your SLURM allocation.
+  #   This is the per-invocation thread count; see profiles.parallel_workers for
+  #   the number of concurrent profile-building jobs (Step 2).
   threads: 8
-  tmpdir: tmp/mmseqs              # Temporary directory for MMseqs2
+
+  # tmpdir: scratch directory for MMseqs2 intermediate files.
+  tmpdir: tmp/mmseqs
+
   # min_protein_length: proteins shorter than this (amino acids) are removed
-  # from the input FASTA before clustering.  Set to 0 to disable filtering.
-  # Dropped proteins are recorded in filtered_short_proteins.tsv for auditing.
+  # before clustering.  Set to 0 to disable filtering.
+  # Removed proteins are recorded in filtered_short_proteins.tsv for auditing.
   min_protein_length: 0
-  # min_cluster_size_for_profile: clusters with fewer members than this
-  # threshold are skipped during profile building (Step 2).  Singletons (n=1)
-  # are still embedded and can join families via KNN edges (Step 4).
-  # Set to 1 (default) to build profiles for every cluster including
-  # singletons; set to 2 to skip singleton profile building.
+
+  # min_cluster_size_for_profile: clusters smaller than this are skipped when
+  # building HMM profiles in Step 2.  Singletons (n=1) are still embedded and
+  # can join families through KNN edges in Step 5.
+  #   1 (default) — build profiles for every cluster including singletons.
+  #   2           — skip singletons; only build profiles for clusters with ≥2 members.
   min_cluster_size_for_profile: 1
 
 # ---------------------------------------------------------------------------
 # Step 2 — Subfamily profile construction (MAFFT + HH-suite)
 # ---------------------------------------------------------------------------
-# MSAs and HMM profiles are built for each subfamily.
+# A multiple-sequence alignment (MSA) and HMM profile (.hhm) are built for
+# each subfamily.  Profiles are the key inputs for remote homology detection
+# in Step 3 (HMM-HMM edges).
+#
+# Output directory (auto-derived when not specified):
+#   {results_root}/02_profiles/
 profiles:
-  max_members_per_subfamily: 256  # Cap sequences per subfamily MSA to limit memory
-  # parallel_workers: number of subfamily profiles built concurrently.
-  # Distinct from mmseqs.threads (per-tool thread count).
-  # Recommended value: number of CPU cores in your SLURM allocation.
+  # max_members_per_subfamily: cap the number of sequences per MSA.
+  #   Limits memory and run-time for very large subfamilies.
+  #   Sequences above this cap are randomly sampled.
+  max_members_per_subfamily: 256
+
+  # parallel_workers: number of subfamily MSA/profile jobs running concurrently.
+  #   Distinct from mmseqs.threads (which is the per-tool thread count).
+  #   Recommended: set to the number of CPU cores in your allocation.
   parallel_workers: 8
 
 # ---------------------------------------------------------------------------
 # Step 3 — HMM-HMM edge construction (hhalign / hhsearch)
 # ---------------------------------------------------------------------------
-# Profile-profile alignments detect remote homology between subfamilies.
-# Two edge tiers are produced: strict ("core") and relaxed ("functional").
+# Profile-to-profile alignments detect remote homology between subfamilies.
+# Two sets of edges are produced:
+#   "core"       — strict thresholds → high-confidence structural/functional links.
+#   "relaxed"    — looser thresholds → broader functional relationships.
+#
+# Output directory (auto-derived when not specified):
+#   {results_root}/03_hmm_hmm_edges/
 hmm_hmm:
-  # Three modes are available:
-  #   pairwise       – one hhalign per candidate pair (thread-parallel, default)
-  #   db-search      – build HH-suite ffindex DB + one parallel hhsearch per query
-  #   mmseqs-profile – MMseqs2 profile-profile all-vs-all; fastest for large
-  #                    datasets (220K+ families), requires only mmseqs in PATH.
-  mode: pairwise                  # "pairwise" | "db-search" | "mmseqs-profile"
-  topN: 200                       # Max candidate neighbors per subfamily from KNN
-  # parallel_workers: number of concurrent hhalign/hhsearch jobs.
-  # Distinct from mmseqs.threads (per-tool thread count).
-  # Total CPUs ≈ parallel_workers × (1 for hhalign, or mmseqs.threads for hhsearch).
+  # mode: how profile-profile comparisons are computed.
+  #   "pairwise"       — one hhalign per candidate pair; thread-parallel (default).
+  #   "db-search"      — build an ffindex DB then run hhsearch per query; faster
+  #                      for many queries against a fixed profile library.
+  #   "mmseqs-profile" — MMseqs2 profile-profile all-vs-all; fastest for very
+  #                      large datasets (220 K+ subfamilies); requires only mmseqs.
+  mode: pairwise
+
+  # topN: maximum number of candidate neighbor subfamilies to evaluate per query.
+  #   Candidates come from the KNN embedding step (Step 5).
+  topN: 200
+
+  # parallel_workers: number of concurrent hhalign / hhsearch jobs.
+  #   Total CPU load ≈ parallel_workers × 1 (hhalign) or × mmseqs.threads (hhsearch).
+  #   Set to the core count of your allocation.
   parallel_workers: 8
+
   # --- Core (strict) edge thresholds ---
-  mincov_core: 0.70               # Min bidirectional alignment coverage [0-1]
-  min_prob_core: 90               # Min HHalign probability [0-100]
-  max_evalue_core: 1e-5           # Max E-value (alternative to probability gate)
+  # These produce the strict family graph used by the primary Leiden clustering.
+  mincov_core: 0.70               # Min bidirectional alignment coverage [0.0–1.0]
+  min_prob_core: 90               # Min HHalign probability score [0–100]
+  max_evalue_core: 1e-5           # Max E-value (alternative gate to probability)
   min_aln_len_core: 120           # Min aligned columns (amino acids)
+
   # --- Relaxed (functional) edge thresholds ---
-  mincov_relaxed: 0.60            # Broader coverage tolerance [0-1]
-  min_prob_relaxed: 80            # Lower probability gate [0-100]
+  # These produce the functional family graph capturing broader homology.
+  mincov_relaxed: 0.60            # Broader coverage tolerance [0.0–1.0]
+  min_prob_relaxed: 80            # Lower probability gate [0–100]
   max_evalue_relaxed: 1e-3        # Relaxed E-value gate
-  min_aln_len_relaxed: 80         # Shorter alignment tolerance
+  min_aln_len_relaxed: 80         # Shorter alignment tolerance (amino acids)
 
 # ---------------------------------------------------------------------------
 # Step 4 — ESM-2 protein language model embeddings
 # ---------------------------------------------------------------------------
-# Mean-pooled residue embeddings are computed on subfamily reps and used for
-# KNN candidate generation and (optionally) functional graph edges.
+# Mean-pooled residue embeddings are computed for each subfamily representative.
+# Embeddings are used in Step 5 (KNN candidate edges) and optionally as
+# additional edge weights in Step 6 (graph merge).
+#
+# Output directory (auto-derived when not specified):
+#   {results_root}/04_embeddings/
 embed:
-  esm_model_name: esm2_t33_650M_UR50D   # Model identifier (for metadata only)
-  pooling: mean                          # Pooling strategy: "mean" (residue avg)
-  long_seq_policy: truncate              # "truncate" | "skip" | "full"
-  max_len: 2048                          # Max residues per sequence (truncate above)
-  batch_size: 4                          # Sequences per forward pass
-  device: cpu                            # "cpu" or "cuda" / "cuda:0" for GPU
+  # esm_model_name: identifier of the ESM-2 model variant (metadata / logging only).
+  #   The actual model is loaded from weights_path.
+  esm_model_name: esm2_t33_650M_UR50D
+
+  # pooling: how per-residue embeddings are reduced to a single vector per protein.
+  #   "mean" — average over all residue positions (recommended).
+  pooling: mean
+
+  # long_seq_policy: what to do when a sequence exceeds max_len residues.
+  #   "truncate" — keep only the first max_len residues (fast, slight information loss).
+  #   "skip"     — omit sequences longer than max_len entirely.
+  #   "full"     — embed without truncation (may cause OOM for very long sequences).
+  long_seq_policy: truncate
+
+  # max_len: maximum residues per sequence before applying long_seq_policy.
+  max_len: 2048
+
+  # batch_size: sequences embedded per GPU/CPU forward pass.
+  #   Reduce if you see out-of-memory errors; increase to speed up GPU runs.
+  batch_size: 4
+
+  # device: compute device for the ESM-2 model.
+  #   "cpu"      — CPU inference (slow but always available).
+  #   "cuda"     — default GPU.
+  #   "cuda:0"   — specific GPU by index (useful on multi-GPU nodes).
+  device: cpu
+
   # checkpoint_dir: directory to store per-batch embedding checkpoints.
-  # When set (non-empty), each completed batch is saved as a .npy file here.
-  # If the run is interrupted (OOM, timeout, node failure), re-running with
-  # --resume will reload completed batches and continue from the last one.
-  # Leave empty ("") to disable checkpointing (no overhead, no resumability).
-  # Recommended: set to a fast scratch directory on HPC (e.g. $TMPDIR/ckpt).
+  #   When set (non-empty), each completed batch is saved as a .npy file here.
+  #   Re-running with --resume reloads completed batches and continues from the
+  #   last checkpoint — useful after OOM errors or SLURM timeouts.
+  #   Leave empty ("") to disable checkpointing (no overhead, no resumability).
+  #   Recommended on HPC: set to a fast scratch directory (e.g. $TMPDIR/ckpt).
   checkpoint_dir: ""
 
 # ---------------------------------------------------------------------------
-# Step 5 — Candidate neighbor generation (embedding space)
+# Step 5 — Candidate neighbor generation (embedding KNN)
 # ---------------------------------------------------------------------------
-# Two modes are available for generating candidate edges from ESM-2 embeddings:
+# Nearest-neighbor edges are computed in ESM-2 embedding space and used as
+# candidate pairs for the HMM-HMM alignment step (Step 3).
 #
-#   knn   (default) — Standard FAISS/sklearn cosine KNN.  Fast, unsupervised.
-#   rkcnn           — Random K-Conditional Nearest Neighbor.  Supervised ensemble
-#                     that leverages MMseqs2 subfamily labels as classes and uses
-#                     random feature subspaces to overcome the curse of
-#                     dimensionality in high-dimensional embedding space.
-#                     Paper: https://peerj.com/articles/cs-2497/
+# Two modes are available:
+#   "knn"   — Standard cosine KNN via FAISS / sklearn.  Fast, unsupervised.
+#   "rkcnn" — Random K-Conditional Nearest Neighbor (supervised ensemble).
+#             Uses MMseqs2 subfamily labels as ground-truth classes and random
+#             feature subspaces to handle high-dimensional embedding space.
+#             Paper: https://peerj.com/articles/cs-2497/
 #
-# Both modes produce the same output TSV format so downstream steps are
-# unaffected by the choice of mode.
+# Both modes write the same output TSV, so downstream steps are unaffected.
+#
+# Output file (auto-derived when not specified):
+#   {results_root}/04_embeddings/embedding_knn_edges.tsv
 knn:
-  mode: knn                       # "knn" (default) | "rkcnn"
-  k: 100                          # Number of nearest neighbors to retrieve
-  min_cosine: 0.35                # Min cosine similarity to keep an edge [-1, 1]
-  min_len_ratio: 0.5              # Min query/target length ratio filter
-  max_len_ratio: 2.0              # Max query/target length ratio filter
+  # mode: candidate generation algorithm.
+  #   "knn" (default) | "rkcnn"
+  mode: knn
 
-  # --- GPU acceleration for KNN / rKCNN ------------------------------------
-  # Set to "cuda" (or "cuda:0", "cuda:1", etc.) to use FAISS-GPU for the KNN
-  # index and (when mode=rkcnn) for the cascading FAISS pre-filter and rKCNN
-  # pairwise-distance computations via PyTorch.  Requires the faiss-gpu
-  # package; falls back to CPU FAISS or sklearn if unavailable.
-  device: cpu                     # "cpu" or "cuda" / "cuda:0" for GPU
+  # k: number of nearest neighbors to retrieve per query subfamily.
+  k: 100
 
-  # --- rKCNN-specific (only used when mode: rkcnn) --------------------------
-  # rKCNN operates directly on full-dimensional ESM-2 embeddings — do NOT apply
-  # PCA or any dimensionality reduction.  Embeddings are L2-normalized before
-  # fitting.  MMseqs2 subfamily IDs (from Step 1) serve as ground-truth class
-  # labels.
-  #
-  # Cascading strategy: When there are tens of thousands of subfamilies,
-  # computing conditional neighbors against all classes is expensive.  Set
-  # rkcnn_cascade_topn > 0 to first use FAISS to retrieve the top-N closest
-  # subfamily centroids per query, then run rKCNN only over those N classes.
-  rkcnn_n_subspaces: 50           # Number of random feature subspaces to sample
-  rkcnn_subspace_fraction: 0.5    # Fraction of embedding dims per subspace [0.01–1.0]
-  rkcnn_n_neighbors: 5            # k for the inner kCNN classifiers (per subspace)
-  rkcnn_score_threshold: 0.0      # Min separation score to retain a subspace (0 = keep all)
-  rkcnn_weighting: separation     # "separation" (score-weighted) | "uniform"
-  rkcnn_cascade_topn: 500         # FAISS pre-filter: top-N candidate classes (0 = disabled)
-  rkcnn_random_state: 42          # Random seed for subspace sampling
+  # min_cosine: minimum cosine similarity to keep an edge [-1.0–1.0].
+  #   Increase to reduce noisy long-range edges.
+  min_cosine: 0.35
+
+  # min_len_ratio / max_len_ratio: length-ratio filter between query and target.
+  #   Pairs where length(query)/length(target) falls outside [min, max] are dropped.
+  min_len_ratio: 0.5
+  max_len_ratio: 2.0
+
+  # device: compute device for the FAISS index and (when mode=rkcnn) PyTorch ops.
+  #   "cpu"    — CPU FAISS (always available).
+  #   "cuda"   — GPU FAISS (requires faiss-gpu package).
+  device: cpu
+
+  # --- rKCNN-specific settings (only used when mode: rkcnn) ----------------
+  # rKCNN operates on the full-dimensional ESM-2 embedding — do NOT apply PCA.
+  # Embeddings are L2-normalized before fitting.
+
+  # rkcnn_n_subspaces: number of random feature subspaces to sample.
+  #   More subspaces → better ensemble coverage but slower.
+  rkcnn_n_subspaces: 50
+
+  # rkcnn_subspace_fraction: fraction of embedding dimensions per subspace [0.01–1.0].
+  rkcnn_subspace_fraction: 0.5
+
+  # rkcnn_n_neighbors: k for the inner kNN classifiers in each subspace.
+  rkcnn_n_neighbors: 5
+
+  # rkcnn_score_threshold: minimum separation score to keep a subspace [0.0–1.0].
+  #   0 keeps all subspaces; raise to discard uninformative subspaces.
+  rkcnn_score_threshold: 0.0
+
+  # rkcnn_weighting: how subspace predictions are combined.
+  #   "separation" — weight by separation score (recommended).
+  #   "uniform"    — all subspaces weighted equally.
+  rkcnn_weighting: separation
+
+  # rkcnn_cascade_topn: FAISS pre-filter — retrieve only the top-N closest
+  #   subfamily centroids before running rKCNN.  Set to 0 to disable (run
+  #   rKCNN over all classes; only feasible for small datasets).
+  rkcnn_cascade_topn: 500
+
+  # rkcnn_random_state: random seed for subspace sampling.
+  rkcnn_random_state: 42
 
 # ---------------------------------------------------------------------------
-# Step 6 — Graph merge and Leiden clustering
+# Step 6 — Graph merge and Leiden family clustering
 # ---------------------------------------------------------------------------
-# Two graphs are constructed (strict & functional) and clustered separately.
+# HMM-HMM edges and embedding KNN edges are combined into two graphs
+# (strict and functional), then clustered with the Leiden algorithm to
+# produce protein family assignments.
+#
+# Output directory (auto-derived when not specified):
+#   {results_root}/06_family_clustering/
 graph:
-  # How to combine HMM and embedding edges for the functional graph:
-  #   strict              — HMM core edges only (ignore embeddings)
-  #   union               — max(hmm, emb) weight
-  #   gated               — embedding edges only if weak HMM support exists
-  #   downweight_embeddings — w_hmm*hmm + w_emb*emb (recommended)
+  # edge_weight_policy: how HMM and embedding edges are combined in the
+  # functional graph.
+  #   "strict"               — HMM core edges only; embeddings ignored.
+  #   "union"                — max(hmm_weight, emb_weight) per edge.
+  #   "gated"                — embedding edges only when weak HMM support exists.
+  #   "downweight_embeddings" — w_hmm × hmm + w_emb × emb (recommended).
   edge_weight_policy: downweight_embeddings
-  w_hmm: 1.0                     # HMM edge weight multiplier
-  w_emb: 0.35                    # Embedding edge weight multiplier
-  weak_hmm_threshold: 0.2        # Min HMM weight to allow embedding boost (gated)
-  leiden_resolution_strict: 0.7   # Leiden resolution for strict families (lower = larger)
-  leiden_resolution_functional: 1.0  # Leiden resolution for functional families
-  seed: 42                        # Random seed for Leiden
+
+  # w_hmm / w_emb: multipliers for the two edge types when using
+  # "downweight_embeddings" policy.  Increase w_hmm to trust HMM alignments more.
+  w_hmm: 1.0
+  w_emb: 0.35
+
+  # weak_hmm_threshold: minimum HMM weight at which an embedding edge is allowed
+  # to contribute (only used with "gated" policy).
+  weak_hmm_threshold: 0.2
+
+  # leiden_resolution_strict / leiden_resolution_functional:
+  #   Leiden resolution parameter for each graph.
+  #   Lower values → fewer, larger families.
+  #   Higher values → more, smaller families.
+  leiden_resolution_strict: 0.7
+  leiden_resolution_functional: 1.0
+
+  # seed: random seed for the Leiden algorithm.
+  seed: 42
 
 # ---------------------------------------------------------------------------
 # Step 7 — Protein-to-family mapping
 # ---------------------------------------------------------------------------
-# Full-length proteins are aligned against subfamily reps with mmseqs easy-search.
-# A greedy overlap filter prevents the same protein region from being assigned
-# to multiple families (fusion-safe mapping).
+# Full-length proteins are aligned against subfamily representatives using
+# mmseqs easy-search.  A greedy overlap filter prevents the same protein
+# region from being assigned to multiple families (fusion-protein-safe).
+#
+# Output directory (auto-derived when not specified):
+#   {results_root}/05_domain_hits/
 mapping:
-  search_mode: family_reps        # Search strategy (currently only family_reps)
-  profile_cov_min: 0.70           # Min fraction of profile (target) covered [0-1]
+  # search_mode: strategy for finding family representatives to search against.
+  search_mode: family_reps
+
+  # profile_cov_min: minimum fraction of the target (profile/representative)
+  # that must be covered by the alignment [0.0–1.0].
+  profile_cov_min: 0.70
+
   # min_pident: minimum percent identity (0–100) to accept an mmseqs hit.
-  # Replaces the legacy key 'min_prob' (which is still accepted but deprecated).
+  #   Set to 0.0 to accept any identity (E-value / coverage gates still apply).
+  #   Note: the legacy key "min_prob" is still accepted but deprecated.
   min_pident: 0.0
-  max_evalue: 1e-5                # Max E-value for mmseqs easy-search
-  min_segment_len: 120            # Min alignment length (aa) to accept a segment
-  max_overlap_aa: 30              # Max overlap (aa) between accepted segments
+
+  # max_evalue: maximum E-value for mmseqs easy-search hits.
+  max_evalue: 1e-5
+
+  # min_segment_len: minimum alignment length (amino acids) to accept a domain hit.
+  min_segment_len: 120
+
+  # max_overlap_aa: maximum overlap (amino acids) allowed between two accepted
+  # segments from different families on the same protein.
+  max_overlap_aa: 30
 
 # ---------------------------------------------------------------------------
 # Step 8 — Output matrices
 # ---------------------------------------------------------------------------
+# Protein × family membership matrices are written in one or more formats.
+#
+# Output directory (auto-derived when not specified):
+#   {results_root}/07_membership_matrices/
 outputs:
-  write_dense_threshold: 2000000  # Max cells before skipping dense matrix output
-  write_matrix_market: true       # Also write Matrix Market (.mtx) format
+  # write_dense_threshold: skip dense (CSV/TSV) matrix output when the total
+  # number of cells (proteins × families) exceeds this value.  The sparse
+  # Matrix Market format is always attempted regardless.
+  write_dense_threshold: 2000000
+
+  # write_matrix_market: also write a sparse Matrix Market (.mtx) file.
+  write_matrix_market: true
 
 # ---------------------------------------------------------------------------
-# OrthoFinder integration — within-OG subclustering
+# OrthoFinder integration — within-OG subclustering (optional alternative to Step 1)
 # ---------------------------------------------------------------------------
 # Used by:  plm_cluster orthofinder-cluster
 #           plm_cluster run-all-orthofinder
 #
-# Instead of Step 1 (MMseqs2 global clustering), proteins are pre-grouped by
-# their OrthoFinder HOG or OG membership and then subclustered within each
-# group.  This preserves orthology context while separating recent paralogs
-# (lineage-specific expansions) into distinct subfamilies.
+# Instead of the global MMseqs2 clustering in Step 1, proteins are pre-grouped
+# by their OrthoFinder HOG or OG membership and subclustered within each group.
+# This preserves orthology context while separating lineage-specific expansions
+# (recent paralogs) into distinct subfamilies.
 #
-# Provenance chain
-# ----------------
-# Each output file contains the keys needed to reconstruct the full join:
-#
-#   protein_id  →  subfamily_id       via  01_mmseqs/subfamily_map.tsv
-#   subfamily_id → og_id              via  01_mmseqs/og_subfamily_map.tsv
-#   subfamily_id → strict_family_id   via  06_family_clustering/subfamily_to_family_strict.tsv
-#   subfamily_id → functional_family  via  06_family_clustering/subfamily_to_family_functional.tsv
-#
-# Point --og_dir at a directory of *.faa or *.fa files, e.g.:
-#   OrthoFinder/Results_*/Phylogenetic_Hierarchical_Orthogroups/N0/
-#   OrthoFinder/Results_*/Orthogroup_Sequences/
+# Point --og_dir at a directory of *.faa or *.fa files, for example:
+#   OrthoFinder/Results_*/Phylogenetic_Hierarchical_Orthogroups/N0/   (HOGs)
+#   OrthoFinder/Results_*/Orthogroup_Sequences/                        (OGs)
 #
 # HOG level choice:
 #   N0 (species-tree root) — broadest non-redundant set, closest to OGs.
 #   Leaf-level HOGs        — finer pre-grouping but can be very small.
+#
+# Output provenance keys:
+#   protein_id  →  subfamily_id        via  01_mmseqs/subfamily_map.tsv
+#   subfamily_id → og_id               via  01_mmseqs/og_subfamily_map.tsv
+#   subfamily_id → strict_family_id    via  06_family_clustering/subfamily_to_family_strict.tsv
+#   subfamily_id → functional_family   via  06_family_clustering/subfamily_to_family_functional.tsv
 orthofinder:
-  # subcluster_mode: which MMseqs2 algorithm to use within each HOG/OG.
-  #   "linclust" (default) — fast linear-time greedy clustering.  Scales to
-  #                          very large HOGs without memory explosion.
-  #   "cluster"            — sensitive quadratic-time clustering.  Better
-  #                          recall for small/divergent HOGs; also supports
-  #                          --cluster-reassign for improved membership.
-  #   "auto"               — use "cluster" for HOGs below
-  #                          auto_linclust_min_size members, "linclust" for
-  #                          larger ones.  The choice is logged per HOG.
+  # subcluster_mode: MMseqs2 algorithm used within each HOG/OG.
+  #   "linclust" — fast linear-time clustering (default; scales to very large HOGs).
+  #   "cluster"  — sensitive quadratic clustering; better recall for small/divergent HOGs.
+  #   "auto"     — use "cluster" for HOGs below auto_linclust_min_size members,
+  #                "linclust" for larger ones (logs the choice per HOG).
   subcluster_mode: linclust
 
-  # auto_linclust_min_size: HOGs at or above this member count switch to
-  # linclust when subcluster_mode is "auto".  Ignored for other modes.
+  # auto_linclust_min_size: HOGs at or above this member count switch to linclust
+  # when subcluster_mode is "auto".  Ignored for other modes.
   auto_linclust_min_size: 1000
 
-  # --- Sequence identity / coverage thresholds ----------------------------
+  # --- Sequence identity / coverage thresholds ---
   # Lower than mmseqs.min_seq_id because proteins within a HOG are already
-  # orthologous; more divergence is expected and desirable to cluster.
-  subcluster_min_seq_id: 0.4    # Min sequence identity within an OG [0-1]
-  subcluster_coverage: 0.8      # Min alignment coverage for within-OG subclustering [0-1]
-  subcluster_cov_mode: 1        # MMseqs2 coverage mode (0=query, 1=target, 2=bidirectional)
+  # orthologous; more divergence is expected and acceptable.
+  subcluster_min_seq_id: 0.4      # Min sequence identity within an OG [0.0–1.0]
+  subcluster_coverage: 0.8        # Min alignment coverage [0.0–1.0]
+  subcluster_cov_mode: 1          # Coverage mode: 0=query, 1=target, 2=bidirectional
 
   # subcluster_alignment_mode: MMseqs2 --alignment-mode value.
-  #   0 = automatic, 1 = score only, 2 = score + end positions,
-  #   3 = score + full alignment (default; required for cluster-reassign).
+  #   0 = automatic    1 = score only    2 = score + end positions
+  #   3 = score + full alignment (default; required for cluster-reassign)
   # Ignored for linclust mode.
   subcluster_alignment_mode: 3
 
   # subcluster_cluster_reassign: pass --cluster-reassign to mmseqs cluster.
-  # Improves cluster membership by reassigning border-zone members to their
-  # nearest cluster centre.  Only valid for "cluster" mode; silently ignored
-  # for "linclust" (which does not support this flag).
+  #   Reassigns border-zone members to their nearest cluster centre.
+  #   Only valid for "cluster" mode; silently ignored for "linclust".
   subcluster_cluster_reassign: false
 
-  # min_og_size_for_subclustering: OGs with fewer members skip MMseqs2 and
+  # min_og_size_for_subclustering: OGs with fewer members than this skip MMseqs2;
   # each protein is assigned its own singleton subfamily.
   min_og_size_for_subclustering: 2
 
-  # --- Concurrency controls -------------------------------------------------
-  # subcluster_threads: CPU threads passed to each MMseqs2 OG invocation.
-  # parallel_og_workers: number of OGs subclustered concurrently.
-  # Total CPU use ≈ parallel_og_workers × subcluster_threads.
-  # Keep within the core count of your SLURM allocation to avoid oversubscription.
-  subcluster_threads: 4
-  parallel_og_workers: 4
+  # --- Concurrency controls ---
+  # Total CPU load ≈ parallel_og_workers × subcluster_threads.
+  # Keep within the core count of your SLURM allocation.
+  subcluster_threads: 4           # CPU threads per individual MMseqs2 OG invocation
+  parallel_og_workers: 4          # Number of OGs subclustered concurrently
+
+  # gene_trees_source: path to a Resolved_Gene_Trees.txt file or a directory of
+  # *_tree.txt files from OrthoFinder v3.  When set, only OrthoGroups that have
+  # a gene tree are processed; all others are skipped.
+  # Leave empty ("") to process all OGs (default).
+  gene_trees_source: ""
