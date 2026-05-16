@@ -654,6 +654,7 @@ def test_load_og_ids_with_gene_trees_directory(tmp_path):
     og_ids = _load_og_ids_with_gene_trees(str(tree_dir), logger)
 
     assert og_ids == {"OG0000001", "OG0000002", "N0.HOG0000003"}
+    assert len(og_ids) == 3
     assert any("3 OG IDs" in m for m in logger.messages)
 
 

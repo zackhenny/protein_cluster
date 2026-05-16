@@ -194,6 +194,11 @@ def main() -> None:
     cfg = load_config(args.config)
     logger = setup_logging(Path(args.results_root) / "logs", cmd)
 
+    def _resolve_gene_trees_source() -> "str | None":
+        """Return the effective gene_trees_source: CLI flag > config > None."""
+        cli_val = getattr(args, "gene_trees_source", None)
+        return cli_val or cfg.get("orthofinder", {}).get("gene_trees_source") or None
+
     # Determine effective HMM mode BEFORE tool preflight checks so that
     # mmseqs-profile mode is not incorrectly required to have hhalign, and
     # db-search mode correctly requires hhsearch+ffindex_build+cstranslate.
@@ -408,10 +413,9 @@ def main() -> None:
         logger.info("Pipeline completed successfully")
 
     elif cmd == "orthofinder-cluster":
-        gene_trees_src = args.gene_trees_source or cfg["orthofinder"].get("gene_trees_source") or None
         manifest_tools.update(orthofinder_cluster(args.og_dir, args.outdir, cfg, logger,
                                                    resume=args.resume,
-                                                   gene_trees_source=gene_trees_src))
+                                                   gene_trees_source=_resolve_gene_trees_source()))
     elif cmd == "run-all-orthofinder":
         import time as _time
         root = Path(args.results_root)
@@ -441,7 +445,7 @@ def main() -> None:
             orthofinder_cluster, args.og_dir, str(root / "01_mmseqs"), cfg, logger,
             step_log_dir=root / "01_mmseqs", step_log_name="orthofinder-cluster",
             resume=resume,
-            gene_trees_source=args.gene_trees_source or cfg["orthofinder"].get("gene_trees_source") or None)
+            gene_trees_source=_resolve_gene_trees_source())
 
         proteins_combined = str(root / "01_mmseqs/proteins_combined.faa")
 
