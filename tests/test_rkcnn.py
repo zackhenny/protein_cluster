@@ -220,7 +220,8 @@ class TestRkcnnCandidateEdges:
         # cosine values should be in [-1, 1] (real cosine similarities)
         for row in rows:
             assert -1.0 <= row["cosine"] <= 1.0, (
-                f"cosine={row['cosine']} is outside [-1,1]; looks like a probability"
+                f"cosine={row['cosine']} is outside the valid cosine similarity range "
+                "[-1, 1]; the field may be storing rKCNN probability scores instead"
             )
         # With min_cosine=0.35, we should still get some edges (real cosines can
         # exceed 0.35) — not zero edges as probabilities ~0.2 would cause.

@@ -492,8 +492,8 @@ def rkcnn_candidate_edges(
             for ci in top_k_class_idx:
                 target_class = int(classes[ci])
                 for j_idx in class_to_sample_idx[target_class]:
-                    if int(j_idx) != i:
-                        target_indices.append(int(j_idx))
+                    if j_idx != i:
+                        target_indices.append(j_idx)
 
             if not target_indices:
                 continue
