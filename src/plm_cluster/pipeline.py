@@ -1024,11 +1024,29 @@ def orthofinder_cluster(
     n_of_singletons = int(stats["is_singleton"].sum()) if len(stats) > 0 else 0
     pct_singletons = 100.0 * n_singletons / n_proteins if n_proteins else 0.0
     median_size = float(stats["n_members"].median()) if len(stats) > 0 else 0.0
+
+    # Report split statistics
+    og_map_df = pl.DataFrame(og_subfamily_rows)
+    og_split_counts = (
+        og_map_df
+        .group_by("og_id")
+        .agg(pl.col("subfamily_id").n_unique().alias("n_subfamilies"))
+    )
+    n_split_ogs = int((og_split_counts["n_subfamilies"] > 1).sum())
+    n_retained_ogs = int((og_split_counts["n_subfamilies"] == 1).sum())
+    pct_split = 100.0 * n_split_ogs / n_ogs if n_ogs > 0 else 0.0
     logger.info(
         "OrthoFinder subclustering complete: %d OGs → %d subfamilies from %d proteins "
-        "(median size: %.0f, singletons: %d [%.1f%%])",
+        "(median size: %.0f, singletons: %d [%.1f%%]); "
+        "%d OGs split into multiple subfamilies (%.1f%%), %d retained as single subfamily",
         n_ogs, n_subfamilies, n_proteins, median_size, n_of_singletons, pct_singletons,
+        n_split_ogs, pct_split, n_retained_ogs,
     )
+
+    # Generate publication-quality OG split QC plots.
+    from .qc_plots import generate_orthofinder_split_plots  # noqa: PLC0415
+    generate_orthofinder_split_plots(out, logger=logger, resume=resume)
+
     return tools
 
 
