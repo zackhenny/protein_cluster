@@ -490,6 +490,345 @@ def generate_mmseqs_cluster_plots(
 
 
 # ---------------------------------------------------------------------------
+# OrthoFinder subclustering — OG split/retained plots via plotnine
+# ---------------------------------------------------------------------------
+
+def generate_orthofinder_split_plots(
+    outdir: str | Path,
+    logger=None,
+    resume: bool = False,
+) -> "Path | None":
+    """Generate publication-quality QC plots for the OrthoFinder MMSeqs2 subclustering step.
+
+    Reads ``og_subfamily_map.tsv`` and ``subfamily_stats.tsv`` produced by
+    :func:`~plm_cluster.pipeline.orthofinder_cluster` and writes five
+    figure-ready PNG files (300 DPI, ``theme_classic``) to
+    ``<outdir>/plots/``.
+
+    Five plots are produced:
+
+    * ``og_split_summary.png`` -- bar chart of split vs retained OG counts
+      with percentage annotations.
+    * ``subfamilies_per_split_og.png`` -- histogram of the number of
+      subfamilies generated from OGs that were split into more than one
+      subfamily.
+    * ``og_size_vs_subfamilies.png`` -- scatter plot of original OG member
+      count vs number of subfamilies produced (log–log scale), coloured by
+      split status.
+    * ``split_fraction_by_og_size.png`` -- stacked bar chart showing the
+      fraction of OGs that were split or retained, broken down by OG size
+      bin.
+    * ``subfamily_count_from_splits.png`` -- bar chart of the total number
+      of subfamilies contributed by split vs retained OGs, illustrating the
+      downstream impact of splitting.
+
+    Parameters
+    ----------
+    outdir : str or Path
+        OrthoFinder clustering output directory (``results/01_orthofinder``
+        by default).  Plots are written to ``<outdir>/plots/``.
+    logger : logging.Logger, optional
+        Logger for status messages.
+    resume : bool, optional
+        If *True* and plots already exist, skip generation.
+
+    Returns
+    -------
+    Path or None
+        Path to the plots sub-directory, or *None* if **plotnine** is not
+        installed, if ``og_subfamily_map.tsv`` is absent, or if no plots
+        could be saved (e.g. all rendering attempts raised exceptions).
+    """
+    out = Path(outdir)
+    plots_dir = out / "plots"
+    sentinel = plots_dir / "og_split_summary.png"
+
+    if resume and sentinel.exists():
+        if logger:
+            logger.info(
+                "Resume: OrthoFinder split plots already exist in %s, skipping.",
+                str(plots_dir),
+            )
+        return plots_dir
+
+    try:
+        from plotnine import (  # noqa: PLC0415
+            aes,
+            element_blank,
+            element_text,
+            geom_col,
+            geom_histogram,
+            geom_point,
+            geom_text,
+            ggplot,
+            labs,
+            scale_color_manual,
+            scale_fill_manual,
+            scale_x_log10,
+            scale_y_log10,
+            theme,
+            theme_classic,
+        )
+    except ImportError:
+        if logger:
+            logger.warning(
+                "plotnine not installed — skipping OrthoFinder split plots. "
+                "Install with: pip install plotnine  or  pip install 'plm-cluster[plots]'"
+            )
+        return None
+
+    og_map_path = out / "og_subfamily_map.tsv"
+    stats_path = out / "subfamily_stats.tsv"
+
+    og_map = _safe_read(og_map_path)
+    stats_df = _safe_read(stats_path)
+
+    if og_map is None:
+        if logger:
+            logger.warning(
+                "og_subfamily_map.tsv not found in %s — skipping OrthoFinder split plots.",
+                str(out),
+            )
+        return None
+
+    # ------------------------------------------------------------------
+    # Build per-OG summary: n_subfamilies, total_members, was_split
+    # ------------------------------------------------------------------
+    og_subfam_counts = og_map.groupby("og_id")["subfamily_id"].nunique().reset_index()
+    og_subfam_counts.columns = ["og_id", "n_subfamilies"]
+
+    if stats_df is not None and "n_members" in stats_df.columns:
+        # Merge member counts onto the og_map then sum per OG
+        merged = og_map.merge(stats_df[["subfamily_id", "n_members"]], on="subfamily_id", how="left")
+        og_sizes = merged.groupby("og_id")["n_members"].sum().reset_index()
+        og_sizes.columns = ["og_id", "total_members"]
+        og_df = og_subfam_counts.merge(og_sizes, on="og_id", how="left")
+    else:
+        og_df = og_subfam_counts.copy()
+        og_df["total_members"] = np.nan
+
+    og_df["was_split"] = og_df["n_subfamilies"] > 1
+    og_df["split_label"] = og_df["was_split"].map({True: "Split", False: "Retained"})
+
+    n_split = int(og_df["was_split"].sum())
+    n_retained = int((~og_df["was_split"]).sum())
+    n_total_ogs = n_split + n_retained
+    pct_split = 100.0 * n_split / n_total_ogs if n_total_ogs > 0 else 0.0
+    pct_retained = 100.0 * n_retained / n_total_ogs if n_total_ogs > 0 else 0.0
+
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    _THEME = (
+        theme_classic(base_size=12)
+        + theme(
+            plot_title=element_text(size=13, face="bold", margin={"b": 6}),
+            axis_title=element_text(size=11),
+            axis_text=element_text(size=10),
+        )
+    )
+    _DPI = 300
+    _W, _H = 8, 5
+
+    saved: list[Path] = []
+
+    # ------------------------------------------------------------------
+    # 1. Split vs retained OG summary bar chart
+    # ------------------------------------------------------------------
+    summary_df = pd.DataFrame({
+        "Status": ["Retained\n(1 subfamily)", "Split\n(>1 subfamily)"],
+        "Count": [n_retained, n_split],
+        "Fill": ["Retained", "Split"],
+        "pct": [pct_retained, pct_split],
+    })
+    summary_df["Status"] = pd.Categorical(
+        summary_df["Status"],
+        categories=summary_df["Status"].tolist(),
+        ordered=True,
+    )
+    summary_df["label"] = summary_df.apply(
+        lambda r: f"{int(r['Count'])}\n({r['pct']:.1f}%)", axis=1
+    )
+    try:
+        p1 = (
+            ggplot(summary_df, aes(x="Status", y="Count", fill="Fill"))
+            + geom_col(color="white", show_legend=False)
+            + geom_text(
+                aes(label="label"),
+                va="bottom",
+                size=9,
+                nudge_y=0.01 * max(int(summary_df["Count"].max()), 1),
+            )
+            + scale_fill_manual(values={"Retained": "#4c72b0", "Split": "#c44e52"})
+            + labs(
+                title="Orthogroup split summary",
+                subtitle=f"{n_total_ogs} OGs processed  |  "
+                         f"{pct_split:.1f}% split into multiple subfamilies",
+                x="",
+                y="Number of orthogroups",
+            )
+            + _THEME
+            + theme(axis_line_x=element_blank(), axis_ticks_major_x=element_blank())
+        )
+        path1 = plots_dir / "og_split_summary.png"
+        p1.save(str(path1), dpi=_DPI, width=_W, height=_H, verbose=False)
+        saved.append(path1)
+    except Exception as exc:  # noqa: BLE001
+        if logger:
+            logger.warning("Could not generate og_split_summary plot: %s", exc)
+
+    # ------------------------------------------------------------------
+    # 2. Histogram of subfamilies per split OG
+    # ------------------------------------------------------------------
+    split_og_df = og_df[og_df["was_split"]].copy()
+    if not split_og_df.empty:
+        n_bins = min(50, max(10, len(split_og_df) // 5))
+        median_subfams = float(split_og_df["n_subfamilies"].median())
+        try:
+            p2 = (
+                ggplot(split_og_df, aes(x="n_subfamilies"))
+                + geom_histogram(bins=n_bins, fill="#c44e52", color="white", size=0.3)
+                + scale_y_log10()
+                + labs(
+                    title="Subfamilies generated from split orthogroups",
+                    subtitle=f"{n_split} split OGs  |  median subfamilies per split OG = {median_subfams:.0f}",
+                    x="Number of subfamilies",
+                    y="Number of OGs (log\u2081\u2080 scale)",
+                )
+                + _THEME
+            )
+            path2 = plots_dir / "subfamilies_per_split_og.png"
+            p2.save(str(path2), dpi=_DPI, width=_W, height=_H, verbose=False)
+            saved.append(path2)
+        except Exception as exc:  # noqa: BLE001
+            if logger:
+                logger.warning("Could not generate subfamilies_per_split_og plot: %s", exc)
+
+    # ------------------------------------------------------------------
+    # 3. OG size vs number of subfamilies scatter (log–log)
+    # ------------------------------------------------------------------
+    scatter_df = og_df.dropna(subset=["total_members"]).copy()
+    scatter_df = scatter_df[scatter_df["total_members"] > 0]
+    if not scatter_df.empty:
+        try:
+            p3 = (
+                ggplot(scatter_df, aes(x="total_members", y="n_subfamilies", color="split_label"))
+                + geom_point(alpha=0.4, size=1.5)
+                + scale_x_log10()
+                + scale_y_log10()
+                + scale_color_manual(values={"Retained": "#4c72b0", "Split": "#c44e52"})
+                + labs(
+                    title="Orthogroup size vs subfamilies produced",
+                    x="OG member count (log\u2081\u2080 scale)",
+                    y="Subfamilies produced (log\u2081\u2080 scale)",
+                    color="Status",
+                )
+                + _THEME
+            )
+            path3 = plots_dir / "og_size_vs_subfamilies.png"
+            p3.save(str(path3), dpi=_DPI, width=_W, height=_H, verbose=False)
+            saved.append(path3)
+        except Exception as exc:  # noqa: BLE001
+            if logger:
+                logger.warning("Could not generate og_size_vs_subfamilies plot: %s", exc)
+
+    # ------------------------------------------------------------------
+    # 4. Split fraction by OG size bin (stacked bar)
+    # ------------------------------------------------------------------
+    size_df = og_df.dropna(subset=["total_members"]).copy()
+    if not size_df.empty:
+        _bins = [0, 1, 5, 20, 100, 500, float("inf")]
+        _labels = ["1", "2–5", "6–20", "21–100", "101–500", "501+"]
+        size_df["size_bin"] = pd.cut(
+            size_df["total_members"],
+            bins=_bins,
+            labels=_labels,
+            right=True,
+        )
+        bin_counts = (
+            size_df.groupby(["size_bin", "split_label"], observed=True)
+            .size()
+            .reset_index(name="Count")
+        )
+        bin_totals = bin_counts.groupby("size_bin", observed=True)["Count"].transform("sum")
+        bin_counts["fraction"] = bin_counts["Count"] / bin_totals
+        bin_counts["label"] = bin_counts["Count"].apply(str)
+        bin_counts["size_bin"] = pd.Categorical(
+            bin_counts["size_bin"].astype(str), categories=_labels, ordered=True
+        )
+        try:
+            p4 = (
+                ggplot(bin_counts, aes(x="size_bin", y="Count", fill="split_label"))
+                + geom_col(color="white", position="stack")
+                + scale_fill_manual(values={"Retained": "#4c72b0", "Split": "#c44e52"})
+                + labs(
+                    title="OG split status by orthogroup size",
+                    subtitle="Larger OGs tend to be split into multiple subfamilies",
+                    x="OG member count (bin)",
+                    y="Number of OGs",
+                    fill="Status",
+                )
+                + _THEME
+            )
+            path4 = plots_dir / "split_fraction_by_og_size.png"
+            p4.save(str(path4), dpi=_DPI, width=_W, height=_H, verbose=False)
+            saved.append(path4)
+        except Exception as exc:  # noqa: BLE001
+            if logger:
+                logger.warning("Could not generate split_fraction_by_og_size plot: %s", exc)
+
+    # ------------------------------------------------------------------
+    # 5. Total subfamilies contributed by split vs retained OGs
+    # ------------------------------------------------------------------
+    contrib_df = (
+        og_df.groupby("split_label")["n_subfamilies"]
+        .sum()
+        .reset_index()
+        .rename(columns={"n_subfamilies": "total_subfamilies"})
+    )
+    contrib_df["label"] = contrib_df["total_subfamilies"].apply(str)
+    # Ensure consistent ordering
+    contrib_df["split_label"] = pd.Categorical(
+        contrib_df["split_label"], categories=["Retained", "Split"], ordered=True
+    )
+    contrib_df = contrib_df.sort_values("split_label")
+    try:
+        p5 = (
+            ggplot(contrib_df, aes(x="split_label", y="total_subfamilies", fill="split_label"))
+            + geom_col(color="white", show_legend=False)
+            + geom_text(
+                aes(label="label"),
+                va="bottom",
+                size=9,
+                nudge_y=0.01 * max(int(contrib_df["total_subfamilies"].max()), 1),
+            )
+            + scale_fill_manual(values={"Retained": "#4c72b0", "Split": "#c44e52"})
+            + labs(
+                title="Total subfamilies contributed by split vs retained OGs",
+                subtitle="Split OGs generate more subfamilies, expanding coverage",
+                x="OG status",
+                y="Total subfamilies",
+            )
+            + _THEME
+            + theme(axis_line_x=element_blank(), axis_ticks_major_x=element_blank())
+        )
+        path5 = plots_dir / "subfamily_count_from_splits.png"
+        p5.save(str(path5), dpi=_DPI, width=_W, height=_H, verbose=False)
+        saved.append(path5)
+    except Exception as exc:  # noqa: BLE001
+        if logger:
+            logger.warning("Could not generate subfamily_count_from_splits plot: %s", exc)
+
+    if logger:
+        if saved:
+            logger.info(
+                "OrthoFinder split plots (%d files) saved to %s", len(saved), str(plots_dir)
+            )
+        else:
+            logger.warning("No OrthoFinder split plots were produced (check data files).")
+    return plots_dir if saved else None
+
+
+# ---------------------------------------------------------------------------
 # Summary dashboard (full pipeline QC, matplotlib)
 # ---------------------------------------------------------------------------
 
