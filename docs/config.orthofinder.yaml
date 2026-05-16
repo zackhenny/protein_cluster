@@ -98,6 +98,29 @@ orthofinder:
   # singleton subfamily.  This ensures all proteins have a subfamily assignment.
   min_og_size_for_subclustering: 2
 
+  # gene_trees_source: filter OrthoGroups by resolved gene tree (OrthoFinder v3).
+  #
+  # Accepts two formats:
+  #   1. A directory of *_tree.txt files produced by OrthoFinder v3
+  #      (e.g. OrthoFinder/Results_*/Gene_Trees/Resolved_Gene_Trees/).
+  #      Each file contributes one OG ID by stripping "_tree" from its stem:
+  #        OG0000001_tree.txt  →  OG0000001
+  #        N0.HOG0000001_tree.txt  →  N0.HOG0000001
+  #
+  #   2. A combined Resolved_Gene_Trees.txt file — either a plain list of
+  #      OG/HOG identifiers (one per line) or lines containing Newick strings
+  #      that embed OG/HOG IDs as tokens.
+  #
+  # When set, only OrthoGroups whose stem matches an ID in this source are
+  # processed; all others are skipped.  Leave empty ("") to disable filtering
+  # and process every OG FASTA file in --og_dir (default behaviour).
+  #
+  # Example (directory):
+  #   gene_trees_source: "OrthoFinder/Results_Apr01/Gene_Trees/Resolved_Gene_Trees"
+  # Example (file):
+  #   gene_trees_source: "OrthoFinder/Results_Apr01/Resolved_Gene_Trees.txt"
+  gene_trees_source: ""
+
   # --- Concurrency knobs ---
   # subcluster_threads: CPU threads per individual MMseqs2 OG invocation.
   # parallel_og_workers: number of OGs processed concurrently.

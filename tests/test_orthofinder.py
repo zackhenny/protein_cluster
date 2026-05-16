@@ -632,3 +632,240 @@ def test_cli_knn_mode_override_propagates(monkeypatch):
     if args.knn_mode:
         cfg["knn"]["mode"] = args.knn_mode
     assert cfg["knn"]["mode"] == "rkcnn"
+
+
+# ---------------------------------------------------------------------------
+# Gene-tree filter tests
+# ---------------------------------------------------------------------------
+
+def test_load_og_ids_with_gene_trees_directory(tmp_path):
+    """Helper reads OG IDs from *_tree.txt filenames in a directory."""
+    from plm_cluster.pipeline import _load_og_ids_with_gene_trees
+
+    tree_dir = tmp_path / "gene_trees"
+    tree_dir.mkdir()
+    (tree_dir / "OG0000001_tree.txt").write_text("(a,b);")
+    (tree_dir / "OG0000002_tree.txt").write_text("(c,d);")
+    (tree_dir / "N0.HOG0000003_tree.txt").write_text("(e,f);")
+    # File without the expected suffix should not contribute an ID
+    (tree_dir / "README.txt").write_text("ignore me")
+
+    logger = DummyLogger()
+    og_ids = _load_og_ids_with_gene_trees(str(tree_dir), logger)
+
+    assert og_ids == {"OG0000001", "OG0000002", "N0.HOG0000003"}
+    assert any("3 OG IDs" in m for m in logger.messages)
+
+
+def test_load_og_ids_with_gene_trees_file_simple_list(tmp_path):
+    """Helper reads bare OG IDs from a simple-list file."""
+    from plm_cluster.pipeline import _load_og_ids_with_gene_trees
+
+    list_file = tmp_path / "Resolved_Gene_Trees.txt"
+    list_file.write_text("OG0000001\nOG0000002\nN0.HOG0000003\n")
+
+    logger = DummyLogger()
+    og_ids = _load_og_ids_with_gene_trees(str(list_file), logger)
+
+    assert og_ids == {"OG0000001", "OG0000002", "N0.HOG0000003"}
+
+
+def test_load_og_ids_with_gene_trees_file_newick(tmp_path):
+    """Helper extracts OG IDs embedded in Newick strings."""
+    from plm_cluster.pipeline import _load_og_ids_with_gene_trees
+
+    newick_file = tmp_path / "Resolved_Gene_Trees.txt"
+    newick_file.write_text(
+        "OG0000001: (speciesA_prot1:0.1,speciesB_prot2:0.2);\n"
+        "OG0000002: (speciesC_prot3:0.3,speciesD_prot4:0.4);\n"
+    )
+
+    logger = DummyLogger()
+    og_ids = _load_og_ids_with_gene_trees(str(newick_file), logger)
+
+    assert "OG0000001" in og_ids
+    assert "OG0000002" in og_ids
+
+
+def test_load_og_ids_with_gene_trees_nonexistent_raises(tmp_path):
+    """Helper raises ValueError for a path that does not exist."""
+    from plm_cluster.pipeline import _load_og_ids_with_gene_trees
+
+    logger = DummyLogger()
+    with pytest.raises(ValueError, match="does not exist"):
+        _load_og_ids_with_gene_trees(str(tmp_path / "no_such_path"), logger)
+
+
+def test_load_og_ids_with_gene_trees_empty_raises(tmp_path):
+    """Helper raises ValueError when no OG IDs can be parsed."""
+    from plm_cluster.pipeline import _load_og_ids_with_gene_trees
+
+    empty_file = tmp_path / "empty.txt"
+    empty_file.write_text("no ids here\njust random text\n")
+
+    logger = DummyLogger()
+    with pytest.raises(ValueError, match="yielded no OG/HOG IDs"):
+        _load_og_ids_with_gene_trees(str(empty_file), logger)
+
+
+def test_gene_tree_filter_directory(tmp_path, monkeypatch):
+    """Only OGs with a gene tree in the directory are processed."""
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    _write_faa(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK", "p2": "MKTAYIAG"})
+    _write_faa(og_dir / "OG0000002.faa", {"p3": "GAVLILKK", "p4": "GAVLILKG"})
+
+    # Only OG0000001 has a gene tree
+    tree_dir = tmp_path / "gene_trees"
+    tree_dir.mkdir()
+    (tree_dir / "OG0000001_tree.txt").write_text("(p1,p2);")
+
+    outdir = tmp_path / "out"
+    cfg = load_config(None)
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", _fake_require)
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", _make_fake_run(og_dir))
+
+    logger = DummyLogger()
+    orthofinder_cluster(str(og_dir), str(outdir), cfg, logger,
+                        gene_trees_source=str(tree_dir))
+
+    smap = pd.read_csv(outdir / "subfamily_map.tsv", sep="\t")
+    protein_ids = set(smap["protein_id"].tolist())
+    # Only OG0000001 proteins should appear
+    assert "p1" in protein_ids
+    assert "p2" in protein_ids
+    assert "p3" not in protein_ids
+    assert "p4" not in protein_ids
+
+    # Filter log message should be present
+    assert any("Gene-tree filter" in m for m in logger.messages)
+
+
+def test_gene_tree_filter_file_list(tmp_path, monkeypatch):
+    """Only OGs listed in a simple-list Resolved_Gene_Trees.txt are processed."""
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    _write_faa(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK", "p2": "MKTAYIAG"})
+    _write_faa(og_dir / "OG0000002.faa", {"p3": "GAVLILKK", "p4": "GAVLILKG"})
+
+    # Only OG0000001 has a gene tree
+    list_file = tmp_path / "Resolved_Gene_Trees.txt"
+    list_file.write_text("OG0000001\n")
+
+    outdir = tmp_path / "out"
+    cfg = load_config(None)
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", _fake_require)
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", _make_fake_run(og_dir))
+
+    logger = DummyLogger()
+    orthofinder_cluster(str(og_dir), str(outdir), cfg, logger,
+                        gene_trees_source=str(list_file))
+
+    smap = pd.read_csv(outdir / "subfamily_map.tsv", sep="\t")
+    protein_ids = set(smap["protein_id"].tolist())
+    assert "p1" in protein_ids
+    assert "p2" in protein_ids
+    assert "p3" not in protein_ids
+    assert "p4" not in protein_ids
+
+
+def test_gene_tree_filter_file_newick(tmp_path, monkeypatch):
+    """Only OGs mentioned in a Newick-content file are processed."""
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    _write_faa(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK", "p2": "MKTAYIAG"})
+    _write_faa(og_dir / "OG0000002.faa", {"p3": "GAVLILKK", "p4": "GAVLILKG"})
+
+    # Only OG0000001 appears in Newick content
+    newick_file = tmp_path / "Resolved_Gene_Trees.txt"
+    newick_file.write_text("OG0000001: (speciesA_p1:0.1,speciesB_p2:0.2);\n")
+
+    outdir = tmp_path / "out"
+    cfg = load_config(None)
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", _fake_require)
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", _make_fake_run(og_dir))
+
+    logger = DummyLogger()
+    orthofinder_cluster(str(og_dir), str(outdir), cfg, logger,
+                        gene_trees_source=str(newick_file))
+
+    smap = pd.read_csv(outdir / "subfamily_map.tsv", sep="\t")
+    protein_ids = set(smap["protein_id"].tolist())
+    assert "p1" in protein_ids
+    assert "p2" in protein_ids
+    assert "p3" not in protein_ids
+    assert "p4" not in protein_ids
+
+
+def test_gene_tree_filter_no_matching_ogs_raises(tmp_path, monkeypatch):
+    """ValueError is raised when the gene-tree filter removes all OG files."""
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    _write_faa(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK"})
+
+    # Gene tree for a completely different OG
+    list_file = tmp_path / "trees.txt"
+    list_file.write_text("OG9999999\n")
+
+    outdir = tmp_path / "out"
+    cfg = load_config(None)
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", _fake_require)
+
+    logger = DummyLogger()
+    with pytest.raises(ValueError, match="Gene-tree filter removed all"):
+        orthofinder_cluster(str(og_dir), str(outdir), cfg, logger,
+                            gene_trees_source=str(list_file))
+
+
+def test_gene_tree_filter_none_processes_all(tmp_path, monkeypatch):
+    """With gene_trees_source=None, all OGs are processed (backward compatibility)."""
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    _write_faa(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK", "p2": "MKTAYIAG"})
+    _write_faa(og_dir / "OG0000002.faa", {"p3": "GAVLILKK", "p4": "GAVLILKG"})
+
+    outdir = tmp_path / "out"
+    cfg = load_config(None)
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", _fake_require)
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", _make_fake_run(og_dir))
+
+    logger = DummyLogger()
+    orthofinder_cluster(str(og_dir), str(outdir), cfg, logger, gene_trees_source=None)
+
+    smap = pd.read_csv(outdir / "subfamily_map.tsv", sep="\t")
+    protein_ids = set(smap["protein_id"].tolist())
+    # All proteins from both OGs must be present
+    assert protein_ids == {"p1", "p2", "p3", "p4"}
+
+
+def test_gene_tree_filter_config_fallback(tmp_path, monkeypatch):
+    """gene_trees_source in config is used when no CLI value is passed."""
+    og_dir = tmp_path / "ogs"
+    og_dir.mkdir()
+    _write_faa(og_dir / "OG0000001.faa", {"p1": "MKTAYIAK"})
+    _write_faa(og_dir / "OG0000002.faa", {"p3": "GAVLILKK"})
+
+    list_file = tmp_path / "trees.txt"
+    list_file.write_text("OG0000001\n")
+
+    outdir = tmp_path / "out"
+    cfg = load_config(None)
+    cfg["orthofinder"]["gene_trees_source"] = str(list_file)
+
+    monkeypatch.setattr("plm_cluster.pipeline.require_executables", _fake_require)
+    monkeypatch.setattr("plm_cluster.pipeline.run_cmd", _make_fake_run(og_dir))
+
+    logger = DummyLogger()
+    # gene_trees_source=None → must fall back to config value
+    orthofinder_cluster(str(og_dir), str(outdir), cfg, logger, gene_trees_source=None)
+
+    smap = pd.read_csv(outdir / "subfamily_map.tsv", sep="\t")
+    protein_ids = set(smap["protein_id"].tolist())
+    assert protein_ids == {"p1"}
+    assert "p3" not in protein_ids
+

@@ -202,6 +202,7 @@ results/01_mmseqs/
 | `min_og_size_for_subclustering` | `2` | OGs smaller than this skip MMseqs2; each protein becomes a singleton subfamily |
 | `subcluster_threads` | `4` | CPU threads per individual MMseqs2 OG invocation |
 | `parallel_og_workers` | `4` | OGs processed concurrently (`total CPU ≈ parallel_og_workers × subcluster_threads`) |
+| `gene_trees_source` | `""` | Path to OrthoFinder v3 gene-tree directory or file; see [Filtering by gene tree](#filtering-by-gene-tree-orthofinder-v3) |
 
 **Subclustering modes:**
 
@@ -215,6 +216,43 @@ results/01_mmseqs/
 members to their nearest cluster center.  Set `subcluster_cluster_reassign: true`
 to enable it; it is only applied when the effective algorithm is `cluster`
 (silently ignored for `linclust`).
+
+### Filtering by gene tree (OrthoFinder v3)
+
+OrthoFinder v3 resolves gene trees only for a subset of orthogroups.  Use
+`--gene-trees-source` (or the `orthofinder.gene_trees_source` config key) to
+restrict the pipeline to OrthoGroups that have a resolved gene tree, skipping
+all others.
+
+**Directory of `*_tree.txt` files** (OrthoFinder v3 default output):
+
+```bash
+plm_cluster run-all-orthofinder \
+  --og_dir OrthoFinder/Results_*/Orthogroup_Sequences/ \
+  --gene-trees-source OrthoFinder/Results_*/Gene_Trees/Resolved_Gene_Trees/ \
+  --weights_path /path/to/esm2_t33_650M_UR50D.pt \
+  --results_root results
+```
+
+**Combined `Resolved_Gene_Trees.txt` file** (plain list or Newick content):
+
+```bash
+plm_cluster run-all-orthofinder \
+  --og_dir OrthoFinder/Results_*/Orthogroup_Sequences/ \
+  --gene-trees-source OrthoFinder/Results_*/Resolved_Gene_Trees.txt \
+  --weights_path /path/to/esm2_t33_650M_UR50D.pt \
+  --results_root results
+```
+
+Both forms can also be set in the config file under
+`orthofinder.gene_trees_source`.  The CLI flag takes precedence.
+
+**Supported file formats for `Resolved_Gene_Trees.txt`:**
+
+| Format | Example line |
+|--------|-------------|
+| Simple list | `OG0000001` |
+| Newick content | `OG0000001: (speciesA_prot1:0.1,speciesB_prot2:0.2);` |
 
 **Provenance chain** — every output contains keys to reconstruct the full join:
 
