@@ -62,7 +62,7 @@ class TestRKCNN:
         assert (proba >= 0).all()
         # Each row should sum to approximately 1
         row_sums = proba.sum(axis=1)
-        np.testing.assert_allclose(row_sums, 1.0, atol=0.05)
+        np.testing.assert_allclose(row_sums, 1.0, atol=1e-6)
 
     def test_predict_proba_not_fitted_raises(self):
         model = RKCNN()
@@ -193,6 +193,65 @@ class TestRkcnnCandidateEdges:
         rows = rkcnn_candidate_edges(X, ids, lens, labels, config)
         for row in rows:
             assert row["q_subfamily_id"] != row["t_subfamily_id"]
+
+    def test_cosine_field_is_actual_cosine_not_probability(self, tmp_path):
+        """cosine field must contain actual cosine similarity in [-1,1], not rKCNN
+        probability scores.  With min_cosine=0.35 and k=5 neighbors, rKCNN
+        probabilities (~0.2) would yield zero edges; actual cosines must be used."""
+        rng = np.random.RandomState(7)
+        n = 30
+        X = rng.randn(n, 32).astype(np.float32)
+        X /= np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
+        ids = [f"s{i}" for i in range(n)]
+        lens = {s: 200 for s in ids}
+        labels = np.arange(n)
+        # Use a realistic min_cosine threshold (default is 0.35)
+        config = {
+            "knn": {
+                "mode": "rkcnn", "k": 5, "min_cosine": 0.35,
+                "min_len_ratio": 0.0, "max_len_ratio": 100.0,
+                "device": "cpu", "rkcnn_n_subspaces": 5,
+                "rkcnn_subspace_fraction": 0.5, "rkcnn_n_neighbors": 5,
+                "rkcnn_score_threshold": 0.0, "rkcnn_weighting": "separation",
+                "rkcnn_cascade_topn": 15, "rkcnn_random_state": 7,
+            }
+        }
+        rows = rkcnn_candidate_edges(X, ids, lens, labels, config)
+        # cosine values should be in [-1, 1] (real cosine similarities)
+        for row in rows:
+            assert -1.0 <= row["cosine"] <= 1.0, (
+                f"cosine={row['cosine']} is outside the valid cosine similarity range "
+                "[-1, 1]; the field may be storing rKCNN probability scores instead"
+            )
+        # With min_cosine=0.35, we should still get some edges (real cosines can
+        # exceed 0.35) — not zero edges as probabilities ~0.2 would cause.
+        assert len(rows) > 0, (
+            "No edges generated; cosine field may be storing probabilities (<0.35) "
+            "instead of actual cosine similarities"
+        )
+
+    def test_cosine_field_is_actual_cosine_global_mode(self, tmp_path):
+        """Same cosine-vs-probability check for global mode (cascade_topn=0)."""
+        rng = np.random.RandomState(11)
+        n = 20
+        X = rng.randn(n, 32).astype(np.float32)
+        X /= np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
+        ids = [f"s{i}" for i in range(n)]
+        lens = {s: 200 for s in ids}
+        labels = np.arange(n)
+        config = {
+            "knn": {
+                "mode": "rkcnn", "k": 3, "min_cosine": 0.0,
+                "min_len_ratio": 0.0, "max_len_ratio": 100.0,
+                "device": "cpu", "rkcnn_n_subspaces": 3,
+                "rkcnn_subspace_fraction": 0.5, "rkcnn_n_neighbors": 3,
+                "rkcnn_score_threshold": 0.0, "rkcnn_weighting": "uniform",
+                "rkcnn_cascade_topn": 0, "rkcnn_random_state": 11,
+            }
+        }
+        rows = rkcnn_candidate_edges(X, ids, lens, labels, config)
+        for row in rows:
+            assert -1.0 <= row["cosine"] <= 1.0
 
     def test_l2_normalization_enforced(self, tmp_path):
         """Embeddings that are NOT L2-normalized should be auto-normalized."""
