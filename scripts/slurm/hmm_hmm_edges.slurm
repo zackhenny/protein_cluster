@@ -27,7 +27,7 @@
 #
 # Set hmm_hmm.parallel_workers in config.yaml equal to --cpus-per-task.
 # =============================================================================
-#SBATCH --job-name=plm-hhm
+#SBATCH --job-name=plm-hmm
 #SBATCH --account=YOUR_ACCOUNT       # Replace with your CARC project allocation
 #SBATCH --partition=epyc-64
 #SBATCH --nodes=1

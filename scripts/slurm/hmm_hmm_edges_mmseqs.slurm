@@ -37,7 +37,7 @@
 #   epyc-64  — 64 cores, 248 GB, ≤48 h  (strongly recommended)
 #   largemem — if >500k subfamilies and MMseqs2 needs more than 248 GB
 # =============================================================================
-#SBATCH --job-name=plm-hhm-mm
+#SBATCH --job-name=plm-hmm-mm
 #SBATCH --account=YOUR_ACCOUNT       # Replace with your CARC project allocation
 #SBATCH --partition=epyc-64
 #SBATCH --nodes=1

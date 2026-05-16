@@ -21,7 +21,7 @@
 # Discovery partition guidance:
 #   main  — sufficient
 # =============================================================================
-#SBATCH --job-name=plm-hhm-merge
+#SBATCH --job-name=plm-hmm-merge
 #SBATCH --account=YOUR_ACCOUNT       # Replace with your CARC project allocation
 #SBATCH --partition=main
 #SBATCH --nodes=1

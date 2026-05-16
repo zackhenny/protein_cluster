@@ -39,7 +39,7 @@
 #   main     — acceptable; slightly lower core count on some nodes
 #   oneweek  — if individual shards might exceed 48 h
 # =============================================================================
-#SBATCH --job-name=plm-hhm-arr
+#SBATCH --job-name=plm-hmm-arr
 #SBATCH --account=YOUR_ACCOUNT       # Replace with your CARC project allocation
 #SBATCH --partition=epyc-64
 #SBATCH --nodes=1
