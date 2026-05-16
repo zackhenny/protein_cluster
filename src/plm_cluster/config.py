@@ -140,6 +140,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # parallel_og_workers: how many OGs to subcluster concurrently.
         # Total CPU load ≈ parallel_og_workers × subcluster_threads.
         "parallel_og_workers": 4,
+        # gene_trees_source: path to a Resolved_Gene_Trees.txt file or a
+        # directory of *_tree.txt files from OrthoFinder v3.  When set, only
+        # OrthoGroups that have a gene tree are processed; all others are
+        # silently skipped.  Leave empty ("") to disable filtering (default,
+        # processes all OGs).
+        "gene_trees_source": "",
     },
 }
 

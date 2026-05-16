@@ -353,6 +353,39 @@ plm_cluster write-matrices \
 - `knn.rkcnn_cascade_topn`: FAISS pre-filter for rKCNN scalability
 - `outputs.write_dense_threshold`
 
+## OrthoFinder v3: filtering by gene tree
+
+Pass `--gene-trees-source` to `orthofinder-cluster` or `run-all-orthofinder` to
+restrict processing to only those OrthoGroups that have a resolved gene tree.
+OGs not represented in the source are silently skipped; all downstream steps
+(Steps 2–9) then operate only on the filtered set.
+
+```bash
+# Directory of *_tree.txt files (OrthoFinder v3 Resolved_Gene_Trees/ output)
+plm_cluster run-all-orthofinder \
+  --og_dir OrthoFinder/Results_*/Orthogroup_Sequences/ \
+  --gene-trees-source OrthoFinder/Results_*/Gene_Trees/Resolved_Gene_Trees/ \
+  --weights_path /path/to/esm2.pt
+
+# Single combined file (plain OG list or Newick content with OG IDs)
+plm_cluster run-all-orthofinder \
+  --og_dir OrthoFinder/Results_*/Orthogroup_Sequences/ \
+  --gene-trees-source OrthoFinder/Results_*/Resolved_Gene_Trees.txt \
+  --weights_path /path/to/esm2.pt
+```
+
+The same option works for the standalone step:
+
+```bash
+plm_cluster orthofinder-cluster \
+  --og_dir OrthoFinder/Results_*/Orthogroup_Sequences/ \
+  --gene-trees-source OrthoFinder/Results_*/Resolved_Gene_Trees.txt \
+  --outdir results/01_mmseqs
+```
+
+The filter can also be set in the config file (`orthofinder.gene_trees_source`);
+the CLI flag takes precedence.
+
 ## Backward-compatible command aliases
 
 - `plm_cluster map-proteins` -> `map-proteins-to-families`

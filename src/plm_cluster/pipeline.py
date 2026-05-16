@@ -592,7 +592,76 @@ def _save_og_checkpoint(
     tmp.rename(cp)
 
 
-def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: bool = False) -> dict[str, str]:
+# ---------------------------------------------------------------------------
+# Gene-tree filter helper (OrthoFinder v3)
+# ---------------------------------------------------------------------------
+
+_OG_ID_RE = re.compile(r"\b(?:N\d+\.)?(?:OG|HOG)\d+\b")
+_OG_ID_LINE_RE = re.compile(r"^\s*(?:N\d+\.)?(?:OG|HOG)\d+\s*$")
+
+
+def _load_og_ids_with_gene_trees(source: str, logger) -> set[str]:
+    """Return the set of OG/HOG IDs that have a resolved gene tree.
+
+    *source* may be:
+
+    * A **directory** — every ``*_tree.txt`` file inside it contributes one ID
+      by stripping the ``_tree`` suffix from the file stem.
+      E.g. ``OG0000001_tree.txt`` → ``OG0000001``,
+      ``N0.HOG0000001_tree.txt`` → ``N0.HOG0000001``.
+
+    * A **file** — read line-by-line and handle two sub-formats automatically:
+
+      - *Simple list*: lines whose entire content is a bare OG/HOG identifier
+        (e.g. ``OG0000001``).
+      - *Newick/tree content*: lines that contain an OG/HOG token embedded in
+        a Newick string or other text; all matching tokens are extracted.
+
+    Raises :class:`ValueError` if *source* does not exist or if no OG IDs can
+    be parsed from it.
+    """
+    src = Path(source)
+    og_ids: set[str] = set()
+
+    if src.is_dir():
+        for tree_file in src.glob("*_tree.txt"):
+            # Strip the trailing "_tree" from the stem
+            stem = tree_file.stem
+            if stem.endswith("_tree"):
+                og_id = stem[:-5]  # remove "_tree"
+            else:
+                og_id = stem
+            og_ids.add(og_id)
+    elif src.is_file():
+        for line in src.read_text(errors="replace").splitlines():
+            if _OG_ID_LINE_RE.match(line):
+                og_ids.add(line.strip())
+            else:
+                og_ids.update(_OG_ID_RE.findall(line))
+    else:
+        raise ValueError(
+            f"gene_trees_source '{source}' does not exist or is neither a file nor a directory."
+        )
+
+    if not og_ids:
+        raise ValueError(
+            f"gene_trees_source '{source}' was parsed but yielded no OG/HOG IDs. "
+            "Check that the file contains OG* or HOG* identifiers, or that the "
+            "directory contains *_tree.txt files."
+        )
+
+    logger.info("Gene-tree filter: %d OG IDs with gene trees loaded from %s", len(og_ids), source)
+    return og_ids
+
+
+def orthofinder_cluster(
+    og_dir: str,
+    outdir: str,
+    config: dict,
+    logger,
+    resume: bool = False,
+    gene_trees_source: "str | None" = None,
+) -> dict[str, str]:
     """Step 1 (OrthoFinder mode): Subcluster each HOG/OG FASTA into subfamilies using MMseqs2.
 
     Scans *og_dir* for ``*.faa`` and ``*.fa`` files produced by OrthoFinder
@@ -618,6 +687,17 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
     skipped, while OGs without a checkpoint (including any that timed out
     mid-run) are (re-)processed from scratch.  This allows a long run to be
     safely interrupted and resumed without using any partial per-OG data.
+
+    Parameters
+    ----------
+    gene_trees_source:
+        Optional path to an OrthoFinder v3 gene-tree source: either a
+        directory of ``*_tree.txt`` files or a ``Resolved_Gene_Trees.txt``
+        list/multi-tree file.  When provided, only OGs whose stem appears in
+        the resolved gene-tree set are processed; all others are skipped.
+        If ``None`` (default), the value of
+        ``config["orthofinder"]["gene_trees_source"]`` is used as a fallback;
+        an empty string there also means no filtering.
     """
     out = _ensure_dir(outdir)
     if resume and (out / "subfamily_map.tsv").exists():
@@ -659,6 +739,33 @@ def orthofinder_cluster(og_dir: str, outdir: str, config: dict, logger, resume: 
             f"No *.faa or *.fa files found in '{og_dir}'. "
             "Please point --og_dir at a directory of OrthoFinder HOG or OG FASTA files."
         )
+
+    # ------------------------------------------------------------------
+    # Gene-tree filter (OrthoFinder v3)
+    # ------------------------------------------------------------------
+    # Resolve effective source: explicit parameter wins over config fallback.
+    _gene_trees_src = gene_trees_source or of_cfg.get("gene_trees_source") or None
+    if _gene_trees_src:
+        og_ids_with_tree = _load_og_ids_with_gene_trees(_gene_trees_src, logger)
+        n_total = len(og_files)
+        og_files = [f for f in og_files if f.stem in og_ids_with_tree]
+        n_kept = len(og_files)
+        n_skip = n_total - n_kept
+        logger.info(
+            "Gene-tree filter: keeping %d/%d OGs with resolved gene trees (skipping %d)",
+            n_kept, n_total, n_skip,
+        )
+        if not og_files:
+            raise ValueError(
+                f"Gene-tree filter removed all {n_total} OG FASTA files — "
+                f"no OG stems matched the IDs in '{_gene_trees_src}'. "
+                "Check that the gene_trees_source path points to the correct "
+                "OrthoFinder v3 Resolved_Gene_Trees directory or file."
+            )
+        if resume:
+            logger.info(
+                "Gene-tree filter active during resume: stale checkpoints for excluded OGs are ignored"
+            )
 
     # Per-HOG checkpoint directory: stores one JSON per successfully processed OG so
     # that a resumable run can skip already-completed OGs without re-running them.

@@ -161,6 +161,10 @@ def main() -> None:
     p.add_argument("--outdir", default="results/01_mmseqs")
     p.add_argument("--resume", action="store_true",
                    help="Skip this step if its output files already exist")
+    p.add_argument("--gene-trees-source", default=None, dest="gene_trees_source",
+                   help="Path to a Resolved_Gene_Trees.txt file or a directory of "
+                        "*_tree.txt files (OrthoFinder v3); only OGs with a gene tree "
+                        "are processed")
 
     p = sub.add_parser("run-all-orthofinder")
     add_common(p)
@@ -180,11 +184,20 @@ def main() -> None:
                    help="Shard index for the HMM-HMM step")
     p.add_argument("--n-shards", type=int, default=1, dest="n_shards",
                    help="Total shards for the HMM-HMM step")
+    p.add_argument("--gene-trees-source", default=None, dest="gene_trees_source",
+                   help="Path to a Resolved_Gene_Trees.txt file or a directory of "
+                        "*_tree.txt files (OrthoFinder v3); only OGs with a gene tree "
+                        "are processed")
 
     args = ap.parse_args()
     cmd = ALIASES.get(args.cmd, args.cmd)
     cfg = load_config(args.config)
     logger = setup_logging(Path(args.results_root) / "logs", cmd)
+
+    def _resolve_gene_trees_source() -> "str | None":
+        """Return the effective gene_trees_source: CLI flag > config > None."""
+        cli_val = getattr(args, "gene_trees_source", None)
+        return cli_val or cfg.get("orthofinder", {}).get("gene_trees_source") or None
 
     # Determine effective HMM mode BEFORE tool preflight checks so that
     # mmseqs-profile mode is not incorrectly required to have hhalign, and
@@ -401,7 +414,8 @@ def main() -> None:
 
     elif cmd == "orthofinder-cluster":
         manifest_tools.update(orthofinder_cluster(args.og_dir, args.outdir, cfg, logger,
-                                                   resume=args.resume))
+                                                   resume=args.resume,
+                                                   gene_trees_source=_resolve_gene_trees_source()))
     elif cmd == "run-all-orthofinder":
         import time as _time
         root = Path(args.results_root)
@@ -430,7 +444,8 @@ def main() -> None:
         _timed_step_of("Step 1/9: OrthoFinder subclustering",
             orthofinder_cluster, args.og_dir, str(root / "01_mmseqs"), cfg, logger,
             step_log_dir=root / "01_mmseqs", step_log_name="orthofinder-cluster",
-            resume=resume)
+            resume=resume,
+            gene_trees_source=_resolve_gene_trees_source())
 
         proteins_combined = str(root / "01_mmseqs/proteins_combined.faa")
 
