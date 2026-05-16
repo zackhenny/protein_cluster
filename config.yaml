@@ -255,7 +255,7 @@ knn:
 
   # --- rKCNN-specific settings (only used when mode: rkcnn) ----------------
   # rKCNN operates on the full-dimensional ESM-2 embedding — do NOT apply PCA.
-  # Embeddings are L2-normalised before fitting.
+  # Embeddings are L2-normalized before fitting.
 
   # rkcnn_n_subspaces: number of random feature subspaces to sample.
   #   More subspaces → better ensemble coverage but slower.
